@@ -9,14 +9,22 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 
 function loadDotEnv () {
-  const p = path.join(here, '.env')
-  if (!fs.existsSync(p)) return
-  for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
-    const t = line.trim()
-    if (!t || t.startsWith('#') || !t.includes('=')) continue
-    const i = t.indexOf('=')
-    const k = t.slice(0, i).trim()
-    if (!(k in process.env)) process.env[k] = t.slice(i + 1).trim()
+  // .env 查找顺序（都不覆盖已存在的真实环境变量）：
+  //   1. scripts/e2e/.env（README 文档的标准位置）
+  //   2. scripts/e2e/config/.env（兼容旧位置）
+  const candidates = [
+    path.join(here, '..', '.env'),
+    path.join(here, '.env')
+  ]
+  for (const p of candidates) {
+    if (!fs.existsSync(p)) continue
+    for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
+      const t = line.trim()
+      if (!t || t.startsWith('#') || !t.includes('=')) continue
+      const i = t.indexOf('=')
+      const k = t.slice(0, i).trim()
+      if (!(k in process.env)) process.env[k] = t.slice(i + 1).trim()
+    }
   }
 }
 loadDotEnv()
