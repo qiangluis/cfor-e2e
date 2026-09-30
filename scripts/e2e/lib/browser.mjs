@@ -2,6 +2,7 @@
 // 登录成功判定以页面状态为准（URL 离开 /login + 用户标识出现），
 // 不解析 login-encrypted 的加密响应体——旧版直接 response.json() 取 code 是错的。
 import { chromium } from 'playwright-core'
+import fs from 'node:fs'
 import path from 'node:path'
 import { config, resolveChromePath } from '../config/index.mjs'
 import { ensureDir } from './report.mjs'
@@ -52,6 +53,22 @@ async function firstVisible (page, candidates, timeout = 8000) {
     } catch { /* 试下一个 */ }
   }
   throw new Error(`找不到可见元素，候选：${candidates.join(' / ')}`)
+}
+
+/**
+ * 登录失败时的现场导出：把登录卡片区的 HTML 落盘，方便离线分析选择器失效原因。
+ * @returns 导出的文件路径（失败返回 null）
+ */
+export async function dumpLoginDom (page, dumpDir, tag = 'login') {
+  if (!dumpDir) return null
+  try {
+    ensureDir(dumpDir)
+    const card = await page.locator(SEL.loginCard).first().innerHTML().catch(() => '')
+    const html = card || await page.content().catch(() => '')
+    const file = path.join(dumpDir, `${tag}-dom.html`)
+    fs.writeFileSync(file, html)
+    return file
+  } catch { return null }
 }
 
 export async function launchBrowser () {
@@ -128,7 +145,8 @@ export async function restoreSession (page, ctx) {
  * 用户名/密码 → 登录 → 等页面状态。
  * @returns {{ token: string, failures: string[] }}
  */
-export async function login (page, { check } = {}) {
+export async function login (page, { check, dumpDir } = {}) {
+  try {
   const failures = watchApiFailures(page)
   await page.goto(`${config.webUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {})
@@ -181,6 +199,11 @@ export async function login (page, { check } = {}) {
   const token = await readToken(page)
   check?.step('page', '本地 token 已写入', !!token)
   return { token, failures }
+  } catch (e) {
+    // 登录挂掉时自动导出登录区 DOM，下次不用靠猜
+    const f = await dumpLoginDom(page, dumpDir, 'login')
+    throw new Error(`${e.message}${f ? `（已导出登录区 DOM：${f}）` : ''}`)
+  }
 }
 
 export async function openRoute (page, routePath, { check } = {}) {

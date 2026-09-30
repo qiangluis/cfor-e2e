@@ -8,9 +8,9 @@ import { checklist } from '../lib/assert.mjs'
 
 export const implemented = true
 
-async function ensureAuth (ctx, check) {
+async function ensureAuth (ctx, check, shotDir) {
   if (!ctx.token) {
-    const { token, failures } = await login(ctx.page, { check })
+    const { token, failures } = await login(ctx.page, { check, dumpDir: shotDir })
     check.step('page', '登录过程无 4xx/5xx 接口失败', failures.length === 0, failures.slice(0, 3).join(' | '))
     ctx.token = token
   }
@@ -27,7 +27,7 @@ async function smoke001 (ctx, check, shotDir) {
   // 1. 后端健康（api 层）
   await apiHealth({ check })
   // 2. 真实登录 + 租户上下文（page 层）
-  await ensureAuth(ctx, check)
+  await ensureAuth(ctx, check, shotDir)
   // 3. 租户上下文二次确认：当前登录身份确属该租户
   const info = await ctx.api.getPermissionInfo()
   const flat = JSON.stringify(info)
@@ -36,7 +36,7 @@ async function smoke001 (ctx, check, shotDir) {
 }
 
 async function smoke002 (ctx, check, shotDir) {
-  await ensureAuth(ctx, check)
+  await ensureAuth(ctx, check, shotDir)
 
   // 工作台
   let r = await openRoute(ctx.page, '/index', { check })
