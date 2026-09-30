@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     env:
       CFOR_TARGET: online
@@ -40,8 +40,8 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: 安装 Chrome
-        uses: browser-actions/setup-chrome@latest
+      # - name: 安装 Chrome
+      #   uses: browser-actions/setup-chrome@latest
 
       - run: npm ci
 
