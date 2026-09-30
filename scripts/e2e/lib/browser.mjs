@@ -32,11 +32,8 @@ const SEL = {
     'input[name="password"]',
     'input[type="password"]'
   ],
-  // 注意："账密登录"页签按钮也含"登录"二字，必须精确匹配
-  loginButton: [
-    '.portal-login-card button.el-button:has-text("登录")',
-    'button:has-text("登录")'
-  ],
+  // 登录提交按钮的定位已收敛到 findLoginButton()（角色精确匹配 + 文本校验），
+  // 不再用裸 has-text 候选，避免误命中"账密登录"页签
   // 登录成功后页面上必有的用户标识（任一命中即算成功）
   loggedInMarkers: [
     '.avatar', '.user-info', '[class*="user"]',
@@ -53,6 +50,38 @@ async function firstVisible (page, candidates, timeout = 8000) {
     } catch { /* 试下一个 */ }
   }
   throw new Error(`找不到可见元素，候选：${candidates.join(' / ')}`)
+}
+
+/**
+ * 找真正的"登录"提交按钮（排除"账密登录"页签等含"登录"二字的按钮）。
+ * 先用无障碍角色精确匹配，退化到 CSS 候选 + 文本精确校验。
+ */
+async function findLoginButton (page, timeout = 30000) {
+  const deadline = Date.now() + timeout
+  const remain = () => Math.max(deadline - Date.now(), 1000)
+  // 1. 角色精确匹配（最可靠）：卡片内的 button，accessible name 恰为"登录"
+  const roleBtn = page.locator('.portal-login-card').getByRole('button', { name: '登录', exact: true }).first()
+  try {
+    await roleBtn.waitFor({ state: 'visible', timeout: remain() })
+    return roleBtn
+  } catch { /* 退化到 CSS */ }
+  // 2. CSS 候选 + 文本精确校验
+  const cssCandidates = [
+    '.portal-login-card button[type="submit"]',
+    '.portal-login-card button.el-button--primary',
+    '.portal-login-card button.el-button'
+  ]
+  for (const sel of cssCandidates) {
+    const loc = page.locator(sel)
+    const n = await loc.count().catch(() => 0)
+    for (let i = 0; i < n; i++) {
+      const b = loc.nth(i)
+      try { await b.waitFor({ state: 'visible', timeout: remain() }) } catch { continue }
+      const text = (await b.innerText().catch(() => '')).replace(/\s+/g, '')
+      if (text === '登录') return b
+    }
+  }
+  throw new Error('找不到登录提交按钮（已排除"账密登录"等页签按钮）')
 }
 
 /**
@@ -90,7 +119,8 @@ export async function launchBrowser () {
     headless: config.headless,
     executablePath: resolveChromePath(),
     proxy,
-    args: ['--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check']
+    // 有头模式下窗口也要够大，否则登录页页脚会盖住登录按钮
+    args: ['--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check', '--window-size=1600,900']
   })
 }
 
@@ -179,7 +209,8 @@ export async function login (page, { check, dumpDir } = {}) {
     (r) => r.url().includes('/system/auth/login-encrypted') && r.request().method() === 'POST',
     { timeout: 30000 }
   ).catch(() => null)
-  const loginBtn = await firstVisible(page, SEL.loginButton, 30000)
+  const loginBtn = await findLoginButton(page, 30000)
+  await loginBtn.scrollIntoViewIfNeeded().catch(() => {})
   await loginBtn.click()
   await loginResp
 

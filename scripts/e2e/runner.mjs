@@ -89,9 +89,11 @@ async function main () {
 
   const sessionFile = path.join(evidenceDir, 'session.json')
   const browser = await launchBrowser()
-  const newContext = async () => browser.newContext(
-    args.reuseSession && fs.existsSync(sessionFile) ? { storageState: sessionFile } : {}
-  )
+  const newContext = async () => browser.newContext({
+    // 固定大视口：窗口太小会导致登录页页脚盖住登录按钮等布局重叠问题
+    viewport: { width: 1600, height: 900 },
+    ...(args.reuseSession && fs.existsSync(sessionFile) ? { storageState: sessionFile } : {})
+  })
   // 跨 case 共享的会话上下文（token 复用 = 登录一次）
   const sharedCtx = { browser, context: await newContext(), token: '', tenantId: '', api: null }
 
