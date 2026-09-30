@@ -134,17 +134,50 @@ export function watchApiFailures (page) {
   return failures
 }
 
+/**
+ * 从浏览器里捞 token：地毯式扫描 localStorage / sessionStorage（递归找
+ * token/accessToken/authorization 键和 JWT 形状的字符串），再找 cookie。
+ * 发版后前端可能换存储位置，所以不写死 key。
+ * @returns {{ token: string, keys: string[] }} keys 仅用于失败时诊断
+ */
 async function readToken (page) {
-  return page.evaluate(() => {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i)
-      try {
-        const v = JSON.parse(localStorage.getItem(k))
-        if (v && typeof v === 'object' && (v.token || v.accessToken)) return v.token || v.accessToken
-      } catch { /* 非 JSON，跳过 */ }
+  const fromPage = await page.evaluate(() => {
+    const keys = []
+    const found = []
+    const isJwt = (s) => typeof s === 'string' && s.length > 40 &&
+      /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(s)
+    const scan = (obj, depth) => {
+      if (depth > 3 || !obj || typeof obj !== 'object') return
+      for (const k of Object.keys(obj)) {
+        const lk = k.toLowerCase()
+        const v = obj[k]
+        if ((lk === 'token' || lk === 'accesstoken' || lk === 'authorization') &&
+            typeof v === 'string' && v.length > 20) found.push(v.replace(/^Bearer\s+/i, ''))
+        else if (typeof v === 'string' && isJwt(v)) found.push(v)
+        else scan(v, depth + 1)
+      }
     }
-    return localStorage.getItem('token') || localStorage.getItem('accessToken') || ''
-  })
+    for (const store of [window.localStorage, window.sessionStorage]) {
+      try {
+        for (let i = 0; i < store.length; i++) {
+          const k = store.key(i)
+          keys.push(k)
+          const raw = store.getItem(k)
+          if (isJwt(raw)) { found.push(raw); continue }
+          try { scan(JSON.parse(raw), 0) } catch { /* 非 JSON */ }
+          if (typeof raw === 'string' && raw.length > 40 && /token/i.test(k)) {
+            found.push(raw.replace(/^Bearer\s+/i, ''))
+          }
+        }
+      } catch { /* storage 不可用 */ }
+    }
+    return { found, keys }
+  }).catch(() => ({ found: [], keys: [] }))
+  if (fromPage.found.length) return { token: fromPage.found[0], keys: fromPage.keys }
+  // cookie 兜底
+  const cookies = await page.context().cookies().catch(() => [])
+  const ck = cookies.find((c) => /token|auth/i.test(c.name) && c.value && c.value.length > 20)
+  return { token: ck ? String(ck.value).replace(/^Bearer\s+/i, '') : '', keys: fromPage.keys }
 }
 
 /**
@@ -158,7 +191,7 @@ export async function restoreSession (page, ctx) {
   for (const sel of SEL.loggedInMarkers) {
     try {
       await page.locator(sel).first().waitFor({ state: 'visible', timeout: 5000 })
-      const token = await readToken(page)
+      const { token } = await readToken(page)
       if (token) {
         const { createApiClient } = await import('./api.mjs')
         ctx.token = token
@@ -180,6 +213,16 @@ export async function login (page, { check, dumpDir } = {}) {
   const failures = watchApiFailures(page)
   await page.goto(`${config.webUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {})
+
+  // 已登录态直接进 /login 会被路由守卫踢回业务页：此时跳过表单，直接读 token
+  if (!page.url().includes('/login')) {
+    const { token, keys } = await readToken(page)
+    check?.step('page', '已是登录态，跳过表单直接复用', true, page.url())
+    check?.step('page', '本地 token 已写入', !!token,
+      token ? '' : `storage keys: ${keys.slice(0, 12).join(', ')}`)
+    if (!token) throw new Error('已登录但未找到 token')
+    return { token, failures }
+  }
 
   // 0. 等登录卡片真正渲染出来（冷加载时 chunk 较多，表单可能还没挂载）
   await page.locator(SEL.loginCard).first().waitFor({ state: 'visible', timeout: 60000 })
@@ -227,8 +270,9 @@ export async function login (page, { check, dumpDir } = {}) {
   check?.step('page', '登录后离开 /login', true, page.url())
   check?.step('page', '已登录标识可见', markerOk)
 
-  const token = await readToken(page)
-  check?.step('page', '本地 token 已写入', !!token)
+  const { token, keys } = await readToken(page)
+  check?.step('page', '本地 token 已写入', !!token,
+    token ? '' : `storage keys: ${keys.slice(0, 12).join(', ')}`)
   return { token, failures }
   } catch (e) {
     // 登录挂掉时自动导出登录区 DOM，下次不用靠猜
