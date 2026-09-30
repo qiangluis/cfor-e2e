@@ -1,0 +1,76 @@
+name: CFOR E2E 定时巡检
+
+# 每天凌晨 2 点（北京时间）自动跑冒烟，守护线上。
+# 失败时自动上传证据包，并在仓库建/跟进 Issue 告警。
+on:
+  schedule:
+    # GitHub cron 按 UTC 解析：18:00 UTC = 次日 02:00（UTC+8）
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: '测试套件'
+        required: false
+        default: 'smoke'
+        type: choice
+        options: [smoke, init, all]
+
+concurrency:
+  group: e2e-nightly
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CFOR_TARGET: online
+      CFOR_BASE_URL: https://jixu-ai.com
+      CFOR_API_PREFIX: /admin-api
+      CFOR_TENANT: 福奇科技
+      CFOR_USER: admin
+      CFOR_PASS: ${{ secrets.CFOR_PASS }}
+      CFOR_HEADLESS: 'true'
+      CFOR_EVIDENCE_DIR: ${{ github.workspace }}/evidence
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装 Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - run: npm ci
+
+      - name: 运行 E2E
+        id: e2e
+        continue-on-error: true
+        run: node scripts/e2e/runner.mjs --suite ${{ inputs.suite || 'smoke' }} --fresh
+
+      - name: 上传证据包
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence-${{ github.run_number }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 失败时建/跟进 Issue
+        if: steps.e2e.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create e2e-nightly --color B60205 --description "E2E 定时巡检失败" 2>/dev/null || true
+          SUMMARY=$(ls evidence/*/summary.md 2>/dev/null | head -1)
+          BODY="定时巡检失败（run #${{ github.run_number }}，$(date -u '+%F %T UTC'))。"$'\n\n'"证据包：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          [ -n "$SUMMARY" ] && BODY="$BODY"$'\n\n---\n\n'"$(cat "$SUMMARY")"
+          NUM=$(gh issue list --label e2e-nightly --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then
+            printf '%s' "$BODY" | gh issue create --title "E2E 定时巡检失败 $(date -u +%F)" --label e2e-nightly --body-file -
+          else
+            printf '%s' "$BODY" | gh issue comment "$NUM" --body-file -
+          fi
