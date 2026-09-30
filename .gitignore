@@ -1,0 +1,4 @@
+node_modules/
+scripts/e2e/.env
+scripts/e2e/evidence/
+hidden_files/

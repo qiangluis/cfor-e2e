@@ -1,0 +1,390 @@
+{
+  "suites": [
+    {
+      "cases": [
+        {
+          "assertions": [
+            "后端 API 可达",
+            "租户名解析出 tenantId",
+            "真实登录：离开 /login 且用户标识可见",
+            "租户上下文与登录租户一致"
+          ],
+          "id": "SMOKE-001",
+          "preconditions": [
+            "后端服务可用",
+            "测试租户与账号已存在"
+          ],
+          "reverse": [
+            "只读验证，不产生业务数据"
+          ],
+          "routes": [
+            "/login"
+          ],
+          "status": "READY",
+          "title": "后端健康、真实登录和租户上下文"
+        },
+        {
+          "assertions": [
+            "工作台路由可进入且内容可见",
+            "引导中心存在",
+            "已授权业务域菜单可见",
+            "导航期间无 4xx/5xx 接口失败"
+          ],
+          "id": "SMOKE-002",
+          "preconditions": [
+            "SMOKE-001 PASS"
+          ],
+          "reverse": [
+            "不修改菜单权限"
+          ],
+          "routes": [
+            "/index",
+            "/systemInit/index"
+          ],
+          "status": "READY",
+          "title": "工作台、引导中心和已授权业务域菜单"
+        }
+      ],
+      "dependsOn": [],
+      "id": "smoke",
+      "title": "登录、健康和业务域烟测"
+    },
+    {
+      "cases": [
+        {
+          "id": "INIT-001",
+          "status": "DESIGNED",
+          "title": "新租户首次登录只进入 /systemInit"
+        },
+        {
+          "id": "INIT-002",
+          "status": "DESIGNED",
+          "title": "第一页预览、确认、权限立即同步和顶部业务域刷新"
+        },
+        {
+          "id": "INIT-003",
+          "status": "DESIGNED",
+          "title": "首轮预置回执、刷新恢复和只补缺失"
+        },
+        {
+          "id": "INIT-004",
+          "status": "DESIGNED",
+          "title": "初始化页签与设置菜单配置回读"
+        },
+        {
+          "id": "INIT-005",
+          "status": "DESIGNED",
+          "title": "初始化必配、可选和外部前置边界"
+        }
+      ],
+      "dependsOn": [
+        "smoke"
+      ],
+      "id": "init",
+      "title": "租户初始化引导"
+    },
+    {
+      "cases": [
+        {
+          "id": "ERP-SALES-001",
+          "status": "DESIGNED",
+          "title": "客户、商机、合同审批通过并确认签署"
+        },
+        {
+          "id": "ERP-SALES-002",
+          "status": "DESIGNED",
+          "title": "合同确认后生成应收、收款并自动核销"
+        },
+        {
+          "id": "ERP-SALES-003",
+          "status": "DESIGNED",
+          "title": "销售订单审核后按 WMS ATP 分支发货或人工转生产"
+        },
+        {
+          "id": "ERP-SALES-004",
+          "status": "DESIGNED",
+          "title": "发货通知、拣货、销售出库检和发货完成回写"
+        }
+      ],
+      "dependsOn": [
+        "init",
+        "wms-quality"
+      ],
+      "id": "erp-sales",
+      "title": "ERP 销售域"
+    },
+    {
+      "cases": [
+        {
+          "id": "PROC-001",
+          "status": "DESIGNED",
+          "title": "MRP 按净需求和建议口径识别缺料"
+        },
+        {
+          "id": "PROC-002",
+          "status": "DESIGNED",
+          "title": "缺料自动转请购、审核生成采购订单"
+        },
+        {
+          "id": "PROC-003",
+          "status": "DESIGNED",
+          "title": "采购审核自动生成应付、到货、入库和入库检"
+        }
+      ],
+      "dependsOn": [
+        "init",
+        "mes-production"
+      ],
+      "id": "procurement",
+      "title": "采购域"
+    },
+    {
+      "cases": [
+        {
+          "id": "MES-PROD-001",
+          "status": "DESIGNED",
+          "title": "生产订单拆分工单和工单任务"
+        },
+        {
+          "id": "MES-PROD-002",
+          "status": "DESIGNED",
+          "title": "按物料配置领料方式，缺料禁止开工"
+        },
+        {
+          "id": "MES-PROD-003",
+          "status": "DESIGNED",
+          "title": "报工、安灯、报工记录和过程检"
+        },
+        {
+          "id": "MES-PROD-004",
+          "status": "DESIGNED",
+          "title": "过程检放行后生成成品入库并进入 WMS"
+        }
+      ],
+      "dependsOn": [
+        "init",
+        "plm"
+      ],
+      "id": "mes-production",
+      "title": "MES 生产域"
+    },
+    {
+      "cases": [
+        {
+          "id": "WMS-QC-001",
+          "status": "DESIGNED",
+          "title": "入库待检、放行和可用库存"
+        },
+        {
+          "id": "WMS-QC-002",
+          "status": "DESIGNED",
+          "title": "库存 ATP、预留、拣货、出库检和发货"
+        },
+        {
+          "id": "WMS-QC-003",
+          "status": "DESIGNED",
+          "title": "跨租户、无权限、重复执行和事务回滚"
+        }
+      ],
+      "dependsOn": [
+        "init"
+      ],
+      "id": "wms-quality",
+      "title": "WMS 库存与质检"
+    },
+    {
+      "cases": [
+        {
+          "assertions": [
+            "固定账套存在",
+            "事件受理 API 返回来源字段",
+            "事件受理页面显示真实行"
+          ],
+          "id": "FMS-001",
+          "preconditions": [
+            "SMOKE-001 PASS"
+          ],
+          "reverse": [
+            "只读验证"
+          ],
+          "routes": [
+            "/fms/event-inbox"
+          ],
+          "status": "PARTIAL",
+          "title": "来源事务 outbox 异步投递和 inbox 幂等"
+        },
+        {
+          "assertions": [
+            "凭证草稿 API 返回来源字段",
+            "凭证草稿页面显示真实行"
+          ],
+          "id": "FMS-002",
+          "preconditions": [
+            "SMOKE-001 PASS"
+          ],
+          "reverse": [
+            "只读验证"
+          ],
+          "routes": [
+            "/fms/voucher-draft"
+          ],
+          "status": "PARTIAL",
+          "title": "ERP 受控成本快照和 WMS 实物事件生成草稿"
+        },
+        {
+          "id": "FMS-003",
+          "status": "DESIGNED",
+          "title": "人工确认、草稿和正式过账边界"
+        },
+        {
+          "id": "FMS-004",
+          "status": "DESIGNED",
+          "title": "收款到账和付款出账事件"
+        }
+      ],
+      "dependsOn": [
+        "erp-sales",
+        "procurement",
+        "wms-quality"
+      ],
+      "id": "fms",
+      "title": "FMS 财务域"
+    },
+    {
+      "cases": [
+        {
+          "id": "PLM-001",
+          "status": "DESIGNED",
+          "title": "项目、产品、零件、BOM 和工艺建模"
+        },
+        {
+          "id": "PLM-002",
+          "status": "DESIGNED",
+          "title": "正式发布链路供 ERP/MES 消费"
+        }
+      ],
+      "dependsOn": [
+        "init"
+      ],
+      "id": "plm",
+      "title": "PLM 研发域"
+    },
+    {
+      "cases": [
+        {
+          "id": "IOT-001",
+          "status": "DESIGNED",
+          "title": "产品、物模型、设备分组和设备档案"
+        },
+        {
+          "id": "IOT-002",
+          "status": "DESIGNED",
+          "title": "设备遥测、告警和重复消息幂等"
+        }
+      ],
+      "dependsOn": [
+        "init"
+      ],
+      "id": "iot",
+      "title": "IoT 设备域"
+    },
+    {
+      "cases": [
+        {
+          "id": "INT-001",
+          "status": "DESIGNED",
+          "title": "平台目录、连接器和引导中心即配入口"
+        },
+        {
+          "id": "INT-002",
+          "status": "BLOCKED",
+          "title": "实例、映射、值映射、工作流和同步任务"
+        }
+      ],
+      "dependsOn": [
+        "init"
+      ],
+      "id": "integration",
+      "title": "集成平台"
+    },
+    {
+      "cases": [
+        {
+          "id": "HRM-001",
+          "status": "DESIGNED",
+          "title": "员工、账号映射、入离职和敏感字段"
+        },
+        {
+          "id": "PMS-001",
+          "status": "DESIGNED",
+          "title": "项目成员、工作项、评论和工时"
+        },
+        {
+          "id": "OA-001",
+          "status": "DESIGNED",
+          "title": "请假 BPM 审批和协同资源"
+        }
+      ],
+      "dependsOn": [
+        "init"
+      ],
+      "id": "hrm-pms-oa",
+      "title": "HRM/PMS/OA"
+    },
+    {
+      "id": "crm-customer",
+      "name": "CRM 客户主数据",
+      "cases": [
+        {
+          "id": "CRM-CUST-API-001",
+          "title": "新增客户（仅必填名称）"
+        },
+        {
+          "id": "CRM-CUST-API-002",
+          "title": "新增缺名称/缺负责人校验"
+        },
+        {
+          "id": "CRM-CUST-API-003",
+          "title": "新增客户全字段"
+        },
+        {
+          "id": "CRM-CUST-API-004",
+          "title": "分页查询按名称过滤"
+        },
+        {
+          "id": "CRM-CUST-API-005",
+          "title": "更新客户级别"
+        },
+        {
+          "id": "CRM-CUST-API-006",
+          "title": "锁定/解锁客户"
+        },
+        {
+          "id": "CRM-CUST-API-007",
+          "title": "删除客户及异常 id"
+        },
+        {
+          "id": "CRM-CUST-UI-001",
+          "title": "私海客户列表页渲染"
+        },
+        {
+          "id": "CRM-CUST-UI-002",
+          "title": "新增弹窗必填校验与编码生成"
+        },
+        {
+          "id": "CRM-CUST-UI-003",
+          "title": "UI 完整新增客户流程"
+        },
+        {
+          "id": "CRM-CUST-UI-004",
+          "title": "查询过滤与重置"
+        },
+        {
+          "id": "CRM-CUST-UI-005",
+          "title": "客户详情页结构"
+        }
+      ]
+    }
+  ],
+  "version": "2.0.0"
+}
