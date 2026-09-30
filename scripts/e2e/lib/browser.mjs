@@ -7,6 +7,40 @@ import path from 'node:path'
 import { config, resolveChromePath } from '../config/index.mjs'
 import { ensureDir } from './report.mjs'
 
+/**
+ * 带重试的页面导航。jixu-ai.com 会从边缘节点拦截海外机房的
+ * 自动化浏览器流量（net::ERR_EMPTY_RESPONSE，curl 正常），
+ * 此时重试几次（应对间歇性拦截），最终失败则抛出可识别的
+ * 网络错误，方便与真正的测试断言失败区分开。
+ */
+export async function gotoSite (page, url, opts = {}) {
+  const tries = opts.tries ?? 3
+  let lastErr = null
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000, ...opts.goto })
+      return
+    } catch (err) {
+      lastErr = err
+      const msg = String(err?.message || err)
+      if (/ERR_EMPTY_RESPONSE|ERR_CONNECTION|ETIMEDOUT|ENOTFOUND|ERR_TUNNEL_CONNECTION_FAILED/i.test(msg)) {
+        if (i < tries) {
+          await new Promise(r => setTimeout(r, 10000))
+          continue
+        }
+        throw new Error(
+          `网站不可达（${i} 次重试均失败）：${url}。` +
+          `最后错误：${msg.split('\n')[0]}。` +
+          '疑似当前机房 IP 被站点边缘拦截（海外 runner 常见）；' +
+          '建议改用国内 self-hosted runner 跑此套件。'
+        )
+      }
+      throw err
+    }
+  }
+  throw lastErr
+}
+
 // 登录页选择器。文案依据 2026-09-29 从线上 bundle 逆向出的真实值：
 //   zh-CN 语言包：login.tenantNamePlaceholder="请输入租户名称"
 //   login.usernamePlaceholder="请输入用户名"、login.passwordPlaceholder="请输入密码"、
@@ -185,7 +219,7 @@ async function readToken (page) {
  * @returns {{token: string} | null}
  */
 export async function restoreSession (page, ctx) {
-  await page.goto(`${config.webUrl}/index`, { waitUntil: 'domcontentloaded', timeout: 60000 })
+  await gotoSite(page, `${config.webUrl}/index`)
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {})
   if (page.url().includes('/login')) return null
   for (const sel of SEL.loggedInMarkers) {
@@ -211,7 +245,7 @@ export async function restoreSession (page, ctx) {
 export async function login (page, { check, dumpDir } = {}) {
   try {
   const failures = watchApiFailures(page)
-  await page.goto(`${config.webUrl}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
+  await gotoSite(page, `${config.webUrl}/login`)
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {})
 
   // 已登录态直接进 /login 会被路由守卫踢回业务页：此时跳过表单，直接读 token
@@ -283,7 +317,7 @@ export async function login (page, { check, dumpDir } = {}) {
 
 export async function openRoute (page, routePath, { check } = {}) {
   const failures = watchApiFailures(page)
-  await page.goto(`${config.webUrl}${routePath}`, { waitUntil: 'domcontentloaded', timeout: 60000 })
+  await gotoSite(page, `${config.webUrl}${routePath}`)
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {})
   return { failures }
 }

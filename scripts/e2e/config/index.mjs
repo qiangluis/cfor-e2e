@@ -75,6 +75,8 @@ export const config = new Proxy({}, {
 
 export function resolveChromePath () {
   if (config.chromePath) return config.chromePath
+  // browser-actions/setup-chrome 等 CI 动作通过 CHROME_PATH 注入路径
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH
   const candidates = [
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/opt/meta-chromium/chrome',

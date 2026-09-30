@@ -46,6 +46,16 @@ $CFOR_EVIDENCE_DIR/checkpoint.json  # 断点：已通过的 caseId（--fresh 清
 $CFOR_EVIDENCE_DIR/session.json     # 登录态（--reuse-session 复用）
 ```
 
+## 定时巡检（GitHub Actions）
+
+`.github/workflows/e2e-nightly.yml`：每天 02:00（北京时间）自动跑冒烟（`--suite smoke --fresh`），
+全程 headless。
+
+- 仓库 Settings → Secrets → Actions 里加一个 secret：`CFOR_PASS`（测试账号密码，其它配置已写在 workflow 里）。
+- 每次运行的证据包（summary.md + 截图）自动上传为 Artifact，保留 30 天。
+- 失败时自动在仓库建 Issue（标签 `e2e-nightly`）并附上 summary；问题没修好之前的新失败会追加评论到同一个 Issue，不刷屏。
+- 想手动触发：Actions 页 → "CFOR E2E 定时巡检" → Run workflow，可选 smoke/init/all。
+
 ## v1 → v2 修复清单
 
 1. runner 漏传 `caseId` 给 suite（SMOKE/FMS 分支走错）→ 必传。
