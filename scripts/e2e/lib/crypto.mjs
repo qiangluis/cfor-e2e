@@ -21,11 +21,11 @@ function decipher (b64, keyStr) {
 /** 加密请求体（对象或字符串）→ base64，与前端 u0.encryptRequest 等价 */
 export function encryptRequest (data) {
   const plain = typeof data === 'string' ? data : JSON.stringify(data)
-  return cipher(plain, REQ_KEY)
+  return cipher(plain, process.env.CFOR_API_ENCRYPT_REQUEST_KEY || REQ_KEY)
 }
 
 /** 解密响应体（base64 字符串）→ 对象或字符串，与前端 u0.decryptResponse 等价 */
 export function decryptResponse (text) {
-  const plain = decipher(text, RESP_KEY)
+  const plain = decipher(text, process.env.CFOR_API_ENCRYPT_RESPONSE_KEY || RESP_KEY)
   try { return JSON.parse(plain) } catch { return plain }
 }

@@ -1,67 +1,156 @@
-// API 层：fetch 封装 + AES 加解密（用于 *-encrypted 接口）。
-// config.apiUrl 已含 /admin-api 前缀，这里不再拼接。
 import { config } from '../config/index.mjs'
-import { encryptRequest, decryptResponse, ENCRYPT_HEADER } from './crypto.mjs'
+import { assertBusinessSuccess } from './assertions.mjs'
+import { decryptResponse, encryptRequest, ENCRYPT_HEADER } from './crypto.mjs'
+import { redact } from './redact.mjs'
 
-export function createApiClient ({ token = '', tenantId = '', check } = {}) {
-  const headers = () => {
-    const h = { 'Content-Type': 'application/json' }
-    if (token) h.Authorization = `Bearer ${token}`
-    if (tenantId) h['tenant-id'] = String(tenantId)
-    return h
+function endpoint (pathname) {
+  const value = String(pathname)
+  if (/^https?:\/\//.test(value)) return value
+  if (value.startsWith('/admin-api/')) return `${config.apiBase}${value}`
+  return `${config.apiUrl}${value.startsWith('/') ? value : `/${value}`}`
+}
+
+function payloadFromText (text, response) {
+  const encrypted =
+    response.headers.get(ENCRYPT_HEADER.toLowerCase()) === 'true' ||
+    response.headers.get(ENCRYPT_HEADER) === 'true'
+  if (encrypted) return decryptResponse(text)
+  try {
+    return text ? JSON.parse(text) : null
+  } catch {
+    return { raw: text }
   }
+}
 
-  async function request (method, path, { body, encrypted = false, check: c } = {}) {
-    const h = headers()
-    let payload
+export const createApiClient = ({ token = '', tenantId = config.tenantId, check, record } = {}) => {
+  const headers = () => ({
+    'content-type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(tenantId ? { 'tenant-id': String(tenantId) } : {})
+  })
+
+  const request = async (method, pathname, body, options = {}) => {
+    const requestHeaders = {
+      ...headers(),
+      ...(options.headers || {})
+    }
+    let requestBody
     if (body !== undefined) {
-      if (encrypted) {
-        payload = encryptRequest(body)
-        h[ENCRYPT_HEADER] = 'true'
+      if (options.encrypted) {
+        requestBody = encryptRequest(body)
+        requestHeaders[ENCRYPT_HEADER] = 'true'
+      } else if (body instanceof FormData || body instanceof Blob || body instanceof ArrayBuffer) {
+        requestBody = body
+        delete requestHeaders['content-type']
       } else {
-        payload = JSON.stringify(body)
+        requestBody = JSON.stringify(body)
       }
     }
-    const resp = await fetch(`${config.apiUrl}${path}`, { method, headers: h, body: payload })
-    const raw = await resp.text()
-    let data = raw
-    if (resp.headers.get(ENCRYPT_HEADER.toLowerCase()) === 'true' || resp.headers.get(ENCRYPT_HEADER) === 'true') {
-      data = decryptResponse(raw)
-    } else {
-      try { data = JSON.parse(raw) } catch { /* 保持原文 */ }
+
+    const response = await fetch(endpoint(pathname), {
+      method,
+      headers: requestHeaders,
+      body: requestBody,
+      signal: AbortSignal.timeout(options.timeoutMs || config.requestTimeoutMs)
+    })
+    const text = await response.text()
+    const payload = payloadFromText(text, response)
+    const entry = {
+      method,
+      pathname,
+      status: response.status,
+      code: payload?.code,
+      bodySummary: JSON.stringify(redact(payload)).slice(0, 1000)
     }
-    ;(c || check)?.step('api', `${method} ${path} → ${resp.status}`, resp.ok, typeof data === 'object' ? `code=${data.code}` : String(data).slice(0, 120))
-    if (!resp.ok) throw new Error(`API ${resp.status}：${method} ${path}`)
-    return data
+    record?.api?.push(entry)
+    check?.step('api', `${method} ${pathname} -> ${response.status}`, response.ok, entry.bodySummary)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${method} ${pathname}: ${entry.bodySummary.slice(0, 500)}`)
+    }
+    return payload
+  }
+
+  const business = async (method, pathname, body, options = {}) => {
+    const result = await request(method, pathname, body, options)
+    return assertBusinessSuccess(result, pathname)
   }
 
   return {
-    get: (p, o) => request('GET', p, o),
-    post: (p, body, o) => request('POST', p, { ...o, body }),
-    /** 租户名 → 租户 id（登录页同款接口） */
-    async tenantIdByName (name) {
-      const r = await this.get(`/system/tenant/get-id-by-name?name=${encodeURIComponent(name)}`)
-      const id = r?.data ?? r
-      if (!id) throw new Error(`租户不存在：${name}`)
-      return String(id)
+    request,
+    get: (pathname, options) => request('GET', pathname, undefined, options),
+    post: (pathname, body, options) => request('POST', pathname, body, options),
+    put: (pathname, body, options) => request('PUT', pathname, body, options),
+    delete: (pathname, options) => request('DELETE', pathname, undefined, options),
+    getBusiness: (pathname, options) => business('GET', pathname, undefined, options),
+    postBusiness: (pathname, body, options) => business('POST', pathname, body, options),
+    putBusiness: (pathname, body, options) => business('PUT', pathname, body, options),
+    deleteBusiness: (pathname, options) => business('DELETE', pathname, undefined, options),
+    async upload (pathname, formData, options = {}) {
+      return request('POST', pathname, formData, options)
     },
-    /** 当前登录用户信息（含租户上下文） */
+    async uploadBusiness (pathname, formData, options = {}) {
+      return assertBusinessSuccess(await this.upload(pathname, formData, options), pathname)
+    },
+    async download (pathname, options = {}) {
+      const response = await fetch(endpoint(pathname), {
+        method: 'GET',
+        headers: {
+          ...headers(),
+          ...(options.headers || {})
+        },
+        signal: AbortSignal.timeout(options.timeoutMs || config.requestTimeoutMs)
+      })
+      record?.api?.push({
+        method: 'GET',
+        pathname,
+        status: response.status,
+        code: response.ok ? 0 : response.status,
+        bodySummary: `content-type=${response.headers.get('content-type') || ''}`
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status} GET ${pathname}`)
+      return {
+        buffer: Buffer.from(await response.arrayBuffer()),
+        contentType: response.headers.get('content-type'),
+        contentDisposition: response.headers.get('content-disposition')
+      }
+    },
+    async tenantIdByName (name) {
+      const result = await this.get(`/system/tenant/get-id-by-name?name=${encodeURIComponent(name)}`)
+      return String(result?.data ?? result)
+    },
     getPermissionInfo () {
       return this.get('/system/auth/get-permission-info')
     }
   }
 }
 
-/** 后端健康：online 用 login-config（200 即 API 可达）；local 用 actuator/health */
+export async function checkHealth () {
+  if (!config.apiHealthUrl) return { response: null, body: null }
+  const response = await fetch(config.apiHealthUrl, {
+    signal: AbortSignal.timeout(config.requestTimeoutMs)
+  })
+  const body = await response.json().catch(() => ({}))
+  return { response, body }
+}
+
 export async function apiHealth ({ check } = {}) {
-  if (config.target === 'local') {
-    const base = config.apiUrl.replace(/\/admin-api$/, '')
-    const r = await fetch(`${base}/actuator/health`)
-    const j = await r.json().catch(() => ({}))
-    check?.step('api', 'actuator health=UP', j.status === 'UP', JSON.stringify(j).slice(0, 120))
-    return
-  }
-  const r = await fetch(`${config.apiUrl}/system/auth/login-config`)
-  check?.step('api', '后端 API 可达（login-config）', r.ok, `status=${r.status}`)
-  if (!r.ok) throw new Error(`后端 API 不可达：${r.status}`)
+  const { response, body } = await checkHealth()
+  const passed = response ? response.ok && body?.status === 'UP' : true
+  check?.step('api', '后端健康检查', passed, response ? JSON.stringify(body) : 'health endpoint not configured')
+  if (!passed) throw new Error(`后端健康检查失败：${response?.status || 'unavailable'}`)
+  return { response, body }
+}
+
+export async function publicRequest (method, pathname, body) {
+  const response = await fetch(endpoint(pathname), {
+    method,
+    headers: {
+      'content-type': 'application/json',
+      ...(config.tenantId ? { 'tenant-id': String(config.tenantId) } : {})
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(config.requestTimeoutMs)
+  })
+  const text = await response.text()
+  return { response, payload: payloadFromText(text, response) }
 }

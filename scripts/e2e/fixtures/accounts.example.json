@@ -1,0 +1,18 @@
+{
+  "test": {
+    "webBaseEnv": "CFOR_WEB_BASE",
+    "apiBaseEnv": "CFOR_API_BASE",
+    "tenantIdEnv": "CFOR_TENANT_ID",
+    "tenantNameEnv": "CFOR_TENANT_NAME",
+    "usernameEnv": "CFOR_USERNAME",
+    "passwordEnv": "CFOR_PASSWORD",
+    "fmsAccountSetIdEnv": "CFOR_FMS_ACCOUNT_SET_ID"
+  },
+  "demo": {
+    "description": "演示环境只读。不要在自动化 suite 中执行写操作。",
+    "apiBaseEnv": "CFOR_DEMO_API_BASE",
+    "tenantIdEnv": "CFOR_DEMO_TENANT_ID",
+    "usernameEnv": "CFOR_DEMO_USERNAME",
+    "passwordEnv": "CFOR_DEMO_PASSWORD"
+  }
+}

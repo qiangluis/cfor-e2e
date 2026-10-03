@@ -1,76 +1,113 @@
-// e2e 全局配置：全部来自环境变量（支持 scripts/e2e/.env），无硬编码密钥。
-// 约定（已在 .env.example 中说明）：
-//   CFOR_TARGET=online 时，浏览器与 API 都走 CFOR_BASE_URL + CFOR_API_PREFIX；
-//   CFOR_TARGET=local  时，浏览器走 CFOR_WEB_URL，API 走 CFOR_LOCAL_API_URL。
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
+const explicitEnv = new Set(Object.keys(process.env))
+const localEnv = new Set()
 
-function loadDotEnv () {
-  // .env 查找顺序（都不覆盖已存在的真实环境变量）：
-  //   1. scripts/e2e/.env（README 文档的标准位置）
-  //   2. scripts/e2e/config/.env（兼容旧位置）
-  const candidates = [
-    path.join(here, '..', '.env'),
-    path.join(here, '.env')
-  ]
-  for (const p of candidates) {
-    if (!fs.existsSync(p)) continue
-    for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
-      const t = line.trim()
-      if (!t || t.startsWith('#') || !t.includes('=')) continue
-      const i = t.indexOf('=')
-      const k = t.slice(0, i).trim()
-      if (!(k in process.env)) process.env[k] = t.slice(i + 1).trim()
+function loadEnvFile (file, local = false) {
+  if (!fs.existsSync(file)) return
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const text = line.trim()
+    if (!text || text.startsWith('#') || !text.includes('=')) continue
+    const separator = text.indexOf('=')
+    const key = text.slice(0, separator).trim()
+    const value = text.slice(separator + 1).trim()
+    if (local) localEnv.add(key)
+    if (!(key in process.env)) process.env[key] = value
+  }
+}
+
+loadEnvFile(path.join(here, 'local.env'), true)
+// Ignore legacy scripts/e2e/.env files. Local acceptance must be explicit and
+// must not inherit stale production or alternate-port endpoints.
+
+const env = (key, fallback = '') => String(process.env[key] ?? fallback).trim()
+const envAlias = (keys, fallback, localOnly = false) => {
+  const explicit = keys.find((key) => explicitEnv.has(key) && env(key))
+  const configured = keys.find((key) => (!localOnly || localEnv.has(key)) && env(key))
+  return explicit ? env(explicit) : configured ? env(configured) : fallback
+}
+const number = (key, fallback) => {
+  const value = env(key)
+  if (!value) return fallback
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+const bool = (value, fallback) => {
+  if (value === undefined || value === '') return fallback
+  return ['1', 'true', 'yes'].includes(String(value).toLowerCase())
+}
+const trimSlash = (value) => String(value).replace(/\/+$/, '')
+const normalizeApiBase = (value) => trimSlash(value).replace(/\/admin-api$/, '')
+
+// Legacy environment files must never select production implicitly.
+const target = explicitEnv.has('CFOR_TARGET') ? env('CFOR_TARGET', 'local') : 'local'
+const webBase = trimSlash(
+  target === 'local'
+    ? envAlias(['CFOR_WEB_BASE', 'CFOR_WEB_URL'], 'http://127.0.0.1:9151', true)
+    : envAlias(['CFOR_WEB_BASE', 'CFOR_BASE_URL'], 'https://jixu-ai.com')
+)
+const apiBase = normalizeApiBase(
+  target === 'local'
+    ? envAlias(['CFOR_API_BASE', 'CFOR_LOCAL_API_URL'], 'http://127.0.0.1:48083', true)
+    : envAlias(['CFOR_API_BASE', 'CFOR_BASE_URL'], 'https://jixu-ai.com')
+)
+if (target === 'local') {
+  for (const [label, base, port] of [['web', webBase, '9151'], ['api', apiBase, '48083']]) {
+    const url = new URL(base)
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.port !== port) {
+      throw new Error(`Local ${label} must use a loopback address on port ${port}`)
     }
   }
 }
-loadDotEnv()
 
-const env = (k, d = '') => (process.env[k] ?? d).trim()
-const bool = (k, d) => {
-  const v = (process.env[k] ?? '').trim().toLowerCase()
-  if (!v) return d
-  return ['1', 'true', 'yes'].includes(v)
-}
-
-const target = () => env('CFOR_TARGET', 'online')
-const baseUrl = () => env('CFOR_BASE_URL', 'https://jixu-ai.com').replace(/\/$/, '')
-const apiPrefix = () => env('CFOR_API_PREFIX', '/admin-api')
-
-function buildConfig () {
-  const t = target()
-  const b = baseUrl()
-  return {
-    target: t,
-    // 浏览器打开的站点根地址
-    webUrl: t === 'local' ? env('CFOR_WEB_URL', 'http://127.0.0.1:9160').replace(/\/$/, '') : b,
-    // API 根地址（已含 /admin-api 前缀；lib/api.mjs 不再自行拼接，避免重复）
-    apiUrl: t === 'local'
-      ? env('CFOR_LOCAL_API_URL', 'http://127.0.0.1:48083/admin-api').replace(/\/$/, '')
-      : b + apiPrefix(),
-    tenant: env('CFOR_TENANT', '福奇科技'),
-    username: env('CFOR_USER', 'admin'),
-    get password () {
-      const p = env('CFOR_PASS', '')
-      if (!p) throw new Error('缺少 CFOR_PASS：请在环境变量或 scripts/e2e/.env 中设置登录密码')
-      return p
-    },
-    headless: bool('CFOR_HEADLESS', true),
-    chromePath: env('CFOR_CHROME_PATH', ''),
-    evidenceDir: env('CFOR_EVIDENCE_DIR', '/tmp/cfor-e2e'),
-    // 是否复用一次登录（默认开；--no-reuse-session 可关）
-    reuseSession: bool('CFOR_REUSE_SESSION', true)
+export const config = Object.freeze({
+  target,
+  webBase,
+  webUrl: webBase,
+  apiBase,
+  apiUrl: `${apiBase}${env('CFOR_API_PREFIX', '/admin-api')}`,
+  apiHealthUrl: env('CFOR_API_HEALTH_URL', target === 'local' ? `${apiBase}/actuator/health` : ''),
+  tenantId: env('CFOR_TENANT_ID', ''),
+  tenantName: env('CFOR_TENANT_NAME', env('CFOR_TENANT', '福奇科技')),
+  tenant: env('CFOR_TENANT_NAME', env('CFOR_TENANT', '福奇科技')),
+  username: env('CFOR_USERNAME', env('CFOR_USER', 'admin')),
+  password: env('CFOR_PASSWORD', env('CFOR_PASS', '')),
+  registerTenantName: env('CFOR_REGISTER_TENANT_NAME', env('CFOR_TENANT_NAME', '福奇科技')),
+  registerContactName: env('CFOR_REGISTER_CONTACT_NAME', ''),
+  registerEmail: env('CFOR_REGISTER_EMAIL', ''),
+  registerPassword: env('CFOR_REGISTER_PASSWORD', ''),
+  registerEmailCode: env('CFOR_REGISTER_EMAIL_CODE', ''),
+  fmsAccountSetId: env('CFOR_FMS_ACCOUNT_SET_ID', ''),
+  chromePath: env('CFOR_CHROME_PATH', ''),
+  headless: bool(process.env.CFOR_HEADLESS ?? process.env.CFOR_E2E_HEADLESS, true),
+  reuseSession: bool(process.env.CFOR_REUSE_SESSION, true),
+  evidenceDir: env('CFOR_EVIDENCE_DIR', env('CFOR_E2E_OUT', '/tmp/cfor-e2e')),
+  outputRoot: env('CFOR_E2E_OUT', env('CFOR_EVIDENCE_DIR', '/tmp/cfor-e2e')),
+  requestTimeoutMs: number('CFOR_E2E_REQUEST_TIMEOUT_MS', 30000),
+  browserTimeoutMs: number('CFOR_E2E_BROWSER_TIMEOUT_MS', 60000),
+  db: {
+    host: env('CFOR_DB_HOST', ''),
+    port: env('CFOR_DB_PORT', '3306'),
+    name: env('CFOR_DB_NAME', 'cfor_admin_standard'),
+    user: env('CFOR_DB_USER', ''),
+    password: env('CFOR_DB_PASSWORD', '')
   }
-}
+})
 
-// 懒加载：每次访问都重新读环境变量。
-// runner 解析 --headless/--no-headless 等参数时才写 process.env，
-// 而 import 是 hoist 先执行的；不用懒加载这些 CLI 开关永远不生效。
-export const config = new Proxy({}, {
-  get (_t, prop) { return buildConfig()[prop] }
+export const environmentSummary = () => ({
+  target: config.target,
+  webBase: config.webBase,
+  apiBase: config.apiUrl,
+  apiHealthUrl: config.apiHealthUrl || 'not-configured',
+  tenantId: config.tenantId || 'resolved-after-login',
+  tenantName: config.tenantName,
+  username: config.username,
+  registerTenantName: config.registerTenantName,
+  fmsAccountSetId: config.fmsAccountSetId || 'from-env',
+  dbName: config.db.name
 })
 
 export function resolveChromePath () {

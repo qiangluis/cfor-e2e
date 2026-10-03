@@ -1,4 +1,6 @@
 node_modules/
 scripts/e2e/.env
+scripts/e2e/config/.env
+scripts/e2e/config/local.env
 scripts/e2e/evidence/
 hidden_files/

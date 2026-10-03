@@ -1,66 +1,91 @@
-# CFOR E2E v2
+# CFOR E2E
 
-playwright-core + 本机 Chrome 的端到端回归。按《CFOR 5.0.1 功能/测试规范》第 12 章方案重写，
-用例清单来自 `scripts/e2e/cases/catalog.json`（34 个 case，11 个 suite）。
+独立自动化仓库，使用 `playwright-core` 和本机真实 Chrome。案例来源为
+`scripts/e2e/cases/catalog.json`，当前有 34 个套件、266 个案例。
+`READY/PARTIAL/DESIGNED/BLOCKED` 是实现状态，不是验收结果。
 
-## 快速开始（在 Mac 上）
+## 本地执行
+
+本轮只允许后端 `dev / 48083`、前端 `9151`，数据库只读检查仅允许
+`127.0.0.1:3306/cfor_admin_standard`。不要启动其他端口或向生产写测试数据。
+启动应用的方法见后端《CFOR-5.0.1重启后全功能测试执行清单-20261001.md》。
 
 ```bash
-cd cfor-e2e
-pnpm install        # 或 npm install
-cp .env.example scripts/e2e/.env
-# 编辑 scripts/e2e/.env：填 CFOR_PASS（必需），确认 CFOR_CHROME_PATH
-pnpm test:e2e:smoke   # 第一步：SMOKE-001 + SMOKE-002
-# 想看浏览器实际执行过程（默认 headless 不弹窗口）：
-node scripts/e2e/runner.mjs --suite smoke --no-headless
-pnpm test:e2e:full    # 全量（未实现的用例会诚实标记，不伪造通过）
+cd /Users/liuqiang/code/cfor-standard/cfor-e2e
+npm install
+cp scripts/e2e/config/local.env.example scripts/e2e/config/local.env
+# 在已忽略的 local.env 中配置测试密码；不要提交密码或数据库凭据。
+node scripts/e2e/runner.mjs --list
+node scripts/e2e/runner.mjs --suite smoke --headed
+node scripts/e2e/runner.mjs --suite workbench --headed
+node scripts/e2e/runner.mjs --suite all --headed
 ```
 
-常用参数：`--list` 列用例；`--suite fms` 只跑某套件；`--case FMS-001` 只跑单个；
-`--fresh` 清除断点从头跑（默认断点续跑）；`--no-reuse-session` 每个用例重新登录；
-`--no-headless` 有头调试。
+环境变量优先于文件配置。默认目标为 local，旧 `.env` 不会隐式切到生产。
+新 Mac 使用本机 Chrome 的原生 ARM64 架构，无需安装 Playwright 浏览器。
 
-## 环境变量
+| 变量 | 用途 |
+| --- | --- |
+| `CFOR_WEB_BASE` / `CFOR_API_BASE` | 本地前后端地址，固定回环端口 9151 / 48083 |
+| `CFOR_TENANT_ID` / `CFOR_TENANT_NAME` | 本轮 `1 / CFOR 标准平台` |
+| `CFOR_USERNAME` / `CFOR_PASSWORD` | 主验收账号 admin，密码从环境或 local.env 注入 |
+| `CFOR_CHROME_PATH` | 可选，本机 Chrome 可执行文件 |
+| `CFOR_E2E_OUT` | 证据目录，默认 `/tmp/cfor-e2e` |
+| `CFOR_E2E_REQUEST_TIMEOUT_MS` / `CFOR_E2E_BROWSER_TIMEOUT_MS` | 默认 30000 / 60000 ms |
+| `CFOR_DB_HOST/PORT/NAME/USER/PASSWORD` | 写侧案例（例如 PROC-014）必需的本地只读取证配置 |
+| `CFOR_API_ENCRYPT_REQUEST_KEY` / `CFOR_API_ENCRYPT_RESPONSE_KEY` | API 加密工具使用的环境参数，必须与目标环境一致，不提交实际值 |
+| `CFOR_WEB_ROOT` | Vite 检查专项使用的前端源码目录，默认相邻 `cfor/cfor-admin-vue3` |
 
-| 变量 | 说明 | 默认 |
-|---|---|---|
-| CFOR_TARGET | online / local | online |
-| CFOR_BASE_URL | online 站点根地址 | https://jixu-ai.com |
-| CFOR_API_PREFIX | API 前缀（与前端 public/config.json 的 projectUrl 一致） | /admin-api |
-| CFOR_WEB_URL / CFOR_LOCAL_API_URL | local 目标的前后端地址 | 127.0.0.1:9160 / 48083 |
-| CFOR_TENANT / CFOR_USER / CFOR_PASS | 登录身份（密码只从环境/.env 读） | 福奇科技 / admin / 必填 |
-| CFOR_CHROME_PATH | 本机 Chrome 可执行文件 | 自动探测 |
-| CFOR_EVIDENCE_DIR | 证据输出 | /tmp/cfor-e2e |
+## 执行规则
 
-注意：`CFOR_API_PREFIX` 只在 config 里拼一次，`lib/api.mjs` 不再拼接——
-旧版把含 `/admin-api` 的地址又拼一次导致 404 的坑已填。
+- 默认从头执行；显式 `--resume` 才跳过同环境、租户、账号、数据库和 catalog 版本此前已通过的案例。
+- `--case WBF-001` 只执行单例；`--suite smoke` 只执行套件，不自动补建其业务前置。
+- smoke 检查普通工作台不提前请求未访问的六个业务域首页，并包含首次打开设置抽屉及 AI 助手控件回归。人物视频检查非空 canvas 像素和播放推进，不只检查挂载；只打开/关闭，不修改设置或发送模型查询，不能代表 AI 模型与业务链路已验收。
+- 默认在本轮内复用登录态；`--no-reuse-session` 每例使用新的 Chrome 上下文。
+- `FAIL/BLOCKED` 立即停止；修复应用后重启两端再复测，不通过时不继续后续业务写侧。
+- 控制台、页面、业务 API 和浏览器失败请求均参与失败判定；连接错误不能只记录而仍显示通过。
+- 未实现、空断言、缺少前置和仅部分实现不得登记 PASS；包含此类案例的全量报告退出非零。
+- 多角色业务流程须先通过真实账号接口/页面创建关联用户，再使用相互隔离的 Chrome 上下文。
+- 不以页面打开或 HTTP 200 代表业务通过；检查业务 code、真实状态、来源关联、幂等、反向与权限。
+- 接口兼容 `CommonResult(code=0)` 与既有 `Result(code=200, success=true)`；`success=false` 或只有 HTTP 200 不能通过。
+- `PROC-014` 通过业务接口创建 `AUTOTEST-PROC-*` 两行请购，在 Chrome 中关闭分录并回读数据库；只操作专用测试单据并保留终态证据。权限、整单及反向未全部补齐时报告仍为 `PARTIAL`，退出非零。
+- `PROC-014` 会创建仅有请购查询权限的关联账号，以第二个隔离 Chrome 检查关闭入口和接口越权，结束后停用账号；任何失败断言均优先记 `FAIL`，不被 `PARTIAL` 覆盖。
+- `PROC-014` 创建单据前必须确认迁移失败数、开启 Job 数与活动 Quartz 触发器数均为 0；`JobStatusEnum.NORMAL=1`、`STOP=2`，不能用 `status=0` 错算开启数。
+- `PB150-OUTSOURCE-PORTAL-001` 暂时返回 `BLOCKED`：旧门户 smoke 使用模拟响应及 9152，不能从真实业务 runner 调用。需要补齐 9151 上的真实登录、供应商映射与业务前置后再验收。
+- `WMS-OP-001` 暂时返回 `BLOCKED`：模拟的入库单 ID 不是实际 101 草稿或库存证据。历史组件脚本隔离到 `scripts/e2e/legacy/`，不从真实 runner 调用。
 
-## 证据输出
+## 请购页面前置
 
+重建库可能缺少 `erp_purchase_request_no`。以下命令仅在本地租户 1 完全没有该规则时，
+通过真实新增/发布 API 补入历史定义 `CGSQ + yyMMdd + 3 位流水`；已存在的规则不覆盖，
+未生效配置不会自动发布。需要配置本地数据库只读凭据，准备报告与业务验收报告分开。
+这只能补测试环境前置，不代表初始化模板完整性已通过。
+
+```bash
+node scripts/e2e/prepare-purchase-request-numbering.mjs
+npm run test:e2e:request-ui
 ```
-$CFOR_EVIDENCE_DIR/<runId>/
-  result.json      # 机器可读结果
-  summary.md       # 人读报告（含分层断言明细）
-  screenshots/     # 每个用例截图，失败时额外存 *-FAIL.png
-$CFOR_EVIDENCE_DIR/checkpoint.json  # 断点：已通过的 caseId（--fresh 清除）
-$CFOR_EVIDENCE_DIR/session.json     # 登录态（--reuse-session 复用）
+
+页面回归覆盖 1600/1280/1024px 的固定列、输入框全宽点击、筛选展开/收起、
+字段配置定位、分页图例、操作列、首屏延迟资源、首次表单真实取号和来源页签。
+请购页面回归现在同时检查首屏不超过 5 秒，并记录导航和最慢资源的脱敏耗时；
+布局通过但超时仍为 FAIL。须注明是否为重启后的首次访问，不以热缓存通过覆盖冷加载失败。
+该回归不代表完整请购状态机已经验收通过。
+打开新增表单会消耗编号，但不保存请购单、不生成来源单、不执行打印。
+
+## 证据与基础测试
+
+每轮输出 `result.json`、`summary.md`、`screenshots/`、`trace/browser.zip`。
+断点在 `checkpoints/<环境摘要>.json`；`--fresh` 清除当前范围断点。
+API 摘要脱敏；Chrome trace 可能包含真实请求与登录凭据，只保留本机，不提交或公开。
+
+```bash
+npm run test:e2e:unit
+npm run test:e2e:vite-lint
+node scripts/e2e/tests/login-layout.mjs
 ```
 
-## v1 → v2 修复清单
+Vite 专项需要前端依赖已安装；使用隔离缓存与自动清理的测试文件，不启动额外端口。
+覆盖内容缓存、异步格式化器诊断、源码变化重新报错、修正恢复、生成子模块跳过重复检查与生产构建范围。
 
-1. runner 漏传 `caseId` 给 suite（SMOKE/FMS 分支走错）→ 必传。
-2. 登录成功判定解析加密响应体 `body.code`（前端实际加密了响应，必失败）→
-   改为页面状态判定（离开 /login + 用户标识可见）。
-3. checkpoint 只写不读 → 默认读断点续跑。
-4. `--reuse-session` 只解析不实现 → storageState 真正复用，默认登录一次。
-5. PARTIAL 空桩被记 PASS → 未实现只记 PARTIAL/SKIP。
-6. 登录是"租户校验 → 用户名密码"多步流程 → 先填租户名触发校验再填账号。
-7. 租户显示名陷阱：登录后右上角显示「乐之木电子科技」而非注册名「福奇科技」→
-   租户断言走 API 的 tenantId，不走页面显示名。
-
-## 当前状态
-
-- 已真实实现：SMOKE-001、SMOKE-002、FMS-001、FMS-002。
-- 其余 30 个 case 为 DESIGNED/BLOCKED 诚实桩（runner 跳过，不伪造通过）。
-- 登录页选择器在 `scripts/e2e/lib/browser.mjs` 顶部 SEL，多候选兜底；
-  以浏览器实测为准，若线上 DOM 漂移优先按实测调整。
+应用验收按执行清单 Wave 顺序推进，并把实际结果、缺陷和复测证据回写后端执行清单及回归矩阵。
