@@ -309,29 +309,48 @@ export async function submitTenantRegistration (page) {
   await page.getByText('申请已提交', { exact: true }).waitFor({ state: 'visible' })
 }
 
-export async function openRoute (page, pathname) {
+export async function openRoute (page, pathname, options = {}) {
   const failures = watchApiFailures(page)
   const target = new URL(`${config.webBase}${pathname}`)
   // Backend menus are converted into dynamic Vue Router routes after login.
   // A real deep navigation lets the app rebuild that route scope deterministically.
-  await page.goto(target.toString(), {
-    waitUntil: 'domcontentloaded',
-    timeout: config.browserTimeoutMs
-  })
-  await page.waitForFunction(
-    (expectedPath) => window.location.pathname === expectedPath,
-    target.pathname,
-    { timeout: config.browserTimeoutMs }
-  )
-  await page.waitForFunction(
-    () => {
-      const text = document.body?.innerText || ''
-      return text.includes('工作台') && text.length > 100
-    },
-    null,
-    { timeout: config.browserTimeoutMs }
-  )
-  return { failures }
+  const readyTimeoutMs = options.readyTimeoutMs || config.browserTimeoutMs
+  const retries = Number.isInteger(options.retries) ? options.retries : 0
+  let lastError
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      await page.goto(target.toString(), {
+        waitUntil: 'domcontentloaded',
+        timeout: config.browserTimeoutMs
+      })
+      await page.waitForFunction(
+        (expectedPath) => window.location.pathname === expectedPath,
+        target.pathname,
+        { timeout: config.browserTimeoutMs }
+      )
+      if (options.readySelector) {
+        await page.locator(options.readySelector).first().waitFor({
+          state: 'visible',
+          timeout: readyTimeoutMs
+        })
+      } else {
+        await page.waitForFunction(
+          (readyText) => {
+            const text = document.body?.innerText || ''
+            return text.includes(readyText) && text.length > 100
+          },
+          options.readyText || '工作台',
+          { timeout: readyTimeoutMs }
+        )
+      }
+      return { failures }
+    } catch (error) {
+      lastError = error
+      if (attempt === retries) throw error
+      await page.waitForTimeout(500)
+    }
+  }
+  throw lastError
 }
 
 export async function tableRows (page) {
