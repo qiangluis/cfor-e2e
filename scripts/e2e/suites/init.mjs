@@ -6,6 +6,11 @@ import {
   openRoute,
   submitTenantRegistration
 } from '../lib/browser.mjs'
+import {
+  assertSafeCaseScope,
+  markPartial,
+  scopeNote
+} from './init-coverage.mjs'
 
 export const cases = ['INIT-001', 'INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-001', 'PB001-002', 'PB002-001', 'PB029-001', 'PB029-002', 'PB032-001', 'PB032-002', 'PB032-003', 'PB032-004', 'PB032-005', 'PB032-006', 'PB033-001', 'PB033-002', 'PB034-001', 'PB003-001', 'PB004-001', 'PB005-001', 'PB007-001', 'PB008-001', 'PB008-002', 'PB009-001', 'PB010-001', 'PB011-001', 'PB012-001', 'PB017-001', 'PB018-001', 'PB023-001', 'PB023-002', 'PB028-001', 'PB039-001', 'PB039-002', 'PB039-003']
 
@@ -50,6 +55,8 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   if (caseId !== 'INIT-001') {
     currentToken = await loginWithCredentials(page)
   }
+
+  assertSafeCaseScope(caseRecord, caseId)
 
   if (caseId === 'INIT-001') {
     const lookup = await publicRequest(
@@ -117,7 +124,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: page.url()
     })
     caseRecord.evidence.push('真实浏览器打开企业组织资料页并检查企业类型选项')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB001-002') {
@@ -141,7 +148,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `初始化中心三种 Logo 标签=${initLogoLabelCounts.join('/')}`
     })
     caseRecord.evidence.push('真实浏览器打开企业组织资料页；自动 Logo 持久化待后端完整品牌契约完成后执行')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB002-001') {
@@ -167,7 +174,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `cards=${cardCount} monthPickers=${monthPickerCount}`
     })
     caseRecord.evidence.push('真实浏览器请求子系统目录并检查初始化中心卡片；套餐外写侧、依赖和锁定保护由后端定向测试覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB029-001') {
@@ -189,7 +196,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `HTTP ${candidates.status()} candidates=${candidateList.length}`
     })
     caseRecord.evidence.push('真实浏览器通过当前租户上下文读取 PB-029 退役摘要与候选接口；旧表已退役为只读兼容视图')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB029-002') {
@@ -302,7 +309,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `HTTP=${response.status()} count=${records.length}`
     })
     caseRecord.evidence.push('真实浏览器打开 Base 存货档案并读取分页；采购、销售与 WMS 写侧拒绝由 Base 场景校验单测和模块编译覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-002') {
@@ -326,7 +333,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `HTTP=${response.status()} count=${records.length}`
     })
     caseRecord.evidence.push('真实浏览器打开采购/销售出入库入口并读取统一存货列表；服务端场景拒绝由 Base 单测和 ERP 模块构建覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-003') {
@@ -346,7 +353,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `natures=${[...natures].join(',') || 'n/a'}`
     })
     caseRecord.evidence.push('真实浏览器打开生产 BOM 入口并读取统一存货档案形态；MES_BOM/MES_WORK_ORDER/MRP_DEMAND 三个场景拒绝由 Base 单测覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-004') {
@@ -367,7 +374,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `content-type=${templateContentType || 'n/a'}`
     })
     caseRecord.evidence.push('真实浏览器从存货档案页下载统一导入模板；模板字段与 Base 统一写侧校验由后端构建覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-005') {
@@ -386,7 +393,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `reason=${material?.reason || 'n/a'}`
     })
     caseRecord.evidence.push('真实浏览器读取初始化中心存货就绪项；档案形态、主单位、保质期与非实物库存隔离由后端就绪 SQL 校验')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-006') {
@@ -405,7 +412,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: '契约由 Base 单测覆盖：未完成采购/销售/生产订单或 BOM 引用存在时不允许关闭对应能力'
     })
     caseRecord.evidence.push('真实浏览器读取存货档案契约；能力关闭门禁由后端单测覆盖，未在生产数据上执行写操作')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB033-001') {
@@ -433,7 +440,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `customer=${customerLevels.length} supplier=${supplierLevels.length}`
     })
     caseRecord.evidence.push('真实浏览器在初始化上下文请求客商等级分页和角色精简列表；编码修改/引用删除保护由 Base 单测覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB033-002') {
@@ -465,7 +472,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `HTTP=${scopeResponse.status()} count=${scopeLevels?.length ?? 'invalid'}`
     })
     caseRecord.evidence.push('真实浏览器打开客商等级设置页并检查查询项与新增入口；本案例只读，不改写等级目录')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB034-001') {
@@ -505,7 +512,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
         `afterSalesCandidates=${candidates.filter((item) => item?.sourceDomain === 'AFTER_SALES_CUSTOMER').length}`
     })
     caseRecord.evidence.push('真实浏览器在当前租户上下文读取统一客商迁移摘要和候选接口；本案例不执行合并、写入或删除')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB039-001') {
@@ -543,7 +550,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: page.url()
     })
     caseRecord.evidence.push('真实浏览器打开平台设置行业目录并读取统一行业树；改码、引用删除和停用门禁由服务层测试覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB039-002') {
@@ -632,7 +639,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `HTTP ${readiness.status()} status=${rootItem?.status || 'missing'}`
     })
     caseRecord.evidence.push('真实浏览器打开部门管理页并检查 PB-003 组织字段；写侧数据使用测试部门')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB004-001') {
@@ -677,7 +684,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: page.url()
     })
     caseRecord.evidence.push('真实浏览器打开角色页并读取角色分页；菜单父链补齐、越权拒绝和无效资源拒绝由后端权限测试覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB007-001') {
@@ -715,7 +722,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: '普通编辑不可修改 username；创建时后端允许使用手机号补齐'
     })
     caseRecord.evidence.push('真实浏览器打开用户管理页并检查账号/手机号字段；跨租户和后端不可变校验由服务层覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB008-002') {
@@ -758,7 +765,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: '后端按 tenant_id 查询；双租户互斥写侧由接口环境验证'
     })
     caseRecord.evidence.push('真实浏览器打开单据核批配置入口并请求列表；Flyway 唯一键和跨租户串配由后端迁移与服务代码覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB010-001') {
@@ -778,7 +785,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: '已发布模板不可原地覆盖；版本递增和默认模板唯一约束由服务层与 Flyway 覆盖'
     })
     caseRecord.evidence.push('真实浏览器打开打印模板入口并读取分页；发布不可变、版本递增和租户隔离由后端测试与迁移覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB011-001') {
@@ -813,7 +820,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `draft=${hasDraft}；发布入口仅对草稿版本显示`
     })
     caseRecord.evidence.push('真实浏览器打开编号设置页面并读取版本/生效字段；发布态、结构片段、原子取号与租户隔离由后端测试和 Flyway 覆盖')
-    return { designed: true }
+    return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB012-001') {
