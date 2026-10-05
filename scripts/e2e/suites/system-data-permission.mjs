@@ -4,13 +4,14 @@ import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 export const cases = ['AUTH-DATA-003', 'AUTH-DATA-005', 'AUTH-DATA-006', 'PB006-001']
 
 const DEPT_CUSTOM = 2
+const dataOf = (response) => response?.data ?? response
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
 
   if (caseId === 'AUTH-DATA-003') {
-    const deptList = await api.getBusiness('/system/dept/list')
+    const deptList = dataOf(await api.getBusiness('/system/dept/list'))
     const depts = Array.isArray(deptList) ? deptList : []
     caseRecord.checks.push({
       name: '当前租户部门清单可读取',
@@ -19,13 +20,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
 
     const roleCode = `E2E_PB006_${Date.now()}`
-    const roleId = await api.postBusiness('/system/role/create', {
+    const roleId = dataOf(await api.postBusiness('/system/role/create', {
       name: 'PB006 E2E 数据权限角色',
       code: roleCode,
       sort: 99,
       status: 0,
       remark: 'PB-006 自定义部门校验用例，用例末尾删除'
-    })
+    }))
     caseRecord.checks.push({
       name: '用例角色创建成功',
       passed: Boolean(roleId),
@@ -50,7 +51,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       dataScope: DEPT_CUSTOM,
       dataScopeDeptIds: [validDept?.id]
     })
-    const rolePage = await api.getBusiness('/system/role/page?pageNo=1&pageSize=100')
+    const rolePage = dataOf(await api.getBusiness('/system/role/page?pageNo=1&pageSize=100'))
     const persisted = (rolePage?.list || []).find((item) => item?.id === roleId)
     caseRecord.checks.push({
       name: '当前租户有效部门可保存为自定义数据范围',
@@ -66,7 +67,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'AUTH-DATA-005' || caseId === 'AUTH-DATA-006') {
-    const menuTree = await api.getBusiness('/system/menu/list')
+    const menuTree = dataOf(await api.getBusiness('/system/menu/list'))
     const flatMenus = []
     const walk = (nodes) => {
       ;(Array.isArray(nodes) ? nodes : []).forEach((node) => {
@@ -83,14 +84,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
 
     const roleCode = `E2E_PB006_AMT_${Date.now()}`
-    const roleId = await api.postBusiness('/system/role/create', {
-      name: 'PB006 E2E 金额权限角色',
+    const roleId = dataOf(await api.postBusiness('/system/role/create', {
+      name: `PB006 E2E 金额权限角色 ${Date.now()}`,
       code: roleCode,
       sort: 99,
       status: 0,
       remark: 'PB-006 敏感金额权限用例，用例末尾删除'
-    })
-    const roleMenus = await api.getBusiness(`/system/permission/list-role-menus?roleId=${roleId}`)
+    }))
+    const roleMenus = dataOf(await api.getBusiness(`/system/permission/list-role-menus?roleId=${roleId}`))
     const grantedMenuIds = Array.isArray(roleMenus) ? roleMenus : []
     caseRecord.checks.push({
       name: '新建角色默认不包含敏感金额权限',
@@ -103,7 +104,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         roleId,
         menuIds: [...grantedMenuIds, sensitiveMenu.id]
       })
-      const afterGrant = await api.getBusiness(`/system/permission/list-role-menus?roleId=${roleId}`)
+      const afterGrant = dataOf(await api.getBusiness(`/system/permission/list-role-menus?roleId=${roleId}`))
       caseRecord.checks.push({
         name: '授予敏感金额权限后角色菜单可回读',
         passed: (Array.isArray(afterGrant) ? afterGrant : []).includes(sensitiveMenu.id),
@@ -113,7 +114,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         roleId,
         menuIds: grantedMenuIds.filter((id) => id !== sensitiveMenu.id)
       })
-      const afterRevoke = await api.getBusiness(`/system/permission/list-role-menus?roleId=${roleId}`)
+      const afterRevoke = dataOf(await api.getBusiness(`/system/permission/list-role-menus?roleId=${roleId}`))
       caseRecord.checks.push({
         name: '撤回敏感金额权限后角色菜单立即失效',
         passed: !(Array.isArray(afterRevoke) ? afterRevoke : []).includes(sensitiveMenu.id),
@@ -122,19 +123,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     }
 
     if (caseId === 'AUTH-DATA-005') {
-      const orderPage = await api.getBusiness('/erp/sale-order/page?pageNo=1&pageSize=10')
-      const rows = Array.isArray(orderPage?.data?.list) ? orderPage.data.list : []
+      const orderPage = dataOf(await api.getBusiness('/erp/sale-order/page?pageNo=1&pageSize=10'))
+      const rows = Array.isArray(orderPage?.list) ? orderPage.list : []
       const amountRows = rows.filter((item) => item?.totalPrice != null)
       caseRecord.checks.push({
         name: '有权限账号读取订单金额为真实数值（脱敏由 @SensitiveAmount 统一判定）',
         passed: rows.length === 0 || amountRows.every((item) => typeof item.totalPrice === 'number'),
         details: `rows=${rows.length} amountRows=${amountRows.length}`
       })
-      const receivableStatistics = await api.getBusiness(
+      const receivableStatistics = dataOf(await api.getBusiness(
         '/finance/finReceivable/getReceivablesStatistics?pageNo=1&pageSize=10'
-      )
-      const statisticsRows = Array.isArray(receivableStatistics?.data?.list)
-        ? receivableStatistics.data.list
+      ))
+      const statisticsRows = Array.isArray(receivableStatistics?.list)
+        ? receivableStatistics.list
         : []
       const statisticsAmountFields = ['receivableAmount', 'receivedAmount', 'unReceivedAmount']
       const invalidStatisticsRows = statisticsRows.filter((row) =>

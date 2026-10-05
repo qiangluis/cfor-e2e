@@ -18,6 +18,8 @@ const flattenDepartments = (nodes) =>
 
 const responseData = (payload) => payload?.data ?? payload
 
+export const hasDeadLetterSamples = (rows) => Array.isArray(rows) && rows.length > 0
+
 const loadFormalModelPage = async (api) => {
   const result = await api.getBusiness(
     `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
@@ -214,7 +216,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: Array.isArray(deadLetters),
       details: `rows=${Array.isArray(deadLetters) ? deadLetters.length : 'n/a'}`
     })
-    caseRecord.checks.push({
+    if (hasDeadLetterSamples(deadLetters)) caseRecord.checks.push({
       name: '成本死信包含幂等、重试和人工接管字段',
       passed:
         Array.isArray(deadLetters) &&
@@ -245,6 +247,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     await saveScreenshot(page, outputDir, 'cost-workflow-outbox', record)
     caseRecord.evidence.push('成本 Outbox 死信接口结构与成本工作台截图')
+    if (!hasDeadLetterSamples(deadLetters)) {
+      return {
+        token,
+        api,
+        partial: true,
+        note: '当前没有死信样本，仅验证空列表接口；重试、死信字段和人工接管闭环待补真实事件后复测'
+      }
+    }
   }
 
   if (caseId === 'COST-005') {

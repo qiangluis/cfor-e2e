@@ -32,6 +32,12 @@ const listOf = (response) => {
   return Array.isArray(data?.list) ? data.list : []
 }
 
+export const isBusinessRejected = (response, code, message) =>
+  Boolean(response?.code === code && response.success !== true &&
+    typeof response.msg === 'string' && response.msg.includes(message))
+
+export const hasProjectFixture = (response) => listOf(response).length > 0
+
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
@@ -381,11 +387,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `projectId=${project.id}`
       })
     } else {
-      caseRecord.checks.push({
-        name: '存在可校验的交付项目',
-        passed: false,
-        details: '当前租户无交付项目，无法验证健康状态校验'
-      })
+      caseRecord.notes.push('当前租户无交付项目，健康状态校验缺少真实业务事实，标记 PARTIAL。')
+      return { token, api, partial: true }
     }
     return { token, api }
   }
@@ -451,37 +454,37 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB122-001') {
-    const itemResponse = await api.postBusiness('/after-sales/inspection-config/item/create', {
+    const itemFixture = {
       itemCode: unique('ASII'),
       itemName: 'E2E 售后巡检项目',
       resultType: 'BOOLEAN',
       status: 0
-    })
-    const itemId = dataOf(itemResponse)
+    }
+    let itemId
+    let planId
+    let assignmentId
+    try {
+    itemId = dataOf(await api.postBusiness('/after-sales/inspection-config/item/create', itemFixture))
     const planResponse = await api.postBusiness('/after-sales/inspection-config/plan/create', {
       planCode: unique('ASIP'),
       planName: 'E2E 售后巡检方案',
       items: [{ itemId, seq: 1, standard: '目视无异常' }],
       cycles: [{ cycleType: 'TIME', cycleValue: 30, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
     })
-    const planId = dataOf(planResponse)
-    await api.put(`/after-sales/inspection-config/plan/publish?id=${planId}`)
+    planId = dataOf(planResponse)
+    await api.putBusiness(`/after-sales/inspection-config/plan/publish?id=${planId}`)
     const plan = dataOf(await api.getBusiness(`/after-sales/inspection-config/plan/get?id=${planId}`))
     caseRecord.checks.push({
       name: '售后巡检方案发布记录版本',
       passed: plan.status === 'PUBLISHED' && plan.publishedVersion === plan.currentVersion,
       details: `status=${plan.status}, version=${plan.publishedVersion}`
     })
-    let deleteRejected = false
-    try {
-      await api.delete(`/after-sales/inspection-config/item/delete?id=${itemId}`)
-    } catch (error) {
-      deleteRejected = true
-    }
+    const deleteResponse = await api.delete(`/after-sales/inspection-config/item/delete?id=${itemId}`)
+    const deleteRejected = isBusinessRejected(deleteResponse, 400, '项目已被巡检方案引用，只能停用不能删除')
     caseRecord.checks.push({
       name: '被方案引用的巡检项目禁止删除',
       passed: deleteRejected,
-      details: '只能停用，保留执行历史'
+      details: JSON.stringify(deleteResponse)
     })
     const assetPage = await api.getBusiness(
       '/after-sales/asset/page?pageNo=1&pageSize=10&serviceStatus=IN_SERVICE'
@@ -493,7 +496,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         planId,
         status: 0
       })
-      const assignmentId = dataOf(assignmentResponse)
+      assignmentId = dataOf(assignmentResponse)
       const assignments = await api.getBusiness(
         `/after-sales/inspection-config/assignment/list?assetId=${inServiceAssetId}`
       )
@@ -502,12 +505,33 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         passed: listOf(assignments).some((item) => String(item.id) === String(assignmentId)),
         details: `assetId=${inServiceAssetId}, assignmentId=${assignmentId}`
       })
-      await api.delete(`/after-sales/inspection-config/assignment/delete?id=${assignmentId}`)
     } else {
       caseRecord.notes.push('当前租户无在保客户资产，跳过巡检方案资产分配断言')
     }
-    await api.put(`/after-sales/inspection-config/plan/disable?id=${planId}`)
-    await api.delete(`/after-sales/inspection-config/item/delete?id=${itemId}`)
+    } finally {
+      const cleanup = async (name, operation) => {
+        try {
+          await operation()
+          caseRecord.evidence.push(`清理：${name}`)
+        } catch (error) {
+          caseRecord.checks.push({ name: `清理：${name}`, passed: false, details: error.message })
+        }
+      }
+      if (assignmentId) await cleanup(`删除本轮资产分配 ${assignmentId}`, () =>
+        api.deleteBusiness(`/after-sales/inspection-config/assignment/delete?id=${assignmentId}`))
+      if (planId) await cleanup(`停用并回读本轮方案 ${planId}`, async () => {
+        await api.putBusiness(`/after-sales/inspection-config/plan/disable?id=${planId}`)
+        const disabled = dataOf(await api.getBusiness(`/after-sales/inspection-config/plan/get?id=${planId}`))
+        if (disabled?.status !== 'DISABLED') throw new Error('方案停用后状态未回读为 DISABLED')
+      })
+      if (itemId) await cleanup(`停用并回读本轮项目 ${itemId}，引用历史按契约保留`, async () => {
+        await api.putBusiness('/after-sales/inspection-config/item/update', { ...itemFixture, id: itemId, status: 1 })
+        const items = listOf(await api.getBusiness('/after-sales/inspection-config/item/list'))
+        if (!items.some((item) => String(item.id) === String(itemId) && item.status === 1)) {
+          throw new Error('巡检项目停用后状态未回读为 1')
+        }
+      })
+    }
     return { token, api }
   }
 
@@ -603,12 +627,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB123-001') {
     const categories = listOf(await api.getBusiness('/after-sales/modeling/category/list'))
-    let categoryId = categories.length ? categories[0].id : null
+    const categoryId = categories[0]?.id ?? null
     if (!categoryId) {
-      categoryId = dataOf(await api.postBusiness('/after-sales/modeling/category/create', {
-        categoryCode: unique('CAT'),
-        categoryName: 'E2E知识分类'
-      }))
+      caseRecord.notes.push('BLOCKED：当前租户无售后问题分类，无法在不造业务事实的前提下验证知识案例保存门禁。')
+      return { token, api, partial: true }
     }
     const documentPage = await api.getBusiness(
       '/ai/knowledge/document/page?pageNo=1&pageSize=100&status=0&parseStatus=PARSED&indexStatus=INDEXED'
@@ -617,7 +639,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const documents = Array.isArray(documentData)
       ? documentData
       : documentData?.list || documentData?.records || []
-    const invalidId = dataOf(await api.postBusiness('/after-sales/knowledge/save-draft', {
+    const invalidResponse = await api.post('/after-sales/knowledge/save-draft', {
       categoryId,
       title: 'E2E 未关联文档',
       symptom: '问题',
@@ -625,47 +647,24 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       keywords: ['E2E'],
       sourceType: 'MANUAL',
       desensitizationStatus: 'PASSED'
-    }))
-    await api.postBusiness(`/after-sales/knowledge/submit?id=${invalidId}`)
-    let rejectNoDoc = false
-    try {
-      await api.postBusiness(`/after-sales/knowledge/review?id=${invalidId}&approved=true&comment=E2E`)
-    } catch (error) {
-      rejectNoDoc = true
-    }
-    caseRecord.checks.push({
-      name: '未关联知识中枢文档不允许发布',
-      passed: rejectNoDoc,
-      details: '售后案例不再作为正文事实源'
     })
+    const rejectNoDoc = isBusinessRejected(invalidResponse, 1040011, '必须关联知识中枢文档及版本')
+    caseRecord.checks.push({
+      name: '未关联知识中枢文档在保存阶段即被拒绝',
+      passed: rejectNoDoc,
+      details: JSON.stringify(invalidResponse)
+    })
+    if (!rejectNoDoc) {
+      if (invalidResponse?.code === 0) caseRecord.notes.push(
+        `清理未完成：无文档草稿被意外保存，id=${dataOf(invalidResponse)}；无删除接口，未继续提交或发布。`)
+      return { token, api }
+    }
     const document = documents.find((item) => item?.id)
     if (!document) {
       caseRecord.notes.push('当前租户没有 PARSED + INDEXED 知识中枢文档，正向发布闭环等待真实文档前置条件。')
       return { token, api }
     }
-
-    const draftId = dataOf(await api.postBusiness('/after-sales/knowledge/save-draft', {
-      categoryId,
-      title: 'E2E 知识引用',
-      applicableScope: 'E2E测试范围',
-      keywords: ['E2E'],
-      sourceType: 'MANUAL',
-      knowledgeDocumentId: document.id,
-      knowledgeDocumentVersion: document.versionNo || 1,
-      desensitizationStatus: 'PASSED'
-    }))
-    await api.postBusiness(`/after-sales/knowledge/submit?id=${draftId}`)
-    await api.postBusiness(`/after-sales/knowledge/review?id=${draftId}&approved=true&comment=E2E`)
-    const published = dataOf(await api.getBusiness(`/after-sales/knowledge/get?id=${draftId}`))
-    caseRecord.checks.push({
-      name: '知识发布只引用企业知识中枢文档版本',
-      passed:
-        String(published?.knowledgeDocumentId) === String(document.id) &&
-        Number(published?.knowledgeDocumentVersion) === Number(document.versionNo || 1) &&
-        published?.hubPublishStatus === 'SYNCED',
-      details: `docId=${published?.knowledgeDocumentId}, hub=${published?.hubPublishStatus}`
-    })
-    return { token, api }
+    throw new Error('BLOCKED: 正向知识发布缺少撤销/删除清理接口，未创建或发布知识案例。')
   }
 
   if (caseId === 'PB124-001') {
@@ -978,7 +977,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: [categories, slaPolicies, reminderRules, evaluationTemplates].every((item) => Array.isArray(listOf(item))),
       details: `分类=${listOf(categories).length}, SLA=${listOf(slaPolicies).length}, 提醒=${listOf(reminderRules).length}, 评价模板=${listOf(evaluationTemplates).length}`
     })
-    await openRoute(page, '/after-sales/settings')
+    await openRoute(page, '/after-sales/settings', { readyText: '售后建模' })
     await page.waitForTimeout(1000)
     const settingsText = await page.locator('body').innerText()
     caseRecord.checks.push({

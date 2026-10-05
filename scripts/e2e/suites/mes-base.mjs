@@ -1,4 +1,5 @@
 import { createApiClient } from '../lib/api.mjs'
+import { asList } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
 export const cases = [
@@ -17,7 +18,10 @@ export const cases = [
   'PB038-002',
   'PB038-003',
   'PB038-004',
-  'PB038-005'
+  'PB038-005',
+  'PB039-001',
+  'PB039-002',
+  'PB039-003'
 ]
 
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
@@ -35,20 +39,26 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB081-001') {
     // 1. 确保存在在职 HRM 员工，验证建档默认开通系统登录账号
-    let employees = await api.getBusiness('/hrm/employee/simple-page?pageNo=1&pageSize=10&entryStatus=1')
-    let employee = (employees?.list || [])[0]
-    if (!employee) {
-      const employeeId = await api.postBusiness('/hrm/employee/create', {
-        name: 'E2E班组成员',
-        jobNumber: unique('E2EEMP'),
-        mobile: `137${Date.now().toString().slice(-8)}`,
-        entryStatus: 1,
-        type: 1,
-        entryTime: '2026-01-01 00:00:00'
-      })
-      employees = await api.getBusiness('/hrm/employee/simple-page?pageNo=1&pageSize=100&entryStatus=1')
-      employee = (employees?.list || []).find((item) => String(item.id) === String(employeeId))
-    }
+    const userAccountUsername = unique('E2EEMP')
+    const employeeIdResponse = await api.postBusiness('/hrm/employee/create', {
+      name: 'E2E班组成员',
+      jobNumber: userAccountUsername,
+      mobile: `137${Date.now().toString().slice(-8)}`,
+      entryStatus: 1,
+      type: 1,
+      entryTime: '2026-01-01T00:00:00',
+      createUserAccount: true,
+      userAccountUsername
+    })
+    const employeeId =
+      employeeIdResponse?.data?.id ??
+      employeeIdResponse?.data ??
+      employeeIdResponse?.id ??
+      employeeIdResponse
+    const employeeResponse = await api.getBusiness(
+      `/hrm/employee/get?id=${encodeURIComponent(employeeId)}`
+    )
+    const employee = employeeResponse?.data ?? employeeResponse
     caseRecord.checks.push({
       name: 'HRM 员工默认开通系统登录账号',
       passed: Boolean(employee && employee.userId),
@@ -57,13 +67,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
     // 2. 班组主档/成员引用必须解析为 HRM 员工
     const teamPage = await api.getBusiness('/mes/teamManage/list?pageNo=1&pageSize=100')
-    const teams = teamPage?.records || []
+    const teams = asList(teamPage?.data ?? teamPage)
     let referenceOk = true
     const referenceDetails = []
     for (const team of teams.slice(0, 5)) {
       if (team.leaderId) {
         const leader = await api.getBusiness(`/hrm/employee/simple-list?ids=${team.leaderId}`)
-        const hit = Array.isArray(leader) && leader.some((item) => String(item.id) === String(team.leaderId))
+        const leaderRows = asList(leader?.data ?? leader)
+        const hit = leaderRows.some((item) => String(item.id) === String(team.leaderId))
         referenceOk = referenceOk && hit
         referenceDetails.push(`team=${team.teamId},leader=${team.leaderId},hit=${hit}`)
       }
@@ -92,7 +103,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: invalidRejected ? '非法成员编号被拒绝' : '非法成员编号未被阻断'
     })
 
-    await openRoute(page, '/settings/production/team')
+    await openRoute(page, '/settings/production/team', { readyText: '班组' })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '班组维护页成员选择改为 HRM 员工，不再使用系统用户字典',
@@ -133,7 +144,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB102-001') {
     const routePage = await api.getBusiness('/mes/wmsTechRoute/list?pageNo=1&pageSize=10')
-    const route = (routePage?.records || [])[0]
+    const route = asList(routePage?.data ?? routePage)[0]
     if (!route) {
       caseRecord.checks.push({
         name: '产能版本按产品/工序/资源维度承载',
@@ -143,7 +154,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       caseRecord.evidence.push('PB-102 产能版本表 aps_tech_route_procedure_device_capacity 承接产品维度与发布状态')
       return { token, api }
     }
-    const detail = await api.getBusiness(`/mes/wmsTechRoute/getRouteCapacityDetail?routeId=${route.id}`)
+    const detailResponse = await api.getBusiness(`/mes/wmsTechRoute/getRouteCapacityDetail?routeId=${route.id}`)
+    const detail = detailResponse?.data ?? detailResponse
     const capacities = detail?.capacities || detail?.capacityList || []
     caseRecord.checks.push({
       name: '产能按产品、单位、节拍与日历承载',
@@ -155,11 +167,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     caseRecord.checks.push({
       name: '产能版本包含基准产量/时长/换型/版本/发布状态',
       passed:
-        sample === null ||
+        sample == null ||
         versionFields.every((field) => Object.prototype.hasOwnProperty.call(sample, field)),
       details: sample ? JSON.stringify(Object.keys(sample)) : '无产能明细，字段契约由 DO 保证'
     })
-    await openRoute(page, '/settings/production/technique')
+    await openRoute(page, '/settings/production/technique', { readyText: '工艺路线' })
     await saveScreenshot(page, outputDir, 'pb102-capacity-version', record)
     caseRecord.evidence.push('产能版本发布/停用与唯一有效发布校验由 aps_tech_route_procedure_device_capacity.publish_status 承载')
     return { token, api }
@@ -168,10 +180,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'PB102-002') {
     // 走真实写侧：以已持久化的工序设备节点创建产能草稿，再按节点+设备回读版本列表
     const routePage = await api.getBusiness('/mes/wmsTechRoute/list?pageNo=1&pageSize=10')
-    const route = (routePage?.records || [])[0]
-    const detail = route
+    const route = asList(routePage?.data ?? routePage)[0]
+    const detailResponse = route
       ? await api.getBusiness(`/mes/wmsTechRoute/getRouteCapacityDetail?routeId=${route.id}`)
       : null
+    const detail = detailResponse?.data ?? detailResponse
     const procedure = (detail?.procedureList || []).find(
       (item) => item?.routeSubId && (item?.deviceList || []).some((device) => device?.equipmentId)
     )
@@ -232,10 +245,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'PB102-003') {
     // 读取键已升级为「工序+设备+产品」：route 详情中同一设备的设备行按产品维度逐条展开
     const routePage = await api.getBusiness('/mes/wmsTechRoute/list?pageNo=1&pageSize=10')
-    const route = (routePage?.records || [])[0]
-    const detail = route
+    const route = asList(routePage?.data ?? routePage)[0]
+    const detailResponse = route
       ? await api.getBusiness(`/mes/wmsTechRoute/getRouteCapacityDetail?routeId=${route.id}`)
       : null
+    const detail = detailResponse?.data ?? detailResponse
     const procedures = detail?.procedureList || []
     const deviceRows = procedures.flatMap((procedure) => procedure.deviceList || [])
     caseRecord.checks.push({
@@ -277,23 +291,26 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB038-001') {
     const gradeCode = unique('G')
-    const gradeId = await api.postBusiness('/base/material-grade/create', {
+    const createResponse = await api.postBusiness('/base/material-grade/create', {
       code: gradeCode,
       name: `E2E品级${gradeCode}`,
       description: 'PB-038 automated e2e',
       sort: 60,
       status: 1
     })
+    const gradeId = createResponse?.data?.id ?? createResponse?.data ?? createResponse?.id ?? createResponse
     caseRecord.checks.push({
       name: '公共品级可创建',
       passed: Boolean(gradeId),
       details: `gradeId=${gradeId}`
     })
 
-    const page = await api.getBusiness(
+    const pageResponse = await api.getBusiness(
       `/base/material-grade/page?pageNo=1&pageSize=100&code=${encodeURIComponent(gradeCode)}`
     )
-    const found = (page?.list || []).find((item) => String(item.id) === String(gradeId))
+    const found = asList(pageResponse?.data ?? pageResponse).find(
+      (item) => String(item.id) === String(gradeId)
+    )
     caseRecord.checks.push({
       name: '品级分页可回读',
       passed: Boolean(found),
@@ -320,8 +337,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     await api.putBusiness(
       `/base/material-grade/update-status?id=${encodeURIComponent(gradeId)}&status=0`
     )
-    const simple = await api.getBusiness('/base/material-grade/simple-list')
-    const stillEnabled = (simple || []).some((item) => String(item.id) === String(gradeId))
+    const simpleResponse = await api.getBusiness('/base/material-grade/simple-list')
+    const simple = asList(simpleResponse?.data ?? simpleResponse)
+    const stillEnabled = simple.some((item) => String(item.id) === String(gradeId))
     caseRecord.checks.push({
       name: '停用品级不再出现在启用列表',
       passed: !stillEnabled,
@@ -344,7 +362,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: deleteOk ? '删除成功' : '删除失败'
     })
 
-    const presetCodes = (simple || [])
+    const presetCodes = simple
       .filter((item) => ['A', 'B', 'C'].includes(item.code))
       .map((item) => item.code)
     caseRecord.checks.push({
@@ -360,15 +378,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB038-002') {
     const ensureGrade = async (code, name) => {
-      const simple = await api.getBusiness('/base/material-grade/simple-list')
-      let grade = (simple || []).find((item) => item.code === code)
+      const simpleResponse = await api.getBusiness('/base/material-grade/simple-list')
+      const simple = asList(simpleResponse?.data ?? simpleResponse)
+      let grade = simple.find((item) => item.code === code)
       if (!grade) {
-        const id = await api.postBusiness('/base/material-grade/create', {
+        const createResponse = await api.postBusiness('/base/material-grade/create', {
           code,
           name,
           sort: 90,
           status: 1
         })
+        const id = createResponse?.data?.id ?? createResponse?.data ?? createResponse?.id ?? createResponse
         grade = { id, code, name }
       }
       return grade
@@ -377,19 +397,40 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const gB = await ensureGrade('B', 'B级')
     await ensureGrade('C', 'C级')
 
-    const listRes = await api.getBusiness('/mes/basMaterial/list?pageNo=1&pageSize=1')
-    const materials = listRes?.records || listRes?.list || listRes || []
-    const material = Array.isArray(materials) ? materials[0] : null
+    const listRes = await api.getBusiness('/mes/basMaterial/list?pageNo=1&pageSize=100')
+    const materials = asList(listRes?.data ?? listRes)
+    const inventoryCandidates = []
+    for (const candidate of materials) {
+      const inventoryRows = asList(
+        await api.getBusiness(
+          `/mes/stkIo/queryStockQty?pageNo=1&pageSize=100&materialId=${encodeURIComponent(candidate.id)}`
+        )
+      )
+      if (
+        String(candidate.inventoryNature || '').toUpperCase() === 'STOCK' &&
+        candidate.unitId != null &&
+        String(candidate.unitId).trim() !== '' &&
+        inventoryRows.length === 0
+      ) {
+        inventoryCandidates.push(candidate)
+      }
+    }
+    const material = inventoryCandidates[0] || null
     if (!material) {
       caseRecord.checks.push({
         name: '存货品级配置契约',
         passed: true,
-        details: '当前租户没有可编辑存货，写侧契约由 MesBasMaterialServiceImpl 单测与接口定义保证'
+        details: '当前租户没有同时满足实物存货、主单位非空且无库存的测试存货，无法安全执行写侧'
       })
       caseRecord.evidence.push(
-        '存货品级开关/默认品级/允许范围校验已落地（BaseMaterialGradeServiceImpl + MesBasMaterialServiceImpl）'
+        '存货品级开关/默认品级/允许范围校验已落地；真实写侧缺少合法无库存存货前置'
       )
-      return { token, api }
+      return {
+        token,
+        api,
+        partial: true,
+        note: '缺少合法无库存实物存货前置，PB-038-002 写侧暂记 PARTIAL'
+      }
     }
 
     const original = await api.getBusiness(
@@ -468,7 +509,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB038-003') {
     const report = await api.getBusiness('/mes/stkIo/queryStockQty?pageNo=1&pageSize=20')
-    const rows = report?.list || report?.records || []
+    const rows = asList(report?.data ?? report)
     const first = rows[0]
     const hasGradeKeys = first
       ? Object.prototype.hasOwnProperty.call(first, 'gradeId') &&
@@ -482,7 +523,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const filtered = await api.getBusiness(
       '/mes/stkIo/queryStockQty?pageNo=1&pageSize=20&gradeId=__NO_SUCH_GRADE__'
     )
-    const filteredRows = filtered?.list || filtered?.records || []
+    const filteredRows = asList(filtered?.data ?? filtered)
     caseRecord.checks.push({
       name: '现存量报表支持按品级筛选',
       passed: Array.isArray(filteredRows) && filteredRows.length === 0,
@@ -497,18 +538,26 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'PB038-004') {
     // PB-038：WMS 出入库单据明细品级选择控件
     const gradeList = await api.getBusiness('/base/material-grade/simple-list')
-    const grades = Array.isArray(gradeList?.data) ? gradeList.data : []
+    const grades = asList(gradeList?.data ?? gradeList)
     caseRecord.checks.push({
       name: '公共品级目录启用项可加载',
       passed: Array.isArray(grades),
       details: `grades=${grades.length}`
     })
-    await openRoute(page, '/wms/stock/in/purchase')
-    await page.waitForTimeout(1000)
+    await openRoute(page, '/wireSideWarehouse/in/inPurchase', { readyText: '入库单号' })
+    await page
+      .locator('.vxe-table--render-default, .vxe-table, .app-container')
+      .first()
+      .waitFor({ state: 'visible', timeout: 30000 })
+    await page.getByText('入库单号', { exact: true }).first().waitFor({
+      state: 'visible',
+      timeout: 30000
+    })
     const headers = await page.locator('.el-table th, .vxe-header--column').allInnerTexts()
+    const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '入库单据列表页可打开',
-      passed: headers.length > 0,
+      passed: headers.length > 0 && bodyText.includes('入库单号'),
       details: headers.slice(0, 12).join(' | ')
     })
     caseRecord.evidence.push(
@@ -520,7 +569,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'PB038-005') {
     // PB-038：办公用品/样品/赠品/销售出库明细列配置齐全且含品级列
     const gradeList = await api.getBusiness('/base/material-grade/simple-list')
-    const grades = Array.isArray(gradeList?.data) ? gradeList.data : []
+    const grades = asList(gradeList?.data ?? gradeList)
     caseRecord.checks.push({
       name: '公共品级目录启用项可加载',
       passed: Array.isArray(grades),
@@ -528,22 +577,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
 
     const routes = [
-      '/wms/stock/in/material',
-      '/wms/stock/out/material',
-      '/wms/stock/in/sample',
-      '/wms/stock/out/sample',
-      '/wms/stock/in/gift',
-      '/wms/stock/out/gift',
-      '/wms/stock/out/sell'
+      ['/wireSideWarehouse/in/inMaterial', '办公用品入库', '今日入库'],
+      ['/wireSideWarehouse/out/outMaterial', '办公用品出库', '今日出库'],
+      ['/wireSideWarehouse/in/inSample', '样品入库', '今日入库'],
+      ['/wireSideWarehouse/out/outSample', '样品出库', '今日出库'],
+      ['/wireSideWarehouse/in/inGift', '赠品入库', '今日入库'],
+      ['/wireSideWarehouse/out/outGift', '赠品出库', '今日出库'],
+      ['/wireSideWarehouse/out/outSell', '销售出库', '今日已审']
     ]
     const opened = []
-    for (const route of routes) {
-      await openRoute(page, route)
+    for (const [route, label, readyText] of routes) {
+      await openRoute(page, route, { readyText, retries: 1 })
       await page.waitForTimeout(600)
-      const target = route.split('/').pop()
-      const reached = page.url().includes(`/wms/stock/`) && page.url().includes(target)
+      const reached = page.url().includes(route)
       const text = await page.evaluate(() => document.body.innerText || '')
-      opened.push(`${route}:${reached ? 'ok' : 'redirect'}(${text.length})`)
+      opened.push(`${label}:${reached ? 'ok' : 'redirect'}(${text.length})`)
     }
     caseRecord.checks.push({
       name: '办公用品/样品/赠品/销售出库列表页可打开',
@@ -553,6 +601,106 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     caseRecord.evidence.push(
       'dialogData.ts 恢复 materialInOut/sampleInOut/giftInOut 三套明细列配置并统一加入 gradeId_dictText（grade_select 槽位），销售出库 formDialog/formDialogBom/formDetail 的 otherTableColumns 同步加入品级列'
     )
+    return { token, api }
+  }
+
+  if (caseId === 'PB039-001') {
+    await openRoute(page, '/systemModel/base/organization/enterprise-organization', {
+      readyText: '行业大类',
+      retries: 1
+    })
+    const tree = await api.getBusiness('/system/system-init/industry-template/tree')
+    const rows = tree?.data ?? tree
+    const root = (Array.isArray(rows) ? rows : []).find((item) => item?.code === 'MANUFACTURING') || rows?.[0]
+    const children = root?.children || []
+    caseRecord.checks.push({
+      name: '统一行业目录返回大行业到细分行业两层树',
+      passed:
+        Array.isArray(rows) &&
+        rows.length > 0 &&
+        rows.every((item) => item?.level === 'INDUSTRY' && item?.selectable === false) &&
+        children.length > 0 &&
+        children.every(
+          (item) =>
+            item?.level === 'SUB_INDUSTRY' &&
+            item?.parentCode === root?.code &&
+            item?.selectable === true
+        ),
+      details: `roots=${rows?.length || 0} children=${children.length}`
+    })
+    const bodyText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '平台行业维护页真实渲染',
+      passed: bodyText.includes('行业'),
+      details: page.url()
+    })
+    caseRecord.evidence.push('真实登录、行业树接口与平台设置页面截图')
+    await saveScreenshot(page, outputDir, 'pb039-industry-maintenance', record)
+    return { token, api }
+  }
+
+  if (caseId === 'PB039-002') {
+    await openRoute(page, '/systemInit/index', { readySelector: '.system-init' })
+    const editButton = page
+      .locator('button')
+      .filter({ hasText: '修改行业与板块' })
+      .filter({ visible: true })
+      .first()
+    await editButton.waitFor({ state: 'visible', timeout: 30000 })
+    await editButton.click()
+    await page.locator('.init-wizard--first').waitFor({ state: 'visible', timeout: 30000 })
+    const parentLabel = page.getByText('行业大类', { exact: true }).first()
+    const leafLabel = page.getByText('细分行业', { exact: true }).first()
+    await parentLabel.waitFor({ state: 'visible', timeout: 30000 })
+    await leafLabel.waitFor({ state: 'visible', timeout: 30000 })
+    const oldScenarioGrid = await page.locator('[data-industry]').count()
+    caseRecord.checks.push({
+      name: '初始化中心只保留一套行业级联选择',
+      passed:
+        (await parentLabel.count()) > 0 &&
+        (await leafLabel.count()) > 0 &&
+        oldScenarioGrid === 0,
+      details: `parent=${await parentLabel.count()} leaf=${await leafLabel.count()} oldScenarioCards=${oldScenarioGrid}`
+    })
+    caseRecord.checks.push({
+      name: '初始化行业侧重使用统一细分行业配置',
+      passed:
+        (await page.getByText(/行业侧重/).count()) > 0 ||
+        (await page.getByText(/行业场景/).count()) === 0,
+      details: '行业场景卡已由随细分行业加载的侧重说明替代'
+    })
+    caseRecord.evidence.push('真实浏览器验证初始化中心单一行业选择和数据回读入口')
+    return { token, api }
+  }
+
+  if (caseId === 'PB039-003') {
+    await openRoute(page, '/systemModel/base/organization/enterprise-organization', {
+      readyText: '行业大类',
+      retries: 1
+    })
+    const tree = await api.getBusiness('/system/system-init/industry-template/tree')
+    const rows = tree?.data ?? tree
+    const root = (Array.isArray(rows) ? rows : []).find((item) => item?.code === 'MANUFACTURING')
+    const leaf = root?.children?.find((item) => item?.selectable !== false)
+    const organizationResponse = await api.getBusiness('/system/enterprise-organization/current')
+    const organization = organizationResponse?.data ?? organizationResponse
+    const industryLabels = await Promise.all([
+      page.getByText('行业大类', { exact: true }).count(),
+      page.getByText('细分行业', { exact: true }).count()
+    ])
+    caseRecord.checks.push({
+      name: '企业资料与初始化中心共用统一行业目录',
+      passed: Array.isArray(rows) && Boolean(root) && Boolean(leaf) && industryLabels.every((count) => count > 0),
+      details: `root=${root?.code || 'missing'} leaf=${leaf?.code || 'missing'}`
+    })
+    caseRecord.checks.push({
+      name: '企业资料已保存稳定行业编码或可只读兼容历史名称',
+      passed:
+        typeof organization?.industryCategory === 'string' &&
+        typeof organization?.industrySubCategory === 'string',
+      details: `category=${organization?.industryCategory || 'empty'} sub=${organization?.industrySubCategory || 'empty'}`
+    })
+    caseRecord.evidence.push('真实浏览器打开企业资料页并比对统一行业树和当前企业资料回读')
     return { token, api }
   }
 

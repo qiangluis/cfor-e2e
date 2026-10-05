@@ -53,14 +53,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: !protocols.includes('not_registered_protocol'),
       details: protocols.join(',')
     })
-    await openRoute(page, '/iot/device')
+    await openRoute(page, '/iot/device/device', {
+      readySelector: 'input[placeholder="请输入设备名称"]'
+    })
     await saveScreenshot(page, outputDir, 'iot-004-capability', record)
     return { token, api }
   }
 
   if (caseId === 'IOT-005') {
-    const catalog = await api.getBusiness('/iot/capability/catalog')
-    const modbus = await api.getBusiness('/iot/device-modbus-point/page?pageNo=1&pageSize=10')
+    const catalog = dataOf(await api.getBusiness('/iot/capability/catalog'))
+    const modbus = dataOf(await api.getBusiness('/iot/device-modbus-point/page?pageNo=1&pageSize=10'))
     caseRecord.checks.push({
       name: '序列化能力来自代码枚举',
       passed: (catalog.serializeTypes || []).some((item) => item.value === 'json'),
@@ -1026,8 +1028,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       drilldown: drilldownRows
     })
     caseRecord.checks.push({
-      name: '正式状态事件与维修工单事实支撑完整指标闭环',
-      passed: true,
+      name: '正式事实样本数量已记录，缺少任一类事实时保留 PARTIAL',
+      passed: Array.isArray(statusEvents?.list) && Array.isArray(drilldown),
       details: hasFormalEvidence
         ? `statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`
         : `当前正式事实不足，保留为部分通过：statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`

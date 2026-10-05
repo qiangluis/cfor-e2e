@@ -4,6 +4,7 @@ import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 export const cases = ['PB034-002']
 
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
+const dataOf = (response) => response?.data ?? response
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   caseRecord.notes.push(
@@ -14,7 +15,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   const api = createApiClient({ token, record })
 
   if (caseId === 'PB034-002') {
-    const pageResult = await api.getBusiness('/base/partner/page?pageNo=1&pageSize=100')
+    const pageResult = dataOf(await api.getBusiness('/base/partner/page?pageNo=1&pageSize=100'))
     const rows = pageResult?.list || pageResult?.records || []
     caseRecord.checks.push({
       name: '统一客商分页来自 base_partner 单表',
@@ -34,7 +35,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
     // 双角色闭环：创建一个同时启用客户与供应商角色的客商，校验编码稳定并最终清理
     const suffix = unique('E2E')
-    const partnerId = await api.postBusiness('/base/partner/create', {
+    const partnerId = dataOf(await api.postBusiness('/base/partner/create', {
       name: `E2E双角色客商${suffix}`,
       shortName: 'E2E双角色',
       partnerKind: 'ORGANIZATION',
@@ -43,14 +44,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       customerEnabled: true,
       supplierEnabled: true,
       carrierEnabled: false
-    })
+    }))
     caseRecord.checks.push({
       name: '同一客商可同时启用客户与供应商角色',
       passed: Boolean(partnerId),
       details: `partnerId=${partnerId}`
     })
 
-    const detail = await api.getBusiness(`/base/partner/get?id=${encodeURIComponent(partnerId)}`)
+    const detail = dataOf(await api.getBusiness(`/base/partner/get?id=${encodeURIComponent(partnerId)}`))
     caseRecord.checks.push({
       name: '创建后回读双角色与自动生成的角色编码',
       passed:
@@ -75,8 +76,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: codeImmutableRejected ? '编码变更被拒绝' : '编码变更未被拒绝'
     })
 
-    const customerHits = await api.getBusiness('/base/partner/simple-list?roleType=CUSTOMER')
-    const supplierHits = await api.getBusiness('/base/partner/simple-list?roleType=SUPPLIER')
+    const customerHits = dataOf(await api.getBusiness('/base/partner/simple-list?roleType=CUSTOMER'))
+    const supplierHits = dataOf(await api.getBusiness('/base/partner/simple-list?roleType=SUPPLIER'))
     caseRecord.checks.push({
       name: '客户与供应商角色过滤返回同一客商 ID',
       passed:
@@ -126,22 +127,22 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
     // PB-034 第四批：旧 ERP 客户/供应商接口已切换到统一客商，旧表退役为只读视图
     const legacySuffix = unique('LEGACY')
-    const legacyCustomerId = await api.postBusiness('/erp/customer/create', {
+    const legacyCustomerId = dataOf(await api.postBusiness('/erp/customer/create', {
       name: `E2E旧客户口径${legacySuffix}`,
       code: `LEGACY${legacySuffix}`,
       mobile: '13800000000',
       status: 0,
       sort: 0
-    })
+    }))
     caseRecord.checks.push({
       name: '旧 ERP 客户创建接口返回统一客商编号',
       passed: Boolean(legacyCustomerId),
       details: `id=${legacyCustomerId}`
     })
 
-    const partnerRows = await api.getBusiness(
+    const partnerRows = dataOf(await api.getBusiness(
       `/base/partner/page?pageNo=1&pageSize=100&keyword=${encodeURIComponent(`LEGACY${legacySuffix}`)}`
-    )
+    ))
     const unifiedRows = partnerRows?.list || partnerRows?.records || []
     caseRecord.checks.push({
       name: '旧客户接口写入落到 base_partner（统一客商可见）',
@@ -149,7 +150,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `partnerHits=${unifiedRows.length}`
     })
 
-    const legacyPage = await api.getBusiness('/erp/customer/page?pageNo=1&pageSize=100')
+    const legacyPage = dataOf(await api.getBusiness('/erp/customer/page?pageNo=1&pageSize=100'))
     const legacyRows = legacyPage?.list || legacyPage?.records || []
     caseRecord.checks.push({
       name: '旧客户分页经只读兼容视图读取统一客商',

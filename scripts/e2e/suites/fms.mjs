@@ -2,7 +2,6 @@ import { createApiClient } from '../lib/api.mjs'
 import { nonEmpty } from '../lib/assertions.mjs'
 import { config } from '../config/index.mjs'
 import { login, openRoute, saveScreenshot, tableRows } from '../lib/browser.mjs'
-import * as XLSX from 'xlsx'
 
 export const cases = [
   'FMS-001',
@@ -78,6 +77,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'FIN-OPENING-001' || caseId === 'FIN-OPENING-002') {
     // PB-069/PB-070：期初应收/应付模板下载、Excel 导入、批次落库与明细回读。
+    const XLSX = await import('xlsx')
     const receivable = caseId === 'FIN-OPENING-001'
     const roleLabel = receivable ? 'receivable' : 'payable'
     const partnerRole = receivable ? 'CUSTOMER' : 'SUPPLIER'
@@ -196,7 +196,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       }
     }
 
-    await openRoute(page, '/finance/dealingsBeginning')
+    await openRoute(page, '/finance/dealingsBeginning', { readyText: '导入期初' })
     caseRecord.checks.push({
       name: '往来期初页面提供导入入口',
       passed: (await page.getByRole('button', { name: '导入期初' }).count()) > 0,

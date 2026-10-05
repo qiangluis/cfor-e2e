@@ -19,6 +19,11 @@ import {
   finishCase,
   writeReport
 } from './lib/report.mjs'
+import {
+  caseFailureAction,
+  DEFAULT_CASE_TIMEOUT_MS,
+  parseRunnerArgs
+} from './lib/runner-options.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const catalog = JSON.parse(fs.readFileSync(path.join(here, 'cases/catalog.json'), 'utf8'))
@@ -60,30 +65,6 @@ const suiteFiles = {
   'mes-monitor': 'mes-monitor.mjs'
 }
 
-function parseArgs (argv) {
-  const args = {
-    list: false,
-    suite: '',
-    caseId: '',
-    headed: false,
-    resume: false,
-    reuseSession: config.reuseSession
-  }
-  for (let index = 0; index < argv.length; index++) {
-    const value = argv[index]
-    if (value === '--list') args.list = true
-    else if (value === '--suite') args.suite = argv[++index]
-    else if (value === '--case') args.caseId = argv[++index]
-    else if (value === '--headed' || value === '--no-headless') args.headed = true
-    else if (value === '--headless') args.headed = false
-    else if (value === '--resume') args.resume = true
-    else if (value === '--fresh' || value === '--no-resume') args.resume = false
-    else if (value === '--reuse-session') args.reuseSession = true
-    else if (value === '--no-reuse-session') args.reuseSession = false
-  }
-  return args
-}
-
 const definitions = new Map(
   catalog.suites.flatMap((suite) =>
     suite.cases.map((item) => [item.id, { ...item, suite: suite.id }])
@@ -116,10 +97,12 @@ function orderedSuites (suites) {
 }
 
 function caseIdsFor (args) {
-  if (args.caseId) {
-    const definition = definitions.get(args.caseId)
-    if (!definition) throw new Error(`未知 case：${args.caseId}`)
-    return [definition]
+  if (args.caseIds.length) {
+    return args.caseIds.map((caseId) => {
+      const definition = definitions.get(caseId)
+      if (!definition) throw new Error(`未知 case：${caseId}`)
+      return definition
+    })
   }
   if (args.suite && args.suite !== 'all') {
     const suite = catalog.suites.find((item) => item.id === args.suite)
@@ -193,8 +176,52 @@ async function closeWithTimeout (operation, label, timeoutMs = 15000) {
   }
 }
 
+async function closeBrowserHandle (handle, tracePath, label = 'browser') {
+  if (!handle) return
+  fs.mkdirSync(path.dirname(tracePath), { recursive: true })
+  await closeWithTimeout(
+    handle.flushResponses().catch(() => {}),
+    `${label} response flush`,
+    5000
+  )
+  await closeWithTimeout(
+    handle.context.tracing.stop({ path: tracePath }).catch(() => {}),
+    `${label} trace`,
+    15000
+  )
+  await closeWithTimeout(
+    handle.context.close().catch(() => {}),
+    `${label} context`,
+    15000
+  )
+  await closeWithTimeout(
+    handle.browser.close().catch(() => {}),
+    `${label} browser`,
+    15000
+  )
+}
+
+async function runCaseWithTimeout (operation, timeoutMs, caseId) {
+  let timer
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`案例 ${caseId} 超过 ${timeoutMs}ms 未完成，已终止等待`))
+        }, timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function main () {
-  const args = parseArgs(process.argv.slice(2))
+  const args = parseRunnerArgs(process.argv.slice(2), {
+    reuseSession: config.reuseSession,
+    caseTimeoutMs: Number(process.env.CFOR_E2E_CASE_TIMEOUT_MS || DEFAULT_CASE_TIMEOUT_MS)
+  })
   if (args.list) return printList()
   if (!config.password) throw new Error('缺少 CFOR_PASSWORD/CFOR_PASS，不能启动真实浏览器验收')
   if (config.target === 'local') {
@@ -281,23 +308,31 @@ async function main () {
         }
         console.log(`[RUN ] ${definition.id} ${definition.title}`)
         try {
-          const result = await module.runCase({
-            caseId: definition.id,
-            suiteId: suite.id,
-            page: browserHandle.page,
-            context: browserHandle.context,
-            record,
-            caseRecord,
-            outputDir,
-            shotDir: outputDir,
-            check,
-            ctx: {
-              browser: browserHandle.browser,
+          const result = await runCaseWithTimeout(
+            module.runCase({
+              caseId: definition.id,
+              suiteId: suite.id,
+              page: browserHandle.page,
               context: browserHandle.context,
-              page: browserHandle.page
-            }
-          })
-          await browserHandle.flushResponses()
+              record,
+              caseRecord,
+              outputDir,
+              shotDir: outputDir,
+              check,
+              ctx: {
+                browser: browserHandle.browser,
+                context: browserHandle.context,
+                page: browserHandle.page
+              }
+            }),
+            args.caseTimeoutMs,
+            definition.id
+          )
+          await closeWithTimeout(
+            browserHandle.flushResponses(),
+            'response flush',
+            5000
+          )
           const hasAssertions = caseRecord.checks.length + check.steps.length > 0
           caseRecord.runtimeErrors = {
             console: record.consoleErrors.slice(errorsBefore.console),
@@ -319,7 +354,11 @@ async function main () {
           caseRecord.durationMs = Date.now() - startedAt
           console.log(`[${caseRecord.status}] ${definition.id}`)
         } catch (error) {
-          await browserHandle.flushResponses()
+          await closeWithTimeout(
+            browserHandle.flushResponses().catch(() => {}),
+            'response flush after failure',
+            5000
+          )
           caseRecord.runtimeErrors = {
             console: record.consoleErrors.slice(errorsBefore.console),
             page: record.pageErrors.slice(errorsBefore.page),
@@ -341,15 +380,29 @@ async function main () {
           await saveScreenshot(browserHandle.page, outputDir, `${definition.id}-FAIL`, record).catch(() => {})
           console.log(`[${caseRecord.status}] ${definition.id} ${error.message || error}`)
         }
-        if (['FAIL', 'BLOCKED'].includes(caseRecord.status)) {
+        const failureAction = caseFailureAction(
+          caseRecord.status,
+          args.continueOnFailure
+        )
+        if (failureAction === 'stop') {
           console.log('[e2e] 当前用例未通过，停止后续用例，修复并重启后再续跑')
           break suites
+        }
+        if (failureAction === 'continue-isolated' && browserHandle) {
+          const tracePath = path.join(
+            config.outputRoot,
+            record.runId,
+            'trace',
+            `${definition.id}-FAIL.zip`
+          )
+          await closeBrowserHandle(browserHandle, tracePath, `${definition.id} failure`)
+          browserHandle = undefined
+          console.log('[e2e] continue-on-failure：已关闭失败用例浏览器，下一例使用隔离上下文')
         }
         if (!args.reuseSession && browserHandle) {
           const tracePath = path.join(config.outputRoot, record.runId, 'trace', `${definition.id}.zip`)
           fs.mkdirSync(path.dirname(tracePath), { recursive: true })
-          await browserHandle.context.tracing.stop({ path: tracePath })
-          await browserHandle.browser.close()
+          await closeBrowserHandle(browserHandle, tracePath, definition.id)
           browserHandle = undefined
         }
       }
@@ -358,12 +411,7 @@ async function main () {
     if (browserHandle) {
       const tracePath = path.join(config.outputRoot, record.runId, 'trace', 'browser.zip')
       fs.mkdirSync(path.dirname(tracePath), { recursive: true })
-      await closeWithTimeout(
-        browserHandle.context.tracing.stop({ path: tracePath }).catch(() => {}),
-        'trace'
-      )
-      await closeWithTimeout(browserHandle.context.close().catch(() => {}), 'browser context')
-      await closeWithTimeout(browserHandle.browser.close().catch(() => {}), 'browser')
+      await closeBrowserHandle(browserHandle, tracePath)
     }
   }
 

@@ -4,8 +4,13 @@ export const nonEmpty = (value) =>
 export const asList = (value) => {
   if (Array.isArray(value)) return value
   if (Array.isArray(value?.list)) return value.list
+  if (Array.isArray(value?.records)) return value.records
   if (Array.isArray(value?.data?.list)) return value.data.list
+  if (Array.isArray(value?.data?.records)) return value.data.records
+  if (Array.isArray(value?.result?.list)) return value.result.list
+  if (Array.isArray(value?.result?.records)) return value.result.records
   if (Array.isArray(value?.data)) return value.data
+  if (Array.isArray(value?.result)) return value.result
   return []
 }
 

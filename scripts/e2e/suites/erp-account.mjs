@@ -21,10 +21,7 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
     details: `rows=${rows.length}`
   })
 
-  await openRoute(page, '/systemModel/base/account', {
-    readySelector: '.vxe-cell--title:has-text("账户编码")',
-    readyTimeoutMs: 60000
-  })
+  await openRoute(page, '/systemModel/base/account', { readyText: '账户编码' })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '企业资金账户设置页真实渲染',

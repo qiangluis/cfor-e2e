@@ -1,7 +1,7 @@
 # CFOR E2E
 
 独立自动化仓库，使用 `playwright-core` 和本机真实 Chrome。案例来源为
-`scripts/e2e/cases/catalog.json`，当前有 34 个套件、266 个案例。
+`scripts/e2e/cases/catalog.json`，当前有 34 个套件、268 个案例。
 `READY/PARTIAL/DESIGNED/BLOCKED` 是实现状态，不是验收结果。
 
 ## 本地执行
@@ -19,6 +19,10 @@ node scripts/e2e/runner.mjs --list
 node scripts/e2e/runner.mjs --suite smoke --headed
 node scripts/e2e/runner.mjs --suite workbench --headed
 node scripts/e2e/runner.mjs --suite all --headed
+# 串行批次：可重复传入 --case；默认遇到 FAIL/BLOCKED 即停止
+node scripts/e2e/runner.mjs \
+  --case COST-002 --case COST-003 --case COST-005 \
+  --continue-on-failure
 # 服务只需启动一次；并行批次会独立启动 Chrome、进程和证据目录
 CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs --workers 2
 # 查看并行只读组和后续串行组
@@ -42,7 +46,7 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 | `CFOR_CHROME_PATH` | 可选，本机 Chrome 可执行文件 |
 | `CFOR_E2E_OUT` | 证据目录，默认 `/tmp/cfor-e2e` |
 | `CFOR_E2E_PARALLEL_WORKERS` | 并行 worker 数，默认 3；只用于登记为无共享写状态的案例 |
-| `CFOR_E2E_CASE_TIMEOUT_MS` | 单例超时，默认 180000；超时会记录 `ERROR` 并继续批次 |
+| `CFOR_E2E_CASE_TIMEOUT_MS` | 单例超时，默认 180000；超时进入失败处理，默认停止，`--continue-on-failure` 时收集后续案例 |
 | `CFOR_E2E_REQUEST_TIMEOUT_MS` / `CFOR_E2E_BROWSER_TIMEOUT_MS` | 默认 30000 / 60000 ms |
 | `CFOR_DB_HOST/PORT/NAME/USER/PASSWORD` | 写侧案例（例如 PROC-014）必需的本地只读取证配置 |
 | `CFOR_API_ENCRYPT_REQUEST_KEY` / `CFOR_API_ENCRYPT_RESPONSE_KEY` | API 加密工具使用的环境参数，必须与目标环境一致，不提交实际值 |
@@ -51,16 +55,21 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 ## 执行规则
 
 - 默认从头执行；显式 `--resume` 才跳过同环境、租户、账号、数据库、用例目录及脚本指纹此前已完整通过的案例。
-- `--case WBF-001` 只执行单例；`--suite smoke` 只执行套件，不自动补建其业务前置。
+- `runner.mjs` 的 `--case WBF-001` 仍执行单例，也支持重复传入
+  `--case CASE-A --case CASE-B` 组成串行批次；案例按 suite 依赖和 catalog 顺序执行。
+  `--suite smoke` 只执行套件，不自动补建其业务前置。
 - smoke 检查普通工作台不提前请求未访问的六个业务域首页，并包含首次打开设置抽屉及 AI 助手控件回归。人物视频检查非空 canvas 像素和播放推进，不只检查挂载；只打开/关闭，不修改设置或发送模型查询，不能代表 AI 模型与业务链路已验收。
 - 默认在本轮内复用登录态；`--no-reuse-session` 每例使用新的 Chrome 上下文。
-- `FAIL/BLOCKED` 立即停止；修复应用后重启两端再复测，不通过时不继续后续业务写侧。
+- 默认 `FAIL/BLOCKED` 立即停止；只有显式 `--continue-on-failure` 才会收集后续案例。
+  continue 模式会先关闭失败案例的 browser/context，再为下一例创建隔离上下文，避免失败页面、登录态和监听器污染下一例。
+  `PARTIAL` 按现有规则继续执行；未实现、`DESIGNED`、`BLOCKED` 不会升级为 PASS。
 - `parallel-runner.mjs` 只并行执行已登记为无共享写状态的案例；每个案例独立子进程、
   Chrome 上下文和证据目录，失败不会停止其他案例。输出批次下的
   `parallel-result.json` 和 `parallel-summary.md` 是统一重启/复测清单。涉及单据、审批、
   库存、初始化、Job 或账号权限写入的案例保留到串行阶段。
 - 并行批次完成后统一重启前后端，再使用 `--case` 重跑失败、部分通过和超时案例；
-  不要为每个案例单独重启。多个 `--case` 参数可放在同一条命令中。
+  不要为每个案例单独重启。`runner.mjs` 的多个 `--case` 参数可放在同一条串行命令中；
+  `parallel-runner.mjs` 的 `--case` 过滤并行安全白名单，二者不是同一执行模式。
 - 控制台、页面、业务 API 和浏览器失败请求均参与失败判定；连接错误不能只记录而仍显示通过。
 - 未实现、空断言、缺少前置和仅部分实现不得登记 PASS；包含此类案例的全量报告退出非零。
 - 多角色业务流程须先通过真实账号接口/页面创建关联用户，再使用相互隔离的 Chrome 上下文。
@@ -73,6 +82,16 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 - `PROC-018` 使用 admin 与三段关联审批账号的独立 Chrome，验证自动转单、逐行来源、无供应商详情、未收货不能关闭及重复审批阻断。
 - `PB150-OUTSOURCE-PORTAL-001` 暂时返回 `BLOCKED`：旧门户 smoke 使用模拟响应及 9152，不能从真实业务 runner 调用。需要补齐 9151 上的真实登录、供应商映射与业务前置后再验收。
 - `WMS-OP-001` 暂时返回 `BLOCKED`：模拟的入库单 ID 不是实际 101 草稿或库存证据。历史组件脚本隔离到 `scripts/e2e/legacy/`，不从真实 runner 调用。
+
+### runner 与 parallel-runner
+
+| 命令 | 执行模型 | 失败处理 | 适用范围 |
+| --- | --- | --- | --- |
+| `runner.mjs` | 串行；默认复用一个 browser/context | 默认 fail-stop；`--continue-on-failure` 时失败后销毁当前 browser/context，再隔离启动下一例 | 有顺序依赖、业务写侧、多角色或需要稳定上下文的案例 |
+| `parallel-runner.mjs` | 多 worker；每例独立子进程、Chrome、context 和证据目录 | 其他 worker 不受单例失败影响，批次结束统一汇总 | 仅适用于静态 `parallelSafeCases` 白名单；不会自动补 suite 或业务前置 |
+
+`parallel-runner.mjs --plan` 的 `serial` 是“未进入并行白名单”的集合，可能包含
+`PARTIAL`；它不是当前可直接执行的串行 READY 清单。
 
 ## 请购页面前置
 

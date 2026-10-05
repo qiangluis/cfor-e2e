@@ -33,7 +33,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: uniqueValues.size === ruleRows.length,
       details: `unique=${uniqueValues.size}, rows=${ruleRows.length}`
     })
-    await openRoute(page, '/crm/config/followUpTypeRule')
+    await openRoute(page, '/crm/config/followUpTypeRule', { readyText: '跟进方式规则' })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '设置-业务设置-CRM 页面可访问且展示跟进方式规则',

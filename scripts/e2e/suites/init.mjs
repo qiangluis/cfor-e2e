@@ -17,6 +17,25 @@ const toApiUrl = (path) => {
 
 let currentToken = ''
 
+export const isSuccessfulPayload = (payload) =>
+  (payload?.code === 0 && payload.success !== false) ||
+  (payload?.code === 200 && payload.success === true)
+
+export const listPayload = (payload) => {
+  const list = payload?.data?.list
+  return Array.isArray(list) ? list : null
+}
+
+export const arrayPayload = (payload) => {
+  const data = payload?.data
+  return Array.isArray(data) ? data : null
+}
+
+export const readinessItemsPayload = (payload) => {
+  const items = payload?.data?.items
+  return Array.isArray(items) ? items : null
+}
+
 const requestApi = (page, method, path, options) =>
   page.request[method](toApiUrl(path), {
     ...options,
@@ -418,13 +437,13 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB033-002') {
-    await openRoute(page, '/base/partner-level')
+    await openRoute(page, '/settings/erp/partner-level', { readyText: '等级编码' })
     const codeLabel = page.getByText('等级编码', { exact: true }).first()
     const scopeLabel = page.getByText('适用角色', { exact: true }).first()
     const createButton = page.getByRole('button', { name: /新增等级/ }).first()
     caseRecord.checks.push({
       name: '客商等级设置页可从设置菜单进入',
-      passed: page.url().includes('/base/partner-level'),
+      passed: page.url().includes('/settings/erp/partner-level'),
       details: page.url()
     })
     caseRecord.checks.push({
@@ -438,10 +457,12 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
     const scopeResponse = await requestApi(page, 'get',
       '/admin-api/base/partner-level/simple-list?scope=BOTH'
     )
+    const scopePayload = await scopeResponse.json().catch(() => null)
+    const scopeLevels = arrayPayload(scopePayload)
     caseRecord.checks.push({
       name: '页面使用的客商等级接口在角色维度可读',
-      passed: scopeResponse.ok(),
-      details: `HTTP=${scopeResponse.status()}`
+      passed: scopeResponse.ok() && isSuccessfulPayload(scopePayload) && scopeLevels !== null,
+      details: `HTTP=${scopeResponse.status()} count=${scopeLevels?.length ?? 'invalid'}`
     })
     caseRecord.evidence.push('真实浏览器打开客商等级设置页并检查查询项与新增入口；本案例只读，不改写等级目录')
     return { designed: true }
@@ -488,7 +509,10 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB039-001') {
-    await openRoute(page, '/settings/enterprise')
+    await openRoute(page, '/settings/systemModel/base/organization/enterprise-organization', {
+      readyText: '行业',
+      retries: 1
+    })
     const treeResponse = await requestApi(page, 'get',
       '/admin-api/system/system-init/industry-template/tree'
     )
@@ -523,7 +547,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB039-002') {
-    await openRoute(page, '/systemInit')
+    await openRoute(page, '/systemInit/index', { retries: 1 })
     const parentLabel = page.getByText('行业大类', { exact: true }).first()
     const leafLabel = page.getByText('细分行业', { exact: true }).first()
     const oldScenarioGrid = await page.locator('[data-industry]').count()
@@ -548,7 +572,10 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB039-003') {
-    await openRoute(page, '/system/enterprise-organization')
+    await openRoute(page, '/settings/systemModel/base/organization/enterprise-organization', {
+      readyText: '行业',
+      retries: 1
+    })
     const treeResponse = await requestApi(page, 'get',
       '/admin-api/system/system-init/industry-template/tree'
     )
@@ -790,25 +817,27 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB012-001') {
-    await openRoute(page, '/ai/model/model')
-    const modelResponse = await requestApi(page, 'get', '/admin-api/ai/model/page?pageNo=1&pageSize=100')
-    const capabilityResponse = await requestApi(page, 'get', '/admin-api/ai/model-capability/list')
+    await openRoute(page, '/settings/business-settings/ai-model', { readyText: '企业 AI 配置' })
+    const modelResponse = await requestApi(page, 'get', '/admin-api/ai/tenant-config/model/page?pageNo=1&pageSize=100')
+    const capabilityResponse = await requestApi(page, 'get', '/admin-api/ai/tenant-config/capability/list')
     const readinessResponse = await requestApi(page, 'get', '/admin-api/system/system-init/readiness')
     const modelPayload = await modelResponse.json().catch(() => null)
-    const models = modelPayload?.data?.list || []
+    const models = listPayload(modelPayload)
     const capabilityPayload = await capabilityResponse.json().catch(() => null)
-    const capabilities = capabilityPayload?.data || []
+    const capabilities = arrayPayload(capabilityPayload)
     const readinessPayload = await readinessResponse.json().catch(() => null)
-    const readinessItems = readinessPayload?.data?.items || []
-    const aiReadiness = readinessItems.find((item) => item?.key === 'ai.model-capability')
+    const readinessItems = readinessItemsPayload(readinessPayload)
+    const aiReadiness = readinessItems?.find((item) => item?.key === 'ai.model-capability')
     caseRecord.checks.push({
       name: 'AI 模型与能力绑定管理入口可访问',
-      passed: modelResponse.ok() && capabilityResponse.ok(),
-      details: `modelHTTP=${modelResponse.status()} capabilityHTTP=${capabilityResponse.status()} models=${models.length} capabilities=${capabilities.length}`
+      passed: modelResponse.ok() && isSuccessfulPayload(modelPayload) && models !== null
+        && capabilityResponse.ok() && isSuccessfulPayload(capabilityPayload) && capabilities !== null,
+      details: `modelHTTP=${modelResponse.status()} capabilityHTTP=${capabilityResponse.status()} models=${models?.length ?? 'invalid'} capabilities=${capabilities?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '初始化中心可返回 AI 能力就绪项',
-      passed: readinessResponse.ok() && Boolean(aiReadiness) && !JSON.stringify(aiReadiness).match(/apiKey|secret/i),
+      passed: readinessResponse.ok() && isSuccessfulPayload(readinessPayload) && readinessItems !== null
+        && Boolean(aiReadiness) && !JSON.stringify(aiReadiness).match(/apiKey|secret/i),
       details: `readinessHTTP=${readinessResponse.status()} status=${aiReadiness?.status || 'MISSING'} count=${aiReadiness?.count ?? 0}`
     })
     caseRecord.evidence.push('真实浏览器打开 AI 模型管理页并读取模型/能力接口；当前租户优先、平台租户 0 回退和密钥脱敏由后端路由与权限链覆盖')
@@ -816,18 +845,18 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB017-001') {
-    await openRoute(page, '/system/config')
+    await openRoute(page, '/settings/business-settings/config', { readyText: '配置大类' })
     const response = await requestApi(page, 'get', '/admin-api/system/config/business-options/list?moduleCode=wms')
     const payload = await response.json().catch(() => null)
-    const options = payload?.data || []
-    const dimension = options.find((item) => item?.optionCode === 'WMS.WAREHOUSE.DIMENSION')
+    const options = arrayPayload(payload)
+    const dimension = options?.find((item) => item?.optionCode === 'WMS.WAREHOUSE.DIMENSION')
     const hasUnifiedContract = dimension?.ownerType === 'SYSTEM_CONFIG'
       && dimension?.valueType === 'ENUM'
       && dimension?.runtimeConsumer
     caseRecord.checks.push({
       name: 'WMS 仓储维度目录可访问',
-      passed: response.ok() && Boolean(dimension),
-      details: `HTTP=${response.status()} options=${options.length} current=${dimension?.currentValue || 'MISSING'}`
+      passed: response.ok() && isSuccessfulPayload(payload) && options !== null && Boolean(dimension),
+      details: `HTTP=${response.status()} options=${options?.length ?? 'invalid'} current=${dimension?.currentValue || 'MISSING'}`
     })
     caseRecord.checks.push({
       name: '仓储维度使用统一枚举契约',
@@ -859,20 +888,22 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB028-001') {
-    await openRoute(page, '/system/config')
+    await openRoute(page, '/settings/business-settings/config', { readyText: '配置大类' })
     const response = await requestApi(page, 'get', '/admin-api/system/config/business-options/list?moduleCode=erp')
     const payload = await response.json().catch(() => null)
-    const options = payload?.data || []
-    const hasRuntimeConsumer = options.length > 0 && options.every((item) => item?.optionCode && item?.runtimeConsumer)
-    const hasGovernedOwners = options.length > 0 && options.every((item) => item?.ownerType)
+    const options = arrayPayload(payload)
+    const hasRuntimeConsumer = options !== null && options.length > 0
+      && options.every((item) => item?.optionCode && item?.runtimeConsumer)
+    const hasGovernedOwners = options !== null && options.length > 0
+      && options.every((item) => item?.ownerType)
     caseRecord.checks.push({
       name: '业务选项目录可访问且包含稳定编码',
-      passed: response.ok() && hasRuntimeConsumer,
-      details: `HTTP=${response.status()} count=${options.length}`
+      passed: response.ok() && isSuccessfulPayload(payload) && hasRuntimeConsumer,
+      details: `HTTP=${response.status()} count=${options?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '配置目录声明事实源归属',
-      passed: response.ok() && hasGovernedOwners,
+      passed: response.ok() && isSuccessfulPayload(payload) && hasGovernedOwners,
       details: '目录只读；SYSTEM_CONFIG 复用 system_config，DOMAIN_MODEL 由领域模型维护'
     })
     caseRecord.evidence.push('真实浏览器打开设置入口并读取 ERP 业务选项目录；目录完整性由稳定编码、ownerType 和 runtimeConsumer 断言')
@@ -880,18 +911,18 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB023-001') {
-    await openRoute(page, '/barcode/barCodeRecord')
-    const response = await requestApi(page, 'get', '/admin-api/erp/barcode/page?pageNo=1&pageSize=100')
+    await openRoute(page, '/erp/barcode/barcodeRecord', { readyText: '创建人' })
+    const response = await requestApi(page, 'get', '/admin-api/erp/barcode/scan/record/page?pageNo=1&pageSize=100')
     const payload = await response.json().catch(() => null)
-    const records = payload?.data?.list || []
+    const records = listPayload(payload)
     caseRecord.checks.push({
       name: '条码分页接口可访问并按当前租户返回',
-      passed: response.ok() && Array.isArray(records),
-      details: `HTTP=${response.status()} count=${records.length}`
+      passed: response.ok() && isSuccessfulPayload(payload) && records !== null,
+      details: `HTTP=${response.status()} count=${records?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '条码页面进入租户隔离验证范围',
-      passed: page.url().includes('/barcode/barCodeRecord'),
+      passed: page.url().includes('/erp/barcode/barcodeRecord'),
       details: 'erp_barcode、SN 与条码规则由现有 MyBatis 租户拦截器统一过滤'
     })
     caseRecord.evidence.push('真实浏览器打开条码页面并读取分页接口；跨租户互斥读取需在双租户环境执行')
@@ -899,18 +930,18 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB023-002') {
-    await openRoute(page, '/barcode/barCodeScheme')
-    const schemeResponse = await requestApi(page, 'get', '/admin-api/erp/barcode-scheme/page?pageNo=1&pageSize=100')
+    await openRoute(page, '/erp/barcode/barCodeScheme', { readyText: '方案名称' })
+    const schemeResponse = await requestApi(page, 'get', '/admin-api/erp/barcode/scheme/page?pageNo=1&pageSize=100')
     const schemePayload = await schemeResponse.json().catch(() => null)
-    const schemes = schemePayload?.data?.list || []
+    const schemes = listPayload(schemePayload)
     caseRecord.checks.push({
       name: '条码方案页面与分页接口可访问',
-      passed: schemeResponse.ok() && Array.isArray(schemes),
-      details: `HTTP=${schemeResponse.status()} count=${schemes.length}`
+      passed: schemeResponse.ok() && isSuccessfulPayload(schemePayload) && schemes !== null,
+      details: `HTTP=${schemeResponse.status()} count=${schemes?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '条码方案关联表和流水计数器纳入租户迁移契约',
-      passed: page.url().includes('/barcode/barCodeScheme'),
+      passed: page.url().includes('/erp/barcode/barCodeScheme'),
       details: '正式 Flyway 已补 tenant_id、默认值 0 和租户前缀索引；保留历史非 0 租户数据'
     })
     caseRecord.evidence.push('真实浏览器打开条码方案页；方案物料关联、SN 流水计数器和时间线的双租户写读在统一回归执行')

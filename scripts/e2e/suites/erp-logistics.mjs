@@ -17,7 +17,12 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
     details: `rows=${rows.length}`
   })
 
-  await openRoute(page, '/erp/sale/delivery')
+  await openRoute(page, '/erp/sale/delivery', { readyText: '新增' })
+  await page.getByRole('button', { name: /新增/ }).first().click()
+  await page.getByText('承运商', { exact: true }).first().waitFor({
+    state: 'visible',
+    timeout: 60000
+  })
   const bodyText = await page.locator('body').innerText()
   const carrierField = page.getByText('承运商', { exact: true }).first()
   const expressField = page.getByText('快递品牌', { exact: true }).first()

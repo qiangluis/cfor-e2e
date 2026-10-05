@@ -160,13 +160,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     caseRecord.checks.push({
       name: '成品入库查询复用 WMS 出入库事实源并可回看工单',
       passed:
-        works?.code === 0 &&
-        inbound?.code === 0 &&
+        isBusinessSuccess(works) &&
+        isBusinessSuccess(inbound) &&
         Array.isArray(workRows) &&
         Array.isArray(inboundRows),
       details: `works=${workRows.length}, inbound=${inboundRows.length}`
     })
-    const invalidClose = await api.request('PUT', '/mes/prodWork/close', {
+    const invalidClose = await api.request('POST', '/mes/prodWork/close', {
       id: '__not_exists__'
     })
     caseRecord.checks.push({
@@ -174,7 +174,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: invalidClose?.code !== 0,
       details: JSON.stringify({ code: invalidClose?.code, msg: invalidClose?.msg })
     })
-    await openRoute(page, '/mes/wms/inbound')
+    await openRoute(page, '/wireSideWarehouse/in/inProduct?stockIoType=104', {
+      readySelector: 'input[placeholder="请输入入库单号"]'
+    })
     await saveScreenshot(page, outputDir, 'mes-prod-inbound-quality-gate', record)
     caseRecord.evidence.push('真实登录后读取工单与成品入库分页并验证非法完工请求被拒绝')
     return { api }

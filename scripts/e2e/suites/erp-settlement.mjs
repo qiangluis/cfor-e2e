@@ -78,7 +78,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     details: `rows=${rows.length}`
   })
 
-  await openRoute(page, '/erp/settings/settle-method-rule')
+  await openRoute(page, '/erp/settings/settle-method-rule', { readyText: '结算方式' })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '结算方式规则设置页真实渲染',

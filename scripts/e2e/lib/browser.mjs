@@ -30,6 +30,11 @@ const SELECTORS = {
   loggedIn: ['.avatar', '.user-info', '[class*="user"]', 'text=工作台']
 }
 
+export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
+  resourceType === 'media' &&
+  error === 'net::ERR_ABORTED' &&
+  /\/ai-human\/digital-human-idle\.webm(?:$|\?)/.test(url || '')
+
 async function firstVisible (page, selectors, timeout = 30000) {
   for (const selector of selectors) {
     const locator = page.locator(selector).first()
@@ -131,10 +136,12 @@ export async function launchBrowser ({ headed = false, record } = {}) {
     })
   })
   page.on('requestfailed', (request) => {
-    record?.requestFailures?.push({
+    const failure = {
       url: resourceUrl(request.url()), method: request.method(),
       resourceType: request.resourceType(), error: request.failure()?.errorText
-    })
+    }
+    if (isExpectedRequestFailure(failure)) return
+    record?.requestFailures?.push(failure)
   })
   page.on('pageerror', (error) => record?.pageErrors?.push(error.message))
   page.on('response', (response) => {
