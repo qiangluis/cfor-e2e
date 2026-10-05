@@ -45,9 +45,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `definitionCount=${definitions.length}`
     })
 
-    await openRoute(page, '/settings/custom-field', {
+    await openRoute(page, '/settings/business-settings/custom-field', {
       readySelector: '.custom-field-tabs',
-      readyTimeoutMs: 15000
+      readyTimeoutMs: 15000,
+      retries: 1
     })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
@@ -153,8 +154,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB040-003') {
-    const slots = await api.getBusiness('/system/custom-field/legacy-slots')
-    const slotList = Array.isArray(slots) ? slots : []
+    const slotsResponse = await api.getBusiness('/system/custom-field/legacy-slots')
+    const slotList = Array.isArray(slotsResponse?.data) ? slotsResponse.data : []
     caseRecord.checks.push({
       name: '旧 custom_field 扩展槽位登记可查询',
       passed: slotList.length > 0,
@@ -185,7 +186,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `schemaCount=${schemaList.length}`
     })
 
-    await openRoute(page, '/settings/custom-field')
+    await openRoute(page, '/settings/business-settings/custom-field', { retries: 1 })
     await page.getByRole('tab', { name: '旧扩展槽位' }).click().catch(() => {})
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({

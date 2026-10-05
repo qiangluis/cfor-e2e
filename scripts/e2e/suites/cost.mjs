@@ -83,7 +83,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `centers=${centersResult?.data?.length ?? 0}`
     })
     await openRoute(page, '/cost-management/modeling/allocation-rule', {
-      readySelector: '.allocation-workspace'
+      readySelector: '.allocation-workspace',
+      retries: 1
     })
     caseRecord.checks.push({
       name: '成本分摊规则页面可打开',

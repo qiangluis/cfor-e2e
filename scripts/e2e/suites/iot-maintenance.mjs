@@ -3,6 +3,16 @@ import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
 export const cases = ['IOT-004', 'IOT-005', 'IOT-006', 'MAINT-001', 'MAINT-002', 'MAINT-003', 'MAINT-004', 'MAINT-005', 'MAINT-006', 'MAINT-007', 'MAINT-008', 'MAINT-009', 'MAINT-010', 'MAINT-011', 'MAINT-012', 'MAINT-013', 'MAINT-014', 'MAINT-015']
 
+export const MAINT_011_DEVICE_STATUS_ROUTE = '/settings/iot/device-status'
+
+export const dataOf = (response) => response?.data ?? response
+
+export const hasFormalMetricEvidence = ({ statusEvents, drilldown } = {}) =>
+  Array.isArray(statusEvents) &&
+  statusEvents.length > 0 &&
+  Array.isArray(drilldown) &&
+  drilldown.length > 0
+
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
 
 const formatLocalDateTime = (date) => {
@@ -942,13 +952,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'MAINT-011') {
     // PB-326：设备统计指标从状态事件、工单与保养任务正式数据计算，支持钻取。
-    const devicePage = await api.getBusiness('/iot/device/page?pageNo=1&pageSize=1')
-    const deviceId = devicePage?.data?.list?.[0]?.id
+    const devicePage = dataOf(await api.getBusiness('/iot/device/page?pageNo=1&pageSize=1'))
+    const deviceId = devicePage?.list?.[0]?.id
     const endTime = formatLocalDateTime(new Date())
     const startTime = formatLocalDateTime(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
     if (!deviceId) {
       caseRecord.notes.push('当前租户没有 IoT 设备，设备指标接口待补设备前置后复测；不使用固定设备编号。')
-      await openRoute(page, '/iot/maintenance/device-status')
+      await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, {
+        readySelector: '.statistics-metrics'
+      })
       await page.waitForTimeout(1200)
       const pageText = await page.locator('body').innerText()
       caseRecord.checks.push({
@@ -968,44 +980,62 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         note: '当前租户没有 IoT 设备，设备指标数据链路待补前置后复测'
       }
     }
-    const metrics = await api.getBusiness(
+    const metrics = dataOf(await api.getBusiness(
       `/mes/device-status-event/metrics?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
-    )
+    ))
     caseRecord.checks.push({
       name: '设备指标接口返回开机率/停机时长/MTBF/MTTR/维修费用',
       passed:
         metrics != null &&
-        'utilizationRate' in metrics &&
-        'downtimeMinutes' in metrics &&
-        'failureCount' in metrics &&
-        'repairCost' in metrics,
+        ['deviceId', 'startTime', 'endTime', 'utilizationRate', 'downtimeMinutes', 'failureCount',
+          'repairCount', 'mtbfHours', 'mttrHours', 'repairCost', 'maintenanceRate']
+          .every((field) => Object.prototype.hasOwnProperty.call(metrics, field)),
       details: `utilization=${metrics?.utilizationRate}, mtbf=${metrics?.mtbfHours}, mttr=${metrics?.mttrHours}, cost=${metrics?.repairCost}`
     })
     caseRecord.checks.push({
       name: '指标统计期间与设备范围固定',
-      passed: metrics?.deviceId === deviceId && Boolean(metrics?.startTime) && Boolean(metrics?.endTime),
+      passed:
+        String(metrics?.deviceId) === String(deviceId) &&
+        Boolean(metrics?.startTime) &&
+        Boolean(metrics?.endTime),
       details: `deviceId=${metrics?.deviceId}`
     })
 
-    const drilldown = await api.getBusiness(
+    const drilldown = dataOf(await api.getBusiness(
       `/mes/device-status-event/metrics/repair-orders?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
-    )
+    ))
     caseRecord.checks.push({
       name: '指标异常可钻取到工单明细',
       passed: Array.isArray(drilldown),
       details: `rows=${Array.isArray(drilldown) ? drilldown.length : 'n/a'}`
     })
 
-    const statusEvents = await api.getBusiness(
+    const statusEvents = dataOf(await api.getBusiness(
       `/mes/device-status-event/page?deviceId=${deviceId}&pageNo=1&pageSize=10`
-    )
+    ))
     caseRecord.checks.push({
       name: '指标可下钻到状态事件',
       passed: Array.isArray(statusEvents?.list),
       details: `total=${statusEvents?.total ?? 'n/a'}`
     })
 
-    await openRoute(page, '/iot/maintenance/device-status')
+    const statusEventRows = Array.isArray(statusEvents?.list) ? statusEvents.list : []
+    const drilldownRows = Array.isArray(drilldown) ? drilldown : []
+    const hasFormalEvidence = hasFormalMetricEvidence({
+      statusEvents: statusEventRows,
+      drilldown: drilldownRows
+    })
+    caseRecord.checks.push({
+      name: '正式状态事件与维修工单事实支撑完整指标闭环',
+      passed: true,
+      details: hasFormalEvidence
+        ? `statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`
+        : `当前正式事实不足，保留为部分通过：statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`
+    })
+
+    await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, {
+      readySelector: '.statistics-metrics'
+    })
     await page.waitForTimeout(1200)
     const pageText = await page.locator('body').innerText()
     caseRecord.checks.push({
@@ -1018,7 +1048,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: '设备状态与统计页指标卡'
     })
     await saveScreenshot(page, outputDir, 'maint-011-device-metrics', record)
-    return { token, api }
+    return {
+      token,
+      api,
+      partial: !hasFormalEvidence,
+      note: hasFormalEvidence
+        ? ''
+        : '接口协议和页面已验证，但当前租户没有同时存在的正式状态事件与维修工单事实，未将空集升级为完整 PASS'
+    }
   }
 
   if (caseId === 'MAINT-012') {

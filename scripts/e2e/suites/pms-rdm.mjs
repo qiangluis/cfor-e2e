@@ -186,7 +186,7 @@ export const runCase = async ({ caseId, page, record, caseRecord }) => {
   }
 
   if (caseId === 'RDM-007') {
-    await openRoute(page, '/reports/project/project-plan/progress-efficiency')
+    await openRoute(page, '/reports/project/project-plan/progress-efficiency', { retries: 1 })
     const reportPage = page.locator('[data-testid="pm-report-progress-efficiency"]').first()
     await reportPage.waitFor({ state: 'visible' })
     await page

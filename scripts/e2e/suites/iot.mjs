@@ -341,15 +341,16 @@ const runDataAnomalyCase = async ({ page, record, caseRecord, outputDir }) => {
     )
   }
 
-  await openRoute(page, '/iot/data-anomaly', {
+  await openRoute(page, '/iot/device/data-anomaly', {
     readyText: '异常类型',
-    readyTimeoutMs: 15000
+    readyTimeoutMs: 15000,
+    retries: 1
   })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '数据异常队列页面渲染',
     passed: bodyText.includes('数据异常'),
-    details: '真实打开 /iot/data-anomaly 并校验页面标题'
+    details: '真实打开 /iot/device/data-anomaly 并校验页面标题'
   })
   await saveScreenshot(page, outputDir, 'pb329-iot-data-anomaly', record)
   caseRecord.evidence.push(
