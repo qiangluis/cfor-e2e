@@ -1422,7 +1422,9 @@
             "已关闭标签真实请求 isClosed=1 并回读测试单据",
             "数据库前后状态和数量与接口回读一致，两次行关闭审计持久化",
             "来源不传行号仍可创建，数据库行号为唯一正整数",
-            "独立 Chrome 的关联账号仅有请购查询权限，不能看到或直接请求关闭写操作"
+            "独立 Chrome 的关联账号仅有请购查询权限，不能看到或直接请求关闭写操作",
+            "Chrome 主动整单关闭新的两行请购，主表及分录同步关闭、原数量和下单标志不变",
+            "主动整单关闭审计持久化，重复关闭与下单明确拒绝且没有来源采购订单"
           ],
           "api": [
             "/erp/purchase/order/request/create",
@@ -1440,20 +1442,22 @@
           "database": ["erp_purchase_order_request", "erp_purchase_order_request_items", "mes_update_history"],
           "reverse": [
             "只修改 AUTOTEST-PROC 专用单据，保留关闭终态及数据库证据，不用 SQL 伪造或恢复状态",
-            "整单主动关闭、权限和跨租户矩阵未补齐前保持 PARTIAL"
+            "跨租户/组织矩阵未补齐前保持 PARTIAL"
           ]
         },
         {
           "id": "PROC-015",
           "title": "PB-139 采购订单状态标签、变更审计与附件",
-          "status": "READY",
+          "status": "PARTIAL",
           "preconditions": [
             "当前用户具备 ERP 采购订单查询权限",
-            "已执行 PB-139 的 erp_purchase_order_change 迁移"
+            "已执行 PB-139 的 erp_purchase_order_change 迁移",
+            "已通过 PROC-018 准备至少一张真实未指定供应商的采购订单"
           ],
           "routes": ["/erp/purchase/order"],
           "assertions": [
             "采购订单分页返回 billStage、isClosed 与 portalStatus 字段",
+            "真实无供应商采购订单详情返回空供应商名称和非空明细，不报供应商不存在",
             "变更接口对不存在单据返回业务错误",
             "变更记录查询接口对不存在单据返回业务错误",
             "附件接口对不存在单据返回业务错误",
@@ -1471,12 +1475,15 @@
             "erp_purchase_order_items",
             "erp_purchase_order_change"
           ],
-          "reverse": ["本案例只做读侧与负向契约验证，不真实变更或替换任何采购订单"]
+          "reverse": [
+            "本案例只做读侧与负向契约验证，不真实变更或替换任何采购订单",
+            "字段变更审计、附件写入与写权限矩阵未补齐前保持 PARTIAL"
+          ]
         },
         {
           "id": "PROC-016",
           "title": "PB-144 采购发票生成应付的历史订单防重复校验",
-          "status": "READY",
+          "status": "PARTIAL",
           "preconditions": [
             "当前用户具备 ERP 采购发票和应付单查询权限",
             "当前租户不存在待修复的历史重复应付数据"
@@ -1490,12 +1497,15 @@
           ],
           "api": ["/erp/purchase-invoice/page", "/finance/finPayable/list/dictText"],
           "database": ["erp_purchase_invoice", "fin_payable"],
-          "reverse": ["本案例只读验证，不自动复核发票或修改任何应付单"]
+          "reverse": [
+            "现有自动化步骤只读验证，不自动复核发票或修改任何应付单",
+            "历史应付存在/不存在/期初跳过三类真实复核尚未补齐，空数据扫描不计业务闭环通过"
+          ]
         },
         {
           "id": "PROC-017",
           "title": "PB-138 待生成请购前置列表与一键生成入口",
-          "status": "READY",
+          "status": "PARTIAL",
           "preconditions": ["当前用户具备 ERP 请购单新增权限", "当前租户已启用请购流程"],
           "routes": ["/erp/purchase/purchaseRequest"],
           "assertions": [
@@ -1512,7 +1522,73 @@
             "/mes/mrp/history"
           ],
           "database": ["erp_purchase_order_request", "erp_purchase_order_request_items"],
-          "reverse": ["本案例只打开入口并校验来源契约，不点击生成、不写入真实请购单"]
+          "reverse": [
+            "现有自动化步骤只打开入口并校验来源契约，不点击生成、不写入真实请购单",
+            "真实来源选择、生成待提审请购及来源关联回读尚未补齐，入口通过不计一键生成闭环通过"
+          ]
+        },
+        {
+          "id": "PROC-018",
+          "title": "请购 BPM 审核通过自动转采购订单",
+          "status": "READY",
+          "preconditions": [
+            "当前用户具备 ERP 请购单新增和审批权限",
+            "请购单审批策略使用流程审批，流程 key 为 erp-purchase-requisition-approval",
+            "采购负责人 purmgr01、财务复核 finrvw01、负责人终审 opsmgr01 及对应密码已准备",
+            "本地数据库只读证据环境变量已配置，写侧安全门禁通过"
+          ],
+          "routes": ["/erp/purchase/purchaseRequest", "/bpm/process-instance/detail", "/erp/purchase/order"],
+          "assertions": [
+            "请购单页面提审后进入 BPM 审批中并绑定流程实例",
+            "第二个 Chrome 会话可收到并办理请购 BPM 待办",
+            "BPM 审核通过后请购生效并自动生成采购订单",
+            "采购订单保留请购主表和明细来源关联",
+            "未入库的自动采购订单保持未关闭，不被通用执行阶段误判为完成",
+            "真实无供应商采购订单详情正常打开且数量和来源完整",
+            "重复办理已完成 BPM 任务被拒绝，不重复生成采购订单"
+          ],
+          "api": [
+            "/erp/purchase/order/request/create",
+            "/erp/purchase/order/request/get",
+            "/bpm/task/my-todo",
+            "/bpm/task/approve",
+            "/erp/purchase/order/page"
+          ],
+          "database": [
+            "erp_purchase_order_request",
+            "erp_purchase_order_request_items",
+            "erp_purchase_order",
+            "erp_purchase_order_items",
+            "bpm_process_instance",
+            "bpm_task"
+          ],
+          "reverse": ["保留本地验收单据和订单，禁止直接删除 BPM 审计事实"]
+        },
+        {
+          "id": "PROC-019",
+          "title": "PB-140 采购对账中心菜单、发起入口与详情字段",
+          "status": "READY",
+          "preconditions": [
+            "当前用户具备采购对账查询和发起权限",
+            "后端已执行采购对账菜单父级修复迁移",
+            "存在采购对账分页数据时才能完成详情字段验收"
+          ],
+          "routes": ["/erp/purchase/home", "/erp/purchase/reconciliation"],
+          "assertions": [
+            "供应链菜单显示采购对账且父级归属正确",
+            "采购首页待对账卡片下钻到 /erp/purchase/reconciliation 不再 404",
+            "采购对账分页返回 list/total 业务结构",
+            "采购对账页渲染发起对账入口",
+            "发起采购对账弹窗展示供应商和可对账发货明细入口",
+            "存在对账单时详情展示发货数量、收货数量、确认数量、确认单价和剩余可开票"
+          ],
+          "api": [
+            "/erp/purchase-reconciliation/page",
+            "/erp/purchase-reconciliation/get",
+            "/erp/purchase-reconciliation/available-lines"
+          ],
+          "database": ["erp_purchase_reconciliation", "erp_purchase_reconciliation_line"],
+          "reverse": ["只读打开页面和弹窗，不创建、确认或驳回对账单"]
         }
       ]
     },

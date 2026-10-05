@@ -48,5 +48,8 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await saveScreenshot(page, outputDir, 'wms-transfer-page', record)
   caseRecord.evidence.push('真实登录、调拨分页接口、仓库菜单路由和浏览器截图')
-  return { token, api }
+  if (rows.length === 0) {
+    caseRecord.notes.push('当前无真实调拨单，状态机、在途量和取消闭环未取得业务单据证据。')
+  }
+  return { token, api, partial: rows.length === 0 }
 }

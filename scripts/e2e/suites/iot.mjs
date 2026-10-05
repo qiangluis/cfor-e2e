@@ -285,7 +285,7 @@ const runAlertLifecycleCase = async ({ page, record, caseRecord, outputDir }) =>
     details: `total=${recordPage?.total ?? 0}, 带状态=${withStatus.length}`
   })
 
-  await openRoute(page, '/iot/alert/record')
+  await openRoute(page, '/iot/alert/record', { readyText: '生命周期' })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '告警记录页面渲染生命周期列与处置入口',
@@ -341,7 +341,10 @@ const runDataAnomalyCase = async ({ page, record, caseRecord, outputDir }) => {
     )
   }
 
-  await openRoute(page, '/iot/data-anomaly')
+  await openRoute(page, '/iot/data-anomaly', {
+    readyText: '异常类型',
+    readyTimeoutMs: 15000
+  })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '数据异常队列页面渲染',

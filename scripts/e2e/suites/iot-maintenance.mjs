@@ -29,7 +29,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   })
 
   if (caseId === 'IOT-004') {
-    const catalog = await api.getBusiness('/iot/capability/catalog')
+    const catalogResponse = await api.getBusiness('/iot/capability/catalog')
+    const catalog = catalogResponse?.data || {}
     const protocols = (catalog.protocols || []).map((item) => item.value)
     const forms = (catalog.deviceForms || []).map((item) => item.value)
     caseRecord.checks.push({
@@ -941,9 +942,32 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'MAINT-011') {
     // PB-326：设备统计指标从状态事件、工单与保养任务正式数据计算，支持钻取。
-    const deviceId = 1
+    const devicePage = await api.getBusiness('/iot/device/page?pageNo=1&pageSize=1')
+    const deviceId = devicePage?.data?.list?.[0]?.id
     const endTime = formatLocalDateTime(new Date())
     const startTime = formatLocalDateTime(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
+    if (!deviceId) {
+      caseRecord.notes.push('当前租户没有 IoT 设备，设备指标接口待补设备前置后复测；不使用固定设备编号。')
+      await openRoute(page, '/iot/maintenance/device-status')
+      await page.waitForTimeout(1200)
+      const pageText = await page.locator('body').innerText()
+      caseRecord.checks.push({
+        name: '设备状态页展示 MTBF/MTTR/维修费用/保养达成率指标',
+        passed:
+          pageText.includes('MTBF') &&
+          pageText.includes('MTTR') &&
+          pageText.includes('维修费用') &&
+          pageText.includes('保养达成率'),
+        details: '设备状态与统计页指标卡'
+      })
+      await saveScreenshot(page, outputDir, 'maint-011-device-metrics', record)
+      return {
+        token,
+        api,
+        partial: true,
+        note: '当前租户没有 IoT 设备，设备指标数据链路待补前置后复测'
+      }
+    }
     const metrics = await api.getBusiness(
       `/mes/device-status-event/metrics?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
     )

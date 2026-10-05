@@ -3,10 +3,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createHash } from 'node:crypto'
 import { config } from './config/index.mjs'
 import { launchBrowser, saveScreenshot } from './lib/browser.mjs'
 import { checklist } from './lib/assert.mjs'
+import {
+  checkpointScope,
+  implementationFingerprint,
+  resumableCases
+} from './lib/checkpoint.mjs'
 import {
   createCaseRecord,
   createRunRecord,
@@ -127,18 +131,25 @@ function caseIdsFor (args) {
   )
 }
 
+let runCheckpointScope
+
 function checkpointPath () {
-  const scope = createHash('sha256').update(JSON.stringify([
-    config.target, config.webBase, config.apiUrl, config.tenantId,
-    config.tenantName, config.username, config.db.name, catalog.version
-  ])).digest('hex').slice(0, 16)
-  return path.join(config.evidenceDir, 'checkpoints', `${scope}.json`)
+  runCheckpointScope ||= checkpointScope({
+    environment: [
+      config.target, config.webBase, config.apiUrl, config.tenantId,
+      config.tenantName, config.username, config.db.name,
+      config.purchaseApproverUsername, config.financeApproverUsername, config.finalApproverUsername
+    ],
+    catalog,
+    implementation: implementationFingerprint(here)
+  })
+  return path.join(config.evidenceDir, 'checkpoints', `${runCheckpointScope}.json`)
 }
 
 function loadCheckpoint () {
   try {
     const value = JSON.parse(fs.readFileSync(checkpointPath(), 'utf8'))
-    return new Set(value.completedCases || [])
+    return resumableCases(value.completedCases, definitions)
   } catch {
     return new Set()
   }
@@ -301,7 +312,7 @@ async function main () {
           })
           caseRecord.checks.push(...check.steps)
           const failedChecks = caseRecord.checks.filter((item) => item.passed === false)
-          const partial = declaredStatus === 'PARTIAL' || result?.notImplemented || result?.designed
+          const partial = declaredStatus === 'PARTIAL' || result?.notImplemented || result?.designed || result?.partial
           const outcome = caseOutcome({ failedChecks, partial, hasAssertions, result })
           finishCase(caseRecord, outcome.status, outcome.note)
           if (outcome.status === 'PASS') saveCheckpoint(definition.id)

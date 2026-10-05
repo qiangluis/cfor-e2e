@@ -25,12 +25,13 @@ export async function createPurchaseReader (api, caseRecord) {
     sort: 999, status: 0, remark: 'PROC-014 permission acceptance only'
   })).data
   const username = `autotestprocreader${tag}`
+  const password = `Auto!${tag.slice(-6)}Aa9`
   let userId
   try {
     await api.postBusiness('/system/permission/assign-role-menu', { roleId, menuIds })
     userId = (await api.postBusiness('/system/user/create', {
       username, nickname: `验收请购只读${tag}`,
-      password: config.password, sex: 0, postIds: [],
+      password, sex: 0, postIds: [],
       remark: 'PROC-014 permission acceptance only'
     })).data
     await api.postBusiness('/system/permission/assign-user-role', { userId, roleIds: [roleId] })
@@ -49,7 +50,7 @@ export async function createPurchaseReader (api, caseRecord) {
   }]
   return {
     userId, username, roleId,
-    credentials: { username, password: config.password, tenantName: config.tenantName },
+    credentials: { username, password, tenantName: config.tenantName },
     deactivate: () => api.putBusiness('/system/user/update-status', { id: userId, status: 1 })
   }
 }

@@ -46,6 +46,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
 
     await openRoute(page, '/finance/payableManage/payWriteOff')
+    await page.waitForFunction(
+      () =>
+        document.body.innerText.includes('单据阶段') &&
+        document.body.innerText.includes('核销金额'),
+      { timeout: 60000 }
+    )
     const checkBodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '应付核销单页面真实渲染单据阶段与核销金额列',

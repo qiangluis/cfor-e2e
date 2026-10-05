@@ -18,12 +18,12 @@ const flattenDepartments = (nodes) =>
 
 const responseData = (payload) => payload?.data ?? payload
 
-const loadFormalModel = async (api) => {
+const loadFormalModelPage = async (api) => {
   const result = await api.getBusiness(
     `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
   )
   const list = result?.data?.list || []
-  return list.find((item) => item.status === 'LOCKED') || list[0] || null
+  return { list, model: list.find((item) => item.status === 'LOCKED') || list[0] || null }
 }
 
 const trackedTraceShape = (rows) =>
@@ -37,11 +37,13 @@ const trackedTraceShape = (rows) =>
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
-  const model = await loadFormalModel(api)
+  const { list: modelVersions, model } = await loadFormalModelPage(api)
   caseRecord.checks.push({
     name: '成本模型版本 API 可用',
-    passed: Boolean(model?.id),
-    details: model ? `${model.id}:${model.versionNo}:${model.status}` : '当前租户暂无成本模型'
+    passed: Array.isArray(modelVersions),
+    details: model
+      ? `${model.id}:${model.versionNo}:${model.status}`
+      : '当前租户暂无成本模型，已验证空列表契约'
   })
 
   if (caseId === 'COST-001') {
@@ -80,7 +82,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: Array.isArray(centersResult?.data),
       details: `centers=${centersResult?.data?.length ?? 0}`
     })
-    await openRoute(page, '/cost-management/modeling/allocation-rule')
+    await openRoute(page, '/cost-management/modeling/allocation-rule', {
+      readySelector: '.allocation-workspace'
+    })
     caseRecord.checks.push({
       name: '成本分摊规则页面可打开',
       passed: (await page.locator('.allocation-workspace').count()) > 0,
@@ -95,6 +99,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     await saveScreenshot(page, outputDir, 'cost-allocation-rule', record)
     caseRecord.evidence.push('成本分摊规则正式 API、成本中心主档与页面截图')
+    return model ? { token, api } : {
+      token,
+      api,
+      partial: true,
+      note: '当前租户暂无成本模型，成本分摊规则完整业务闭环待初始化模型后复测'
+    }
   }
 
   if (caseId === 'COST-002') {

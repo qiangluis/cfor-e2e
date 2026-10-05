@@ -10,10 +10,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   const api = createApiClient({ token, record })
 
   if (caseId === 'PB040-001') {
-    const objectCatalog = await api.getBusiness('/system/custom-field/object-catalog')
-    const definitionPage = await api.getBusiness('/system/custom-field/page?pageNo=1&pageSize=100')
-    const objects = Array.isArray(objectCatalog) ? objectCatalog : []
-    const definitions = definitionPage?.list || []
+    const objectCatalogResponse = await api.getBusiness('/system/custom-field/object-catalog')
+    const definitionPageResponse = await api.getBusiness(
+      '/system/custom-field/page?pageNo=1&pageSize=100'
+    )
+    const objects = Array.isArray(objectCatalogResponse?.data) ? objectCatalogResponse.data : []
+    const definitions = definitionPageResponse?.data?.list || []
 
     caseRecord.checks.push({
       name: '业务对象与能力位置目录可访问',
@@ -43,7 +45,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `definitionCount=${definitions.length}`
     })
 
-    await openRoute(page, '/settings/custom-field')
+    await openRoute(page, '/settings/custom-field', {
+      readySelector: '.custom-field-tabs',
+      readyTimeoutMs: 15000
+    })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '设置-自定义项中心页面渲染定义与旧扩展槽位两个页签',

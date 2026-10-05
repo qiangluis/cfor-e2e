@@ -1,11 +1,11 @@
 // 与前端一致的 AES 加解密（前端 assets 中硬编码的公开参数，非密钥秘密）：
-//   请求加密：AES-256-ECB(Pkcs7)，key = UTF8('cfdeec6bb693b85c8808a6fc47172832')，输出 base64
-//   响应解密：同上，key = '039e10f88123a2b9963f24a3e2254353'
+//   请求加密：AES-256-ECB(Pkcs7)，key = UTF8('52549111389893486934626385991395')，输出 base64
+//   响应解密：同上，key = '96103715984234343991809655248883'
 //   请求头：X-Api-Encrypt: true
 import crypto from 'node:crypto'
 
-export const REQ_KEY = 'cfdeec6bb693b85c8808a6fc47172832'
-export const RESP_KEY = '039e10f88123a2b9963f24a3e2254353'
+export const REQ_KEY = '52549111389893486934626385991395'
+export const RESP_KEY = '96103715984234343991809655248883'
 export const ENCRYPT_HEADER = 'X-Api-Encrypt'
 
 function cipher (plain, keyStr) {

@@ -77,5 +77,8 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await saveScreenshot(page, outputDir, 'wms-borrow-page', record)
   caseRecord.evidence.push('真实登录、借用归还分页接口、仓库菜单路由和浏览器截图')
-  return { token, api }
+  if (rows.length === 0) {
+    caseRecord.notes.push('当前无真实借用单，借用/部分归还/逾期/超期归还状态机未取得业务单据证据。')
+  }
+  return { token, api, partial: rows.length === 0 }
 }

@@ -157,9 +157,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB006-001') {
-    const coverage = await api.getBusiness('/system/data-permission/coverage')
-    const summary = await api.getBusiness('/system/data-permission/coverage/summary')
-    const items = Array.isArray(coverage) ? coverage : []
+    const coverageResponse = await api.getBusiness('/system/data-permission/coverage')
+    const summaryResponse = await api.getBusiness('/system/data-permission/coverage/summary')
+    const items = Array.isArray(coverageResponse?.data) ? coverageResponse.data : []
+    const summary = summaryResponse?.data || {}
 
     caseRecord.checks.push({
       name: '数据权限业务表覆盖清单可读取',

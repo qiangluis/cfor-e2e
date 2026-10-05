@@ -5,7 +5,8 @@ import {
   parallelSafeCases,
   partitionDefinitions,
   selectDefinitions,
-  summarizeResults
+  summarizeResults,
+  validateCaseTimeoutMs
 } from '../parallel-runner.mjs'
 
 test('parallel plan keeps safe cases disjoint from serial cases', () => {
@@ -54,4 +55,20 @@ test('batch summary exposes failures and partial cases for one retest list', () 
   })
   assert.deepEqual(summary.failedCaseIds, ['B', 'D', 'E'])
   assert.deepEqual(summary.partialCaseIds, ['C'])
+})
+
+test('parallel worker timeout must be a bounded integer', () => {
+  assert.equal(validateCaseTimeoutMs(180000), 180000)
+  assert.throws(() => validateCaseTimeoutMs(undefined), /不小于 1000/)
+  assert.throws(() => validateCaseTimeoutMs(999), /不小于 1000/)
+})
+
+test('conditionally mutating quality cases stay in the serial pool', () => {
+  const { parallel, serial } = partitionDefinitions(allDefinitions())
+  const parallelIds = new Set(parallel.map((item) => item.id))
+  const serialIds = new Set(serial.map((item) => item.id))
+  assert.equal(parallelIds.has('QUALITY-NG-001'), false)
+  assert.equal(parallelIds.has('QUALITY-TRACE-001'), false)
+  assert.equal(serialIds.has('QUALITY-NG-001'), true)
+  assert.equal(serialIds.has('QUALITY-TRACE-001'), true)
 })

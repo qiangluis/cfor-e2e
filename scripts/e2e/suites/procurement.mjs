@@ -32,7 +32,8 @@ export const cases = [
   'PROC-015',
   'PROC-016',
   'PROC-017',
-  'PROC-018'
+  'PROC-018',
+  'PROC-019'
 ]
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
@@ -1325,6 +1326,96 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         await approverBrowser.browser.close()
       }
     }
+    return { token, api }
+  }
+
+  if (caseId === 'PROC-019') {
+    const token = await login(page)
+    const api = createApiClient({ token, record })
+    const pageResult = await api.getBusiness(
+      '/erp/purchase-reconciliation/page?pageNo=1&pageSize=100'
+    )
+    const rows = Array.isArray(pageResult?.data?.list) ? pageResult.data.list : []
+    caseRecord.checks.push({
+      name: '采购对账分页返回 list/total 业务结构',
+      passed:
+        Array.isArray(pageResult?.data?.list) &&
+        Object.prototype.hasOwnProperty.call(pageResult.data, 'total'),
+      details: `rows=${rows.length}, total=${pageResult?.data?.total}`
+    })
+
+    await page.goto(`${config.webBase}/erp/purchase/reconciliation`, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.browserTimeoutMs
+    })
+    await page.waitForFunction(
+      (expectedPath) => window.location.pathname === expectedPath,
+      '/erp/purchase/reconciliation',
+      { timeout: config.browserTimeoutMs }
+    )
+    const menuItem = page.locator('.el-menu-item').filter({ hasText: '采购对账' }).first()
+    await menuItem.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
+    const menuVisible = await menuItem.isVisible().catch(() => false)
+    const launchButton = page.getByRole('button', { name: '发起对账', exact: true }).first()
+    await launchButton.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
+    const bodyText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '供应链菜单显示采购对账且深链不再进入 404',
+      passed:
+        menuVisible &&
+        page.url().includes('/erp/purchase/reconciliation') &&
+        bodyText.includes('采购对账'),
+      details: `url=${page.url()}, menuVisible=${menuVisible}`
+    })
+    caseRecord.checks.push({
+      name: '采购对账页面渲染发起对账入口',
+      passed: bodyText.includes('采购对账') && await launchButton.isVisible(),
+      details: page.url()
+    })
+
+    await launchButton.click()
+    const createDialog = page.getByText('发起采购对账', { exact: true }).first()
+    await createDialog.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
+    const createDialogText = await page.locator('.el-dialog:visible').last().innerText()
+    caseRecord.checks.push({
+      name: '发起采购对账弹窗展示供应商与可对账发货明细入口',
+      passed:
+        createDialogText.includes('供应商') &&
+        createDialogText.includes('选择供应商后加载可对账发货明细') &&
+        createDialogText.includes('生成对账单'),
+      details: createDialogText.slice(0, 500)
+    })
+    await page.getByRole('button', { name: '取消', exact: true }).last().click()
+
+    if (!rows.length) {
+      caseRecord.evidence.push(
+        '真实 admin Chrome 已验证供应链菜单、采购对账深链、分页契约和发起弹窗；当前无对账单样本，详情字段待补数据复验'
+      )
+      return {
+        token,
+        api,
+        notImplemented: true,
+        note: '当前租户采购对账分页为空，详情字段缺少真实样本，不能登记完整通过'
+      }
+    }
+
+    const firstRow = rows[0]
+    const billButton = page.getByRole('button', { name: String(firstRow.billNo), exact: true }).first()
+    await billButton.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
+    await billButton.click()
+    const detailTitle = page.getByText('采购对账详情', { exact: true }).first()
+    await detailTitle.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
+    const detailText = await page.locator('.el-dialog:visible').last().innerText()
+    const detailFields = ['发货数量', '收货数量', '确认数量', '确认单价', '剩余可开票']
+    caseRecord.checks.push({
+      name: '采购对账详情展示关键数量、价格和可开票字段',
+      passed: detailFields.every((label) => detailText.includes(label)),
+      details: `billNo=${firstRow.billNo}, fields=${detailFields.filter((label) => detailText.includes(label)).join(',')}`
+    })
+    await saveScreenshot(page, outputDir, 'purchase-reconciliation', record)
+    caseRecord.evidence.push(
+      `真实 admin Chrome 验证采购对账深链、发起弹窗和详情字段，billNo=${firstRow.billNo}`
+    )
     return { token, api }
   }
 

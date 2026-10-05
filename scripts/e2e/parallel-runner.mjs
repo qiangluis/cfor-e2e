@@ -47,8 +47,6 @@ export const parallelSafeCases = new Set([
   'QUALITY-IQC-001',
   'QUALITY-IPQC-001',
   'QUALITY-OQC-001',
-  'QUALITY-NG-001',
-  'QUALITY-TRACE-001',
   'QUALITY-METRIC-001',
   'COST-001',
   'COST-004',
@@ -71,6 +69,13 @@ export function allDefinitions (sourceCatalog = catalog) {
   return sourceCatalog.suites.flatMap((suite) =>
     suite.cases.map((item) => ({ ...item, suite: suite.id }))
   )
+}
+
+export function validateCaseTimeoutMs (value) {
+  if (!Number.isInteger(value) || value < 1000) {
+    throw new Error(`--case-timeout-ms 必须是不小于 1000 的整数，当前=${value}`)
+  }
+  return value
 }
 
 function parseArgs (argv) {
@@ -97,9 +102,7 @@ function parseArgs (argv) {
   if (!Number.isInteger(args.workers) || args.workers < 1) {
     throw new Error(`--workers 必须是大于 0 的整数，当前=${args.workers}`)
   }
-  if (!Number.isInteger(args.caseTimeoutMs) || args.caseTimeoutMs < 1000) {
-    throw new Error(`--case-timeout-ms 必须是不小于 1000 的整数，当前=${args.caseTimeoutMs}`)
-  }
+  validateCaseTimeoutMs(args.caseTimeoutMs)
   return args
 }
 
@@ -317,11 +320,15 @@ export async function runBatch ({
   outputRoot,
   workers,
   headless,
-  caseTimeoutMs
+  caseTimeoutMs = 180000
 }) {
+  validateCaseTimeoutMs(caseTimeoutMs)
   const batchId = `parallel-${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${process.pid}`
   const batchDir = mkdir(path.join(outputRoot, batchId))
-  const results = await runPool(definitions, { batchDir, workers, headless })
+  const results = await runPool(
+    definitions,
+    { batchDir, workers, headless, caseTimeoutMs }
+  )
   const summary = summarizeResults(results)
   const record = {
     batchId,

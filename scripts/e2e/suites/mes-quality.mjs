@@ -1,4 +1,4 @@
-import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { assertBusinessSuccess, isBusinessSuccess } from '../lib/assertions.mjs'
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
@@ -76,10 +76,11 @@ const runNgDispositionReviewCase = async ({ page, record, caseRecord, outputDir 
     })
     caseRecord.checks.push({
       name: '非法评审结论被拒绝且不写库（PB-317）',
-      passed: invalidDecision?.code !== 0,
+      passed: !isBusinessSuccess(invalidDecision),
       details: JSON.stringify(invalidDecision).slice(0, 300)
     })
   } else {
+    caseRecord.notes.push('当前无不合格记录，评审门禁与非法结论写侧未取得真实数据证据。')
     caseRecord.checks.push({
       name: '无不合格记录数据，跳过评审门禁断言',
       passed: true,
@@ -101,7 +102,7 @@ const runNgDispositionReviewCase = async ({ page, record, caseRecord, outputDir 
 
   await saveScreenshot(page, outputDir, 'quality-ng-disposition-review', record)
   caseRecord.evidence.push('真实登录、不合格记录列表/处置门禁接口、评审入口页面与浏览器截图')
-  return { token, api }
+  return { token, api, partial: rowsArray.length === 0 }
 }
 
 const runPendingInspectCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -109,13 +110,14 @@ const runPendingInspectCase = async ({ page, record, caseRecord, outputDir }) =>
   const api = createApiClient({ token, record })
 
   const list = await api.getBusiness('/mes/quality/pending-inspect/list?limit=1')
+  const rows = Array.isArray(list?.data) ? list.data : []
   caseRecord.checks.push({
     name: '统一待检池接口返回成功且最多返回 1 条',
-    passed: Array.isArray(list?.data) && list.data.length <= 1,
-    details: `rows=${Array.isArray(list?.data) ? list.data.length : 'invalid'}`
+    passed: Array.isArray(list?.data) && rows.length <= 1,
+    details: `rows=${rows.length}`
   })
-  if (Array.isArray(list?.data) && list.data.length > 0) {
-    const row = list.data[0]
+  if (rows.length > 0) {
+    const row = rows[0]
     caseRecord.checks.push({
       name: '待检任务详情带来源场景、方案、抽检、检验员与期限字段',
       passed:
@@ -125,8 +127,10 @@ const runPendingInspectCase = async ({ page, record, caseRecord, outputDir }) =>
         Object.prototype.hasOwnProperty.call(row, 'sampleQty') &&
         Object.prototype.hasOwnProperty.call(row, 'assignedInspectorUserId') &&
         Object.prototype.hasOwnProperty.call(row, 'dueTime'),
-      details: `sourceScene=${row.sourceScene}，planId=${row.inspectionPlanId}`
+        details: `sourceScene=${row.sourceScene}，planId=${row.inspectionPlanId}`
     })
+  } else {
+    caseRecord.notes.push('当前无待检任务，来源/方案/抽检/期限字段及待检流程未取得真实数据证据。')
   }
 
   await openRoute(page, '/quality/pendingInspect')
@@ -146,7 +150,7 @@ const runPendingInspectCase = async ({ page, record, caseRecord, outputDir }) =>
 
   await saveScreenshot(page, outputDir, 'quality-pending-inspect-page', record)
   caseRecord.evidence.push('真实登录、待检池列表接口与浏览器截图')
-  return { token, api }
+  return { token, api, partial: rows.length === 0 }
 }
 
 const runRectificationCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -155,7 +159,7 @@ const runRectificationCase = async ({ page, record, caseRecord, outputDir }) => 
 
   // 当前登录用户作为整改责任人，避免依赖固定用户主键
   const permission = await api.get('/system/auth/get-permission-info')
-  const responsibleUserId = permission?.user?.id
+  const responsibleUserId = permission?.data?.user?.id
   caseRecord.checks.push({
     name: '登录权限信息返回当前用户，可作为整改责任人',
     passed: responsibleUserId !== undefined && responsibleUserId !== null,
@@ -169,7 +173,7 @@ const runRectificationCase = async ({ page, record, caseRecord, outputDir }) => 
   })
   caseRecord.checks.push({
     name: '缺少责任人/期限的整改单被拒绝保存',
-    passed: missingDueDate?.code !== 0,
+    passed: !isBusinessSuccess(missingDueDate),
     details: JSON.stringify(missingDueDate).slice(0, 300)
   })
 
@@ -277,7 +281,7 @@ const runRectificationCase = async ({ page, record, caseRecord, outputDir }) => 
     })
     caseRecord.checks.push({
       name: '已关闭整改单拒绝再次修改',
-      passed: updateAfterClose?.code !== 0,
+      passed: !isBusinessSuccess(updateAfterClose),
       details: JSON.stringify(updateAfterClose).slice(0, 300)
     })
   } finally {
@@ -314,19 +318,24 @@ const runIqcQuantityCase = async ({ page, record, caseRecord, outputDir }) => {
   const list = await api.getBusiness(
     '/mes/quality/qualityInspection/list/dictText?pageNo=1&pageSize=1'
   )
-  const rows = list?.data?.list || list?.data || []
+  const rows =
+    list?.data?.records ||
+    list?.data?.list ||
+    (Array.isArray(list?.data) ? list.data : [])
   caseRecord.checks.push({
     name: '质检单列表接口返回成功',
     passed: Array.isArray(rows),
     details: `rows=${Array.isArray(rows) ? rows.length : 'invalid'}`
   })
 
+  let hasQuantityEvidence = false
   if (Array.isArray(rows) && rows.length > 0 && rows[0]?.id) {
     const detail = await api.getBusiness(
       `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${rows[0].id}`
     )
     const entries = detail?.data || []
     const firstEntry = Array.isArray(entries) ? entries[0] : null
+    hasQuantityEvidence = Boolean(firstEntry)
     caseRecord.checks.push({
       name: '质检明细携带合格/让步/不合格/待判定四态数量口径',
       passed:
@@ -341,6 +350,9 @@ const runIqcQuantityCase = async ({ page, record, caseRecord, outputDir }) => {
         : '无质检明细，跳过字段断言'
     })
   }
+  if (!hasQuantityEvidence) {
+    caseRecord.notes.push('当前无来料质检单明细，四态数量口径未取得真实数据证据。')
+  }
 
   await openRoute(page, '/quality/order')
   await page.waitForLoadState('networkidle')
@@ -352,7 +364,7 @@ const runIqcQuantityCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await saveScreenshot(page, outputDir, 'quality-order-page', record)
   caseRecord.evidence.push('真实登录、质检单列表/明细接口与浏览器截图')
-  return { token, api }
+  return { token, api, partial: !hasQuantityEvidence }
 }
 
 const runProcessInspectionGateCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -362,7 +374,10 @@ const runProcessInspectionGateCase = async ({ page, record, caseRecord, outputDi
   const list = await api.getBusiness(
     '/mes/quality/qualityInspection/list/dictText?pageNo=1&pageSize=10'
   )
-  const rows = list?.data?.list || list?.data || []
+  const rows =
+    list?.data?.records ||
+    list?.data?.list ||
+    (Array.isArray(list?.data) ? list.data : [])
   const rowsArray = Array.isArray(rows) ? rows : []
   caseRecord.checks.push({
     name: '质检单列表接口返回成功',
@@ -409,10 +424,12 @@ const runProcessInspectionGateCase = async ({ page, record, caseRecord, outputDi
       details: page.url()
     })
     await saveScreenshot(page, outputDir, 'quality-order-detail-recheck', record)
+  } else {
+    caseRecord.notes.push('当前无可用过程质检单，关键必检门禁与复检新增批次未取得真实数据证据。')
   }
 
   caseRecord.evidence.push('真实登录、关键必检门禁接口、质检单详情复检入口与浏览器截图')
-  return { token, api }
+  return { token, api, partial: !effectiveRow?.id }
 }
 
 const runSalesOutboundQualityCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -422,7 +439,10 @@ const runSalesOutboundQualityCase = async ({ page, record, caseRecord, outputDir
   const list = await api.getBusiness(
     '/mes/quality/qualityInspection/list/dictText?pageNo=1&pageSize=100'
   )
-  const rows = list?.data?.list || list?.data || []
+  const rows =
+    list?.data?.records ||
+    list?.data?.list ||
+    (Array.isArray(list?.data) ? list.data : [])
   const rowsArray = Array.isArray(rows) ? rows : []
   const outboundRows = rowsArray.filter((row) => String(row?.type) === '201')
   caseRecord.checks.push({
@@ -432,12 +452,14 @@ const runSalesOutboundQualityCase = async ({ page, record, caseRecord, outputDir
   })
 
   const sample = outboundRows[0]
+  let hasOqcEvidence = false
   if (sample?.id) {
     const detail = await api.getBusiness(
       `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${sample.id}`
     )
     const entries = detail?.data || []
     const firstEntry = Array.isArray(entries) ? entries[0] : null
+    hasOqcEvidence = Boolean(firstEntry)
     caseRecord.checks.push({
       name: 'OQC 明细按合格/有效让步/待判定/不合格四态返回',
       passed:
@@ -452,6 +474,7 @@ const runSalesOutboundQualityCase = async ({ page, record, caseRecord, outputDir
         : '无 OQC 明细，跳过字段断言'
     })
   } else {
+    caseRecord.notes.push('当前无 201 销售出库检记录，OQC 四态与销售出库放行未取得真实数据证据。')
     caseRecord.checks.push({
       name: '无 201 销售出库检数据，跳过明细字段断言',
       passed: true,
@@ -469,7 +492,7 @@ const runSalesOutboundQualityCase = async ({ page, record, caseRecord, outputDir
 
   await saveScreenshot(page, outputDir, 'quality-oqc-page', record)
   caseRecord.evidence.push('真实登录、201 销售出库检列表/四态明细接口与浏览器截图')
-  return { token, api }
+  return { token, api, partial: !hasOqcEvidence }
 }
 
 const runQualityTraceCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -521,7 +544,7 @@ const runQualityTraceCase = async ({ page, record, caseRecord, outputDir }) => {
     })
     caseRecord.checks.push({
       name: '处理链路缺失异常返回成功',
-      passed: handled?.code === 0,
+      passed: isBusinessSuccess(handled),
       details: JSON.stringify(handled).slice(0, 300)
     })
     const afterHandle = await api.getBusiness(
@@ -545,7 +568,7 @@ const runQualityTraceCase = async ({ page, record, caseRecord, outputDir }) => {
   const missingKey = await api.get('/mes/quality/trace/detail')
   caseRecord.checks.push({
     name: '缺少追溯主键的查询被拒绝',
-    passed: missingKey?.code !== 0,
+    passed: !isBusinessSuccess(missingKey),
     details: JSON.stringify(missingKey).slice(0, 300)
   })
 
@@ -563,7 +586,8 @@ const runQualityTraceCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await saveScreenshot(page, outputDir, 'quality-trace-page', record)
   caseRecord.evidence.push('真实登录、追溯只读聚合接口、链路缺失异常分页/处理接口与浏览器截图')
-  return { token, api }
+  caseRecord.notes.push('本次仅验证无事实批号、缺失异常幂等与页面契约，尚未取得真实批号/序列号六环节链路证据。')
+  return { token, api, partial: true }
 }
 
 const runQualityMetricCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -594,6 +618,17 @@ const runQualityMetricCase = async ({ page, record, caseRecord, outputDir }) => 
 
   const detailResp = await api.getBusiness('/mes/quality/metric/detail/page?pageNo=1&pageSize=100')
   const detailRows = detailResp?.data?.list || []
+  const metricValues = [
+    report.inspectionTaskCount,
+    report.sampleQty,
+    report.defectQty,
+    report.dispositionCount,
+    report.returnBillCount
+  ].map((value) => Number(value || 0))
+  const hasMetricData = detailRows.length > 0 || metricValues.some((value) => value > 0)
+  if (!hasMetricData) {
+    caseRecord.notes.push('当前质量指标报表和明细均无真实业务数据，指标定义与零聚合通过但不代表真实统计闭环已验收。')
+  }
   caseRecord.checks.push({
     name: '质量指标明细与报表同筛选口径且分页不超过 100',
     passed: Array.isArray(detailRows) && detailRows.length <= 100,
@@ -638,7 +673,7 @@ const runQualityMetricCase = async ({ page, record, caseRecord, outputDir }) => 
 
   await saveScreenshot(page, outputDir, 'quality-metric-page', record)
   caseRecord.evidence.push('真实登录、质量指标报表/明细/口径定义接口与浏览器截图')
-  return { token, api }
+  return { token, api, partial: !hasMetricData }
 }
 
 const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
@@ -666,7 +701,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
     'QUALITY-BASE-003': {
       title: '质检方案版本与发布状态可查询',
       endpoint: '/mes/quality/qualityPlan/list?pageNo=1&pageSize=100',
-      route: '/quality/plan',
+      route: '/systemModel/quality/plan',
       validate: (rows) =>
         rows.every(
           (row) =>
@@ -676,7 +711,8 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
     },
     'QUALITY-BASE-004': {
       title: '质检存货适用范围可查询',
-      endpoint: '/mes/quality/qualityMaterial/list?pageNo=1&pageSize=100',
+      endpoint:
+        '/mes/quality/qualityMaterial/list?pageNo=1&pageSize=100&types=300%2C104%2C201%2C101%2C500',
       route: '/quality/workbench',
       validate: (rows) =>
         rows.every(
@@ -713,7 +749,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
   caseRecord.checks.push({
     name: `${definition.title}，分页 pageSize 不超过 100`,
     passed:
-      response?.code === 0 &&
+      isBusinessSuccess(response) &&
       Array.isArray(rows) &&
       rows.length <= 100 &&
       definition.validate(rows),
@@ -747,10 +783,10 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
       caseRecord.checks.push({
         name: '质检存货查询入口经过统一适用规则解析',
         passed:
-          resolved?.code === 0 &&
+          isBusinessSuccess(resolved) &&
           resolvedRule.materialId === firstRule.materialId &&
           resolvedRule.type === firstRule.type &&
-          resolvedRule.planId,
+          Boolean(resolvedRule.planId),
         details: `ruleId=${resolvedRule.id || 'n/a'}, planId=${resolvedRule.planId || 'n/a'}`
       })
     } else {
@@ -771,7 +807,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
     })
     caseRecord.checks.push({
       name: '不合格处置正式执行接口存在并拒绝不存在记录',
-      passed: executeProbe?.code !== 0,
+      passed: !isBusinessSuccess(executeProbe),
       details: `code=${executeProbe?.code}, msg=${executeProbe?.msg || executeProbe?.message || ''}`
     })
     const reverseProbe = await api.post('/mes/quality/qualityNgRecords/reverse', {
@@ -780,7 +816,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
     })
     caseRecord.checks.push({
       name: '不合格处置反执行接口存在并拒绝不存在记录',
-      passed: reverseProbe?.code !== 0,
+      passed: !isBusinessSuccess(reverseProbe),
       details: `code=${reverseProbe?.code}, msg=${reverseProbe?.msg || reverseProbe?.message || ''}`
     })
 
@@ -809,7 +845,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
       caseRecord.checks.push({
         name: '正式处置不能临时改用未评审的动作',
         passed:
-          wrongAction?.code !== 0 &&
+          !isBusinessSuccess(wrongAction) &&
           String(wrongAction?.msg || wrongAction?.message || '').includes('评审不一致'),
         details: `record=${executableRecord.id}, code=${wrongAction?.code}`
       })
@@ -827,7 +863,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
         caseRecord.checks.push({
           name: '报废正式执行缺少仓库时被拒绝，不生成未生效草稿',
           passed:
-            missingWarehouse?.code !== 0 &&
+            !isBusinessSuccess(missingWarehouse) &&
             String(missingWarehouse?.msg || missingWarehouse?.message || '').includes('指定仓库'),
           details: `record=${executableRecord.id}, code=${missingWarehouse?.code}, msg=${missingWarehouse?.msg || missingWarehouse?.message || ''}`
         })
@@ -889,7 +925,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
       caseRecord.checks.push({
         name: '维修/返工缺少正式反向契约时安全拒绝且不改处置数量',
         passed:
-          reverse?.code !== 0 &&
+          !isBusinessSuccess(reverse) &&
           String(reverse?.msg || reverse?.message || '').includes('正式反向接口') &&
           after != null &&
           Number(after.operateQty || 0) === Number(source.operateQty || 0),
@@ -912,7 +948,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
     caseRecord.checks.push({
       name: '正式不合格记录返回主档 ID、编码和名称快照',
       passed:
-        recordsResponse?.code === 0 &&
+        isBusinessSuccess(recordsResponse) &&
         recordRows.every(
           (row) =>
             !row?.ngTypeId ||
@@ -934,7 +970,7 @@ const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir 
     caseRecord.checks.push({
       name: '正式质检单回显场景子类型与方案快照字段',
       passed:
-        response?.code === 0 &&
+        isBusinessSuccess(response) &&
         snapshotRows.every(
           (row) => row.qualityPlanVersion !== undefined && row.qualityPlanSnapshotJson
         ),

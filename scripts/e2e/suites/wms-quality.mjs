@@ -178,6 +178,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `code=${editResult?.code}`
       })
     } else {
+      caseRecord.notes.push('当前租户没有 106 库存期初单据，直接编辑拒绝和期初判重未取得真实单据证据。')
       caseRecord.checks.push({
         name: '期初锁定写测具备前置单据',
         passed: true,
@@ -186,6 +187,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     }
 
     await openRoute(page, '/wireSideWarehouse/beginningInventory')
+    const pageRenderStartedAt = Date.now()
+    await page.getByText('库存期初', { exact: true }).first().waitFor({
+      state: 'visible',
+      timeout: 60000
+    })
+    await page.getByRole('button', { name: '导入', exact: true }).waitFor({
+      state: 'visible',
+      timeout: 60000
+    })
+    const pageRenderDurationMs = Date.now() - pageRenderStartedAt
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '库存期初页面真实渲染导入和单据操作入口',
@@ -193,11 +204,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         page.url().includes('/wireSideWarehouse/beginningInventory') &&
         bodyText.includes('库存期初') &&
         bodyText.includes('导入'),
-      details: page.url()
+      details: `${page.url()}, renderMs=${pageRenderDurationMs}`
+    })
+    caseRecord.checks.push({
+      name: '库存期初页面稳定控件渲染耗时不超过 5 秒',
+      passed: pageRenderDurationMs <= 5000,
+      details: `renderMs=${pageRenderDurationMs}`
     })
     await saveScreenshot(page, outputDir, 'wms-beginning-inventory-lock', record)
     caseRecord.evidence.push('真实登录、106 期初分页、详情事实源、直接编辑拒绝和页面截图')
-    return { token, api }
+    return { token, api, partial: !opening?.id }
   }
 
   if (caseId === 'WMS-QC-008') {

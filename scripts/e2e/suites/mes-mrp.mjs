@@ -27,11 +27,7 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
   })
 
   if (rows.length === 0) {
-    caseRecord.checks.push({
-      name: 'MRP 运算状态查询返回状态码、状态名称与可终止标记',
-      passed: false,
-      details: '当前租户没有 MRP 运算记录，无法验证状态接口；需先构造一条运算记录'
-    })
+    caseRecord.notes.push('当前租户没有 MRP 运算记录样本，无法验收状态接口和幂等负向流程。')
   } else {
     const statusResult = await api.getBusiness(
       `/mes/mrp/status/${encodeURIComponent(rows[0].id)}`
@@ -63,5 +59,9 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await saveScreenshot(page, outputDir, 'mes-mrp-status', record)
   caseRecord.evidence.push('真实登录后调用 MRP 历史分页与状态查询接口')
-  return { api }
+  return {
+    api,
+    notImplemented: rows.length === 0,
+    note: rows.length === 0 ? '当前租户没有 MRP 运算记录样本，状态接口待补数据复验' : undefined
+  }
 }

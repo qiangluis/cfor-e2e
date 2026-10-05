@@ -498,8 +498,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       await bookingFormItem('会议主题').locator('input').first().fill(subject)
       await bookingFormItem('会议室').locator('.el-select').first().click()
       await page.getByRole('option', { name: new RegExp(roomName) }).first().click()
-      await bookingFormItem('开始时间').locator('input').first().fill(startTime)
-      await bookingFormItem('结束时间').locator('input').first().fill(endTime)
+      const startTimeInput = bookingFormItem('开始时间').locator('input').first()
+      await startTimeInput.fill(startTime)
+      await startTimeInput.press('Tab')
+      const endTimeInput = bookingFormItem('结束时间').locator('input').first()
+      await endTimeInput.fill(endTime)
+      await endTimeInput.press('Tab')
       await bookingDialog.getByRole('button', { name: '保存' }).click()
       await bookingDialog.waitFor({ state: 'hidden' })
       const bookingPage = await api.get(
@@ -541,6 +545,24 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         .locator('.agenda-row, .el-empty')
         .first()
         .waitFor({ state: 'visible', timeout: 60000 })
+      const weekStart = (value) => {
+        const result = new Date(value)
+        result.setHours(0, 0, 0, 0)
+        const offset = (result.getDay() + 6) % 7
+        result.setDate(result.getDate() - offset)
+        return result
+      }
+      const weekOffset = Math.round(
+        (weekStart(day).getTime() - weekStart(new Date()).getTime()) / (7 * 24 * 60 * 60 * 1000)
+      )
+      const weekButton = weekOffset >= 0
+        ? page.getByRole('button', { name: '下一周' })
+        : page.getByRole('button', { name: '上一周' })
+      for (let index = 0; index < Math.abs(weekOffset); index++) {
+        await weekButton.click()
+      }
+      const targetWeekday = (day.getDay() + 6) % 7
+      await page.locator('.week-days button').nth(targetWeekday).click()
       const meetingText = await schedulePanel.innerText()
       caseRecord.checks.push({
         name: '工作台我的日程只读聚合 OA 会议室预约（PB-371）',

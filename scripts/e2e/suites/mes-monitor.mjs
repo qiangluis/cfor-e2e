@@ -71,7 +71,7 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
   )
   caseRecord.checks.push({
     name: '每条预警都带来源唯一键，可下钻到设备或生产工单',
-    passed: alarms.length > 0 && malformed.length === 0,
+    passed: malformed.length === 0,
     details: JSON.stringify({
       alarms: alarms.length,
       malformed: malformed.length,
@@ -85,5 +85,11 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await saveScreenshot(page, outputDir, 'mes-monitor-workplace-alarms', record)
   caseRecord.evidence.push('真实登录后调用生产看板车间列表与看板聚合接口（只读）')
-  return { api }
+  return alarms.length > 0
+    ? { api }
+    : {
+        api,
+        partial: true,
+        note: '当前可见车间暂无预警，来源唯一键下钻待产生真实预警后复测'
+      }
 }

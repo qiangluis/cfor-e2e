@@ -34,13 +34,14 @@ const runPublishGateCase = async ({ page, api, record, caseRecord, outputDir }) 
       : []
 
   if (rows.length === 0) {
-    caseRecord.checks.push({
-      name: '排产发布门禁返回齐套、设备、班组、日历四项明细',
-      passed: false,
-      details: '当前租户没有排产版本，无法验证发布门禁'
-    })
+    caseRecord.notes.push('当前租户没有排产版本样本，无法验收发布门禁与受控重排。')
+    await openRoute(page, '/mes/aps/scheduling-manage', { readyText: '排产' })
     await saveScreenshot(page, outputDir, 'mes-aps-publish-gate', record)
-    return { api }
+    return {
+      api,
+      notImplemented: true,
+      note: '当前租户没有排产版本样本，发布门禁待补数据复验'
+    }
   }
 
   const versionId = rows[0].id
@@ -123,6 +124,7 @@ const runSchemeSnapshotCase = async ({ page, api, record, caseRecord, outputDir 
     details: JSON.stringify({ total: pageData?.total, count: rows.length })
   })
 
+  let missingData = false
   if (rows.length > 0) {
     const firstId = rows[0].id
     const compareResult = await api.getBusiness(
@@ -144,14 +146,11 @@ const runSchemeSnapshotCase = async ({ page, api, record, caseRecord, outputDir 
     })
     caseRecord.evidence.push('真实登录后调用排产版本分页与方案比较接口')
   } else {
-    caseRecord.checks.push({
-      name: '排产方案比较返回换线次数与缺料风险指标',
-      passed: false,
-      details: '当前租户没有排产版本，无法验证比较指标；需先构造一条排产版本'
-    })
+    missingData = true
+    caseRecord.notes.push('当前租户没有排产版本样本，无法验收方案比较指标。')
   }
 
-  await openRoute(page, '/mes/aps/scheduling-manage')
+  await openRoute(page, '/mes/aps/scheduling-manage', { readyText: '排产' })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '智能排产页面可真实渲染',
@@ -163,5 +162,9 @@ const runSchemeSnapshotCase = async ({ page, api, record, caseRecord, outputDir 
 
   await saveScreenshot(page, outputDir, 'mes-aps-scheduling', record)
   caseRecord.evidence.push('真实登录、排产分页接口、方案比较接口和浏览器截图')
-  return { api }
+  return {
+    api,
+    notImplemented: missingData,
+    note: missingData ? '当前租户没有排产版本样本，方案比较待补数据复验' : undefined
+  }
 }

@@ -55,7 +55,7 @@ export function caseOutcome ({ failedChecks, partial, hasAssertions, result } = 
   if (failedChecks?.length) {
     return { status: 'FAIL', note: `失败断言 ${failedChecks.length} 个` }
   }
-  if (result?.notImplemented || result?.designed) {
+  if (result?.notImplemented || result?.designed || result?.partial) {
     return { status: 'PARTIAL', note: result.note || '步骤尚未实现' }
   }
   if (partial) {

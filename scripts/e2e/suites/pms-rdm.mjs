@@ -189,6 +189,10 @@ export const runCase = async ({ caseId, page, record, caseRecord }) => {
     await openRoute(page, '/reports/project/project-plan/progress-efficiency')
     const reportPage = page.locator('[data-testid="pm-report-progress-efficiency"]').first()
     await reportPage.waitFor({ state: 'visible' })
+    await page
+      .getByRole('heading', { name: '研发进度与效率报表', exact: true })
+      .waitFor({ state: 'visible' })
+    await reportPage.locator('.report-metric__label').nth(4).waitFor({ state: 'visible' })
     const reportPageText = await reportPage.innerText()
     const expectedPageTexts = [
       '研发进度与效率报表',
