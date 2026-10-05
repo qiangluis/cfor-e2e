@@ -14,6 +14,9 @@ export const cases = [
   'IOT-013'
 ]
 
+export const IOT_011_ROUTE = '/iot/device/write-back-dead-letter'
+export const IOT_012_ROUTE = '/iot/device/device-change-audit'
+
 const dataOf = (response) => response?.data ?? response
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
@@ -191,12 +194,12 @@ const runDeviceChangeAuditCase = async ({ page, record, caseRecord, outputDir })
     caseRecord.notes.push('案例结束后已还原设备备注名称，不新增伪造设备。')
   }
 
-  await openRoute(page, '/iot/device-change-audit')
+  await openRoute(page, IOT_012_ROUTE)
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '设备变更审计页面渲染',
-    passed: bodyText.includes('设备变更'),
-    details: '真实打开 /iot/device-change-audit 并校验页面标题'
+    passed: bodyText.includes('设备变更审计') && bodyText.includes('变更字段'),
+    details: `真实打开 ${IOT_012_ROUTE} 并校验页面标题与变更字段列`
   })
   await saveScreenshot(page, outputDir, 'pb320-device-change-audit', record)
   caseRecord.evidence.push(
@@ -240,12 +243,12 @@ const runWriteBackDeadLetterCase = async ({ page, record, caseRecord, outputDir 
     caseRecord.notes.push('当前租户暂无未处理回写死信，人工接管断言将在存在死信时执行；不伪造死信数据入库。')
   }
 
-  await openRoute(page, '/iot/write-back-dead-letter')
+  await openRoute(page, IOT_011_ROUTE)
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '回写死信页面渲染',
-    passed: bodyText.includes('死信'),
-    details: '真实打开 /iot/write-back-dead-letter 并校验页面标题'
+    passed: bodyText.includes('回写死信队列') && bodyText.includes('最近失败原因'),
+    details: `真实打开 ${IOT_011_ROUTE} 并校验页面标题与最近失败原因列`
   })
   await saveScreenshot(page, outputDir, 'pb331-iot-write-back-dead-letter', record)
   caseRecord.evidence.push(
