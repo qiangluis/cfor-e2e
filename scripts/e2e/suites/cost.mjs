@@ -1645,7 +1645,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         code: firstCode,
         name: `E2E成本中心${suffix}`,
         enabledAt: firstDate,
-        departmentIds: [Number(availableDepartment.id)],
+        departmentIds: [availableDepartment.id],
         remark: 'PB-071 E2E temporary cost center'
       }
       try {
