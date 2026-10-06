@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { config } from './config/index.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const catalog = JSON.parse(
@@ -197,21 +198,92 @@ export function summarizeResults (results) {
   }
 }
 
-function terminateProcessTree (child) {
-  if (!child.pid) return
+export function terminateProcessTree (child, {
+  kill = process.kill,
+  killDelayMs = 5000
+} = {}) {
+  if (!child.pid) return () => {}
+  const pid = process.platform === 'win32' ? child.pid : -child.pid
   try {
-    if (process.platform === 'win32') process.kill(child.pid, 'SIGTERM')
-    else process.kill(-child.pid, 'SIGTERM')
+    kill(pid, 'SIGTERM')
   } catch {}
-  setTimeout(() => {
+  const timer = setTimeout(() => {
     try {
-      if (process.platform === 'win32') process.kill(child.pid, 'SIGKILL')
-      else process.kill(-child.pid, 'SIGKILL')
+      kill(pid, 'SIGKILL')
     } catch {}
-  }, 5000).unref()
+  }, killDelayMs)
+  timer.unref?.()
+  return () => clearTimeout(timer)
 }
 
-function runChild ({ definition, batchDir, headless, caseTimeoutMs }) {
+export function validateParallelPreflight ({ password = config.password } = {}) {
+  if (!String(password || '').trim()) {
+    throw new Error('缺少 CFOR_PASSWORD/CFOR_PASS，不能启动并行真实浏览器验收')
+  }
+}
+
+export function waitForChildExit (child) {
+  return new Promise((resolve) => {
+    let error
+    const onError = (value) => { error = value }
+    const onClose = (exitCode, signal) => {
+      child.removeListener('error', onError)
+      resolve({ exitCode, signal, ...(error ? { error } : {}) })
+    }
+    child.on('error', onError)
+    child.once('close', onClose)
+  })
+}
+
+export function resultFromChildReport ({
+  definition,
+  record,
+  report,
+  exitCode,
+  signal,
+  logFile
+}) {
+  const caseRecord = record?.cases?.find((item) => item.id === definition.id)
+  const status = caseRecord?.status || 'ERROR'
+  const abnormalExit = Boolean(signal) ||
+    ![0, 1].includes(exitCode) ||
+    (status === 'PASS' && exitCode !== 0)
+  if (abnormalExit) {
+    return {
+      caseId: definition.id,
+      suite: definition.suite,
+      title: definition.title,
+      status: 'ERROR',
+      reportedStatus: status,
+      exitCode,
+      signal,
+      error: `子进程异常退出（exitCode=${exitCode ?? 'null'}, signal=${signal || 'none'}），不能接受 ${status} 报告`,
+      report,
+      logFile
+    }
+  }
+  return {
+    caseId: definition.id,
+    suite: definition.suite,
+    title: definition.title,
+    status,
+    exitCode,
+    signal,
+    note: caseRecord?.notes?.join(' ') || '',
+    report,
+    logFile
+  }
+}
+
+export function runChild ({
+  definition,
+  batchDir,
+  headless,
+  caseTimeoutMs,
+  spawnChild = spawn,
+  terminateChild = terminateProcessTree,
+  terminationTimeoutMs = 7000
+}) {
   const caseDir = mkdir(path.join(batchDir, 'workers', definition.id))
   const childEnv = {
     ...process.env,
@@ -235,36 +307,58 @@ function runChild ({ definition, batchDir, headless, caseTimeoutMs }) {
 
   return new Promise((resolve) => {
     let settled = false
+    let timedOut = false
     let timer
-    const settle = (result) => {
+    let timeoutFallback
+    let cancelTermination
+    const settle = (result, { cancelTerminationTimer = true } = {}) => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      if (timeoutFallback) clearTimeout(timeoutFallback)
+      if (cancelTerminationTimer) cancelTermination?.()
+      child.stdout?.unpipe(output)
+      child.stderr?.unpipe(output)
       output.end()
       resolve(result)
     }
-    const child = spawn(process.execPath, args, {
+    const child = spawnChild(process.execPath, args, {
       cwd: path.resolve(here, '../..'),
       env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32'
     })
-    child.stdout.pipe(output)
-    child.stderr.pipe(output)
-    child.on('error', (error) => {
-      settle({
-        caseId: definition.id,
-        suite: definition.suite,
-        title: definition.title,
-        status: 'ERROR',
-        exitCode: null,
-        error: error.message,
-        report: '',
-        logFile
-      })
-    })
-    child.on('close', (exitCode) => {
-      if (settled) return
+    child.stdout?.pipe(output)
+    child.stderr?.pipe(output)
+    waitForChildExit(child).then(({ error, exitCode, signal }) => {
+      if (timedOut) {
+        settle({
+          caseId: definition.id,
+          suite: definition.suite,
+          title: definition.title,
+          status: 'ERROR',
+          exitCode,
+          signal,
+          error: `子进程超过 ${caseTimeoutMs}ms 未结束，已终止并记录为 ERROR`,
+          report: findResultFile(caseDir),
+          logFile,
+          timedOut: true
+        })
+        return
+      }
+      if (error) {
+        settle({
+          caseId: definition.id,
+          suite: definition.suite,
+          title: definition.title,
+          status: 'ERROR',
+          exitCode: null,
+          error: error.message,
+          report: '',
+          logFile
+        })
+        return
+      }
       const report = findResultFile(caseDir)
       if (!report) {
         settle({
@@ -273,6 +367,7 @@ function runChild ({ definition, batchDir, headless, caseTimeoutMs }) {
           title: definition.title,
           status: 'ERROR',
           exitCode,
+          signal,
           error: `子进程未生成 result.json，详见 ${logFile}`,
           report,
           logFile
@@ -281,17 +376,14 @@ function runChild ({ definition, batchDir, headless, caseTimeoutMs }) {
       }
       try {
         const record = JSON.parse(fs.readFileSync(report, 'utf8'))
-        const caseRecord = record.cases?.find((item) => item.id === definition.id)
-        settle({
-          caseId: definition.id,
-          suite: definition.suite,
-          title: definition.title,
-          status: caseRecord?.status || 'ERROR',
-          exitCode,
-          note: caseRecord?.notes?.join(' ') || '',
+        settle(resultFromChildReport({
+          definition,
+          record,
           report,
+          exitCode,
+          signal,
           logFile
-        })
+        }))
       } catch (error) {
         settle({
           caseId: definition.id,
@@ -299,6 +391,7 @@ function runChild ({ definition, batchDir, headless, caseTimeoutMs }) {
           title: definition.title,
           status: 'ERROR',
           exitCode,
+          signal,
           error: `result.json 解析失败：${error.message}`,
           report,
           logFile
@@ -306,37 +399,55 @@ function runChild ({ definition, batchDir, headless, caseTimeoutMs }) {
       }
     })
     timer = setTimeout(() => {
-      terminateProcessTree(child)
-      settle({
-        caseId: definition.id,
-        suite: definition.suite,
-        title: definition.title,
-        status: 'ERROR',
-        exitCode: null,
-        error: `子进程超过 ${caseTimeoutMs}ms 未结束，已终止并记录为 ERROR`,
-        report: findResultFile(caseDir),
-        logFile,
-        timedOut: true
-      })
+      if (settled || timedOut) return
+      timedOut = true
+      cancelTermination = terminateChild(child)
+      timeoutFallback = setTimeout(() => {
+        settle({
+          caseId: definition.id,
+          suite: definition.suite,
+          title: definition.title,
+          status: 'ERROR',
+          exitCode: null,
+          error: `子进程超过 ${caseTimeoutMs}ms 未结束，无法确认终止；停止派发后续案例`,
+          childPid: child.pid ?? null,
+          report: findResultFile(caseDir),
+          logFile,
+          timedOut: true,
+          terminationWaitTimedOut: true
+        }, { cancelTerminationTimer: false })
+      }, terminationTimeoutMs)
     }, caseTimeoutMs)
   })
 }
 
-async function runPool (definitions, options) {
+export async function runPool (definitions, options, runCase = runChild) {
   const results = []
   let cursor = 0
+  let aborted = false
   const worker = async () => {
-    while (cursor < definitions.length) {
+    while (!aborted && cursor < definitions.length) {
       const definition = definitions[cursor++]
       console.log(`[parallel] RUN ${definition.id} ${definition.title}`)
-      const result = await runChild({ definition, ...options })
+      const result = await runCase({ definition, ...options })
       results.push(result)
+      if (result.terminationWaitTimedOut) aborted = true
       console.log(`[parallel] ${result.status} ${definition.id}`)
     }
   }
   await Promise.all(
     Array.from({ length: Math.min(options.workers, definitions.length) }, worker)
   )
+  for (const definition of definitions.slice(cursor)) {
+    results.push({
+      caseId: definition.id,
+      suite: definition.suite,
+      title: definition.title,
+      status: 'SKIPPED',
+      blockedByProcessTermination: true,
+      note: '前序进程终止未确认，队列已停止，未启动此案例'
+    })
+  }
   return results.sort((left, right) => left.caseId.localeCompare(right.caseId))
 }
 
@@ -348,7 +459,9 @@ export async function runBatch ({
   caseTimeoutMs = 180000
 }) {
   validateCaseTimeoutMs(caseTimeoutMs)
-  const batchId = `parallel-${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${process.pid}`
+  validateParallelPreflight()
+  const startedAt = new Date().toISOString()
+  const batchId = `parallel-${startedAt.replace(/[-:.TZ]/g, '')}-${process.pid}`
   const batchDir = mkdir(path.join(outputRoot, batchId))
   const results = await runPool(
     definitions,
@@ -357,14 +470,20 @@ export async function runBatch ({
   const summary = summarizeResults(results)
   const record = {
     batchId,
-    startedAt: new Date().toISOString(),
+    startedAt,
+    finishedAt: new Date().toISOString(),
     mode: 'parallel-readonly',
     workers,
     caseTimeoutMs,
     selectedCases: definitions.map((definition) => definition.id),
+    aborted: results.some((result) => result.terminationWaitTimedOut),
+    unstartedCaseIds: results
+      .filter((result) => result.blockedByProcessTermination)
+      .map((result) => result.caseId),
     results,
     ...summary,
-    restartRequiredBeforeRetest: summary.failedCaseIds.length > 0
+    retestRequired: summary.failedCaseIds.length > 0,
+    restartRequiredBeforeRetest: summary.failedCaseIds.length ? null : false
   }
   fs.writeFileSync(
     path.join(batchDir, 'parallel-result.json'),
@@ -375,8 +494,12 @@ export async function runBatch ({
     '',
     `- 并发数：${workers}`,
     `- 用例数：${definitions.length}`,
+    `- 开始：${record.startedAt}`,
+    `- 结束：${record.finishedAt}`,
+    `- 因进程终止未确认而停止派发：${record.aborted ? '是' : '否'}`,
     `- 结果：${JSON.stringify(summary.counts)}`,
     `- 统一复测：${summary.failedCaseIds.length ? '需要' : '暂不需要'}`,
+    '- 重启判断：仅业务应用修复需要重启；失败本身不自动触发重启',
     '',
     '| 用例 | 套件 | 状态 | 证据 | 日志 |',
     '|---|---|---|---|---|'
