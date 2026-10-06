@@ -6,6 +6,104 @@ import { createPurchaseRequest, snapshotPurchaseRequest } from '../fixtures/purc
 import { databaseConfigured, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 import { createPurchaseReader } from '../fixtures/purchase-reader.mjs'
 import { collectPagePerformance } from '../lib/performance.mjs'
+import { assertBusinessSuccess } from '../lib/assertions.mjs'
+
+const normalizeTenantId = (value, label = 'tenantId') => {
+  if (typeof value !== 'string' &&
+      !(typeof value === 'number' && Number.isSafeInteger(value))) {
+    throw new Error(`BLOCKED: ${label} 缺失或非法，数字 ID 必须可精确表示`)
+  }
+  const normalized = String(value ?? '').trim()
+  if (!/^[1-9]\d*$/.test(normalized)) {
+    throw new Error(`BLOCKED: ${label} 缺失或非法`)
+  }
+  return normalized
+}
+
+const permissionTenantId = (payload) => {
+  if (payload === undefined) return []
+  assertBusinessSuccess(payload, 'PROC-018 权限上下文')
+  const data = payload?.data
+  const candidates = [
+    data?.tenantId,
+    data?.user?.tenantId,
+    payload?.tenantId,
+    payload?.user?.tenantId
+  ].filter((value) => value !== undefined && value !== null && value !== '')
+  return candidates
+}
+
+export const resolveProcurementTenantId = ({
+  loginContext,
+  permissionInfo,
+  expectedTenantId = config.tenantId
+} = {}) => {
+  const candidates = [
+    ...(loginContext?.tenantId !== undefined &&
+    loginContext?.tenantId !== null &&
+    loginContext?.tenantId !== ''
+      ? [loginContext.tenantId]
+      : []),
+    ...permissionTenantId(permissionInfo)
+  ]
+  if (!candidates.length) {
+    throw new Error('BLOCKED: PROC-018 未获得登录结果或权限响应中的可信 tenantId')
+  }
+  const tenantIds = candidates.map((value) => normalizeTenantId(value, '可信 tenantId'))
+  const tenantId = tenantIds[0]
+  if (tenantIds.some((value) => value !== tenantId)) {
+    throw new Error('BLOCKED: PROC-018 登录结果与权限响应的 tenantId 不一致')
+  }
+  if (String(expectedTenantId ?? '').trim() &&
+      normalizeTenantId(expectedTenantId, 'CFOR_TENANT_ID') !== tenantId) {
+    throw new Error('BLOCKED: PROC-018 CFOR_TENANT_ID 与已验证登录租户不一致')
+  }
+  return tenantId
+}
+
+export const purchaseOrderTenantPredicate = (tenantId) =>
+  `po.tenant_id = ${normalizeTenantId(tenantId, 'PROC-018 SQL tenantId')}`
+
+export const assertProcurementApproverCredentials = (settings = config) => {
+  for (const [label, username, password] of [
+    ['采购负责人', settings.purchaseApproverUsername, settings.purchaseApproverPassword],
+    ['财务复核', settings.financeApproverUsername, settings.financeApproverPassword],
+    ['负责人终审', settings.finalApproverUsername, settings.finalApproverPassword]
+  ]) {
+    if (typeof username !== 'string' || !username.trim() ||
+        typeof password !== 'string' || !password.trim()) {
+      throw new Error(`BLOCKED: PROC-018 缺少 ${label} 账号或密码配置，尚未创建或提审请购`)
+    }
+  }
+}
+
+const resolveProcurementTenantContext = async ({
+  page,
+  record,
+  loginImpl = login,
+  apiFactory = createApiClient
+} = {}) => {
+  const loginContext = await loginImpl(page, { returnContext: true })
+  const token = typeof loginContext === 'string' ? loginContext : loginContext?.token
+  if (!token) throw new Error('登录成功后未获得 token')
+
+  let permissionInfo
+  if (!loginContext?.tenantId) {
+    const bootstrapApi = apiFactory({ token, tenantId: '', record })
+    permissionInfo = assertBusinessSuccess(
+      await bootstrapApi.getPermissionInfo(), 'PROC-018 权限上下文')
+  }
+  const tenantId = resolveProcurementTenantId({
+    loginContext: typeof loginContext === 'string' ? undefined : loginContext,
+    permissionInfo
+  })
+  return {
+    token,
+    tenantId,
+    api: apiFactory({ token, tenantId, record })
+  }
+}
+
 
 const readBrowserBusinessResponse = async (response) => {
   const text = await response.text()
@@ -1053,8 +1151,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PROC-018') {
-    const token = await login(page)
-    const api = createApiClient({ token, record })
+    assertProcurementApproverCredentials()
+    const session = await resolveProcurementTenantContext({ page, record })
+    const { token, tenantId, api } = session
+    const tenantPredicate = purchaseOrderTenantPredicate(tenantId)
     const fixture = await createPurchaseRequest(api, caseRecord)
     const approverBrowsers = []
     try {
@@ -1126,12 +1226,30 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         }
         const approverBrowser = await launchBrowser({ record })
         approverBrowsers.push(approverBrowser)
-        const approverToken = await loginWithCredentials(approverBrowser.page, {
+        const approverContext = await loginWithCredentials(approverBrowser.page, {
           tenantName: config.tenantName,
           username,
           password
+        }, { returnContext: true })
+        const approverToken = typeof approverContext === 'string'
+          ? approverContext
+          : approverContext?.token
+        if (!approverToken) throw new Error(`${label}登录成功后未获得 token`)
+        let approverPermission
+        if (!approverContext?.tenantId) {
+          approverPermission = assertBusinessSuccess(
+            await createApiClient({
+              token: approverToken, tenantId: '', record
+            }).getPermissionInfo(),
+            `${label}权限上下文`
+          )
+        }
+        resolveProcurementTenantId({
+          loginContext: typeof approverContext === 'string' ? undefined : approverContext,
+          permissionInfo: approverPermission,
+          expectedTenantId: tenantId
         })
-        const approverApi = createApiClient({ token: approverToken, record })
+        const approverApi = createApiClient({ token: approverToken, tenantId, record })
         const task = await waitForTodo(approverApi)
         caseRecord.checks.push({
           name: `${label}独立 Chrome 会话收到请购 BPM 待办`,
@@ -1222,7 +1340,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
                poi.src_entry_id, poi.count, poi.in_count, po.bill_stage, po.is_closed
         FROM erp_purchase_order po
         JOIN erp_purchase_order_items poi ON poi.mid = po.id
-        WHERE po.tenant_id = 1
+        WHERE ${tenantPredicate}
           AND po.deleted = 0
           AND poi.deleted = 0
           AND poi.src_bill_id = '${fixture.id}'
@@ -1293,7 +1411,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         SELECT po.id
         FROM erp_purchase_order po
         JOIN erp_purchase_order_items poi ON poi.mid = po.id
-        WHERE po.tenant_id = 1
+        WHERE ${tenantPredicate}
           AND po.deleted = 0
           AND poi.deleted = 0
           AND poi.src_bill_id = '${fixture.id}'

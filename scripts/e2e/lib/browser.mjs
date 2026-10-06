@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { config, resolveChromePath } from '../config/index.mjs'
 import { ensureDir } from './report.mjs'
 import { decryptResponse, ENCRYPT_HEADER } from './crypto.mjs'
-import { extractAccessToken } from './session.mjs'
+import { extractAccessToken, resolveLoginContext } from './session.mjs'
 import { isBusinessSuccess } from './assertions.mjs'
 import { resourceUrl } from './redact.mjs'
 
@@ -29,6 +29,7 @@ const SELECTORS = {
   ],
   loggedIn: ['.avatar', '.user-info', '[class*="user"]', 'text=工作台']
 }
+const loginContexts = new WeakMap()
 
 export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
   resourceType === 'media' &&
@@ -194,6 +195,19 @@ async function readToken (page) {
   }
 }
 
+async function readLoginResponse (response) {
+  if (!response) return null
+  const text = await response.text().catch(() => '')
+  if (!text) return null
+  try {
+    return response.headers()[ENCRYPT_HEADER.toLowerCase()] === 'true'
+      ? decryptResponse(text)
+      : JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 function watchApiFailures (page) {
   const failures = []
   page.on('response', (response) => {
@@ -204,7 +218,7 @@ function watchApiFailures (page) {
   return failures
 }
 
-export async function login (page, { check, dumpDir, credentials } = {}) {
+export async function login (page, { check, dumpDir, credentials, returnContext = false } = {}) {
   const tenantName = credentials?.tenantName ?? config.tenantName
   const username = credentials?.username ?? config.username
   const password = credentials?.password ?? config.password
@@ -215,7 +229,10 @@ export async function login (page, { check, dumpDir, credentials } = {}) {
     const { token } = await readToken(page)
     if (token) {
       check?.step('page', '复用当前登录会话', true, page.url())
-      return token
+      const cached = loginContexts.get(page)
+      return returnContext
+        ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
+        : token
     }
   }
   await page.goto(`${config.webBase}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
@@ -224,7 +241,10 @@ export async function login (page, { check, dumpDir, credentials } = {}) {
     const { token } = await readToken(page)
     if (!token) throw new Error('已登录但未找到 token')
     check?.step('page', '已是登录态，复用当前会话', true, page.url())
-    return token
+    const cached = loginContexts.get(page)
+    return returnContext
+      ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
+      : token
   }
 
   try {
@@ -249,7 +269,8 @@ export async function login (page, { check, dumpDir, credentials } = {}) {
       { timeout: 30000 }
     ).catch(() => null)
     await (await findLoginButton(page)).click()
-    await responsePromise
+    const loginResponse = await responsePromise
+    const loginPayload = await readLoginResponse(loginResponse)
     // The login page completes authentication through Vue router and permission
     // bootstrap. Waiting for a full "load" event is flaky for history.pushState
     // navigations, so poll the actual URL and storage state instead.
@@ -282,14 +303,17 @@ export async function login (page, { check, dumpDir, credentials } = {}) {
     check?.step('page', '登录后离开 /login', true, page.url())
     check?.step('page', '本地 token 已写入', Boolean(token), keys.slice(0, 10).join(','))
     if (!token) throw new Error('登录成功后未读取到 token')
-    return token
+    const loginContext = resolveLoginContext(loginPayload, token)
+    loginContexts.set(page, loginContext)
+    return returnContext ? loginContext : token
   } catch (error) {
     const dump = await dumpLoginDom(page, dumpDir, 'login')
     throw new Error(`${error.message}${dump ? `（登录 DOM：${dump}）` : ''}`)
   }
 }
 
-export const loginWithCredentials = async (page, credentials) => login(page, { credentials })
+export const loginWithCredentials = async (page, credentials, options = {}) =>
+  login(page, { ...options, credentials })
 
 export async function openRegistration (page) {
   await page.goto(`${config.webBase}/login`, { waitUntil: 'domcontentloaded' })
