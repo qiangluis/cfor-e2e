@@ -20,6 +20,7 @@ export const parallelSafeCases = new Set([
   'WBF-004',
   'WBF-005',
   'WBF-006',
+  'WBF-008',
   'WBF-009',
   'WBF-012',
   'PROC-009',
@@ -28,6 +29,11 @@ export const parallelSafeCases = new Set([
   'PROC-016',
   'PROC-017',
   'PROC-019',
+  'PROC-001',
+  'PROC-002',
+  'PROC-003',
+  'PROC-004',
+  'PROC-005',
   'RDM-001',
   'RDM-002',
   'RDM-003',
@@ -38,8 +44,6 @@ export const parallelSafeCases = new Set([
   'MES-PROD-003',
   'PB038-003',
   'PB149-OUTSOURCE-WIP-001',
-  'PB151-OUTSOURCE-RECEIPT-QUALITY-001',
-  'PB153-OUTSOURCE-MATERIAL-001',
   'PB154-OUTSOURCE-PAYABLE-001',
   'PB155-OUTSOURCE-INVOICE-001',
   'PB157-OUTSOURCE-CLOSE-001',
@@ -51,6 +55,8 @@ export const parallelSafeCases = new Set([
   'COST-001',
   'COST-004',
   'IOT-004',
+  'IOT-002',
+  'IOT-003',
   'IOT-009',
   'IOT-010',
   'MAINT-011',
@@ -114,6 +120,30 @@ export function selectDefinitions ({
 } = {}) {
   const caseFilter = new Set(cases.filter(Boolean))
   const suiteFilter = new Set(suites.filter(Boolean))
+  const knownDefinitions = new Map(definitions.map((definition) => [definition.id, definition]))
+  if (caseFilter.size) {
+    const unknown = [...caseFilter].filter((id) => !knownDefinitions.has(id))
+    if (unknown.length) throw new Error(`未知 case：${unknown.join(', ')}`)
+    const outsideSuites = [...caseFilter].filter((id) =>
+      suiteFilter.size && !suiteFilter.has(knownDefinitions.get(id).suite)
+    )
+    if (outsideSuites.length) {
+      throw new Error(`指定 case 与 suite 不匹配：${outsideSuites.join(', ')}`)
+    }
+    if (safeOnly) {
+      const unsafe = [...caseFilter].filter((id) => {
+        const definition = knownDefinitions.get(id)
+        return definition.status === 'DESIGNED' ||
+          definition.status === 'BLOCKED' ||
+          !parallelSafeCases.has(id)
+      })
+      if (unsafe.length) {
+        throw new Error(
+          `以下 case 不属于并行只读池，请改用 runner.mjs 串行执行：${unsafe.join(', ')}`
+        )
+      }
+    }
+  }
   const selected = definitions.filter((definition) => {
     if (definition.status === 'DESIGNED' || definition.status === 'BLOCKED') return false
     if (caseFilter.size && !caseFilter.has(definition.id)) return false
@@ -121,11 +151,6 @@ export function selectDefinitions ({
     if (safeOnly && !parallelSafeCases.has(definition.id)) return false
     return true
   })
-  if (caseFilter.size) {
-    const known = new Set(definitions.map((definition) => definition.id))
-    const unknown = [...caseFilter].filter((id) => !known.has(id))
-    if (unknown.length) throw new Error(`未知 case：${unknown.join(', ')}`)
-  }
   return selected
 }
 

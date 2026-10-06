@@ -37,6 +37,35 @@ test('explicit case selection can run one safe case only', () => {
   assert.throws(() => selectDefinitions({ cases: ['DOES-NOT-EXIST'] }), /未知 case/)
 })
 
+test('explicit serial or unimplemented cases are rejected instead of silently omitted', () => {
+  assert.throws(
+    () => selectDefinitions({ cases: ['PB081-001'] }),
+    /不属于并行只读池.*runner\.mjs/
+  )
+  assert.throws(
+    () => selectDefinitions({ cases: ['INIT-002'] }),
+    /不属于并行只读池.*runner\.mjs/
+  )
+})
+
+test('mixed explicit selection cannot silently drop a requested case', () => {
+  assert.throws(
+    () => selectDefinitions({ cases: ['SMOKE-001', 'PB081-001'] }),
+    /不属于并行只读池.*PB081-001/
+  )
+  assert.throws(
+    () => selectDefinitions({ cases: ['SMOKE-001'], suites: ['procurement'] }),
+    /指定 case 与 suite 不匹配.*SMOKE-001/
+  )
+  assert.throws(
+    () => selectDefinitions({
+      definitions: [{ id: 'SMOKE-001', suite: 'smoke', status: 'BLOCKED' }],
+      cases: ['SMOKE-001']
+    }),
+    /不属于并行只读池.*SMOKE-001/
+  )
+})
+
 test('batch summary exposes failures and partial cases for one retest list', () => {
   const summary = summarizeResults([
     { caseId: 'A', status: 'PASS' },
@@ -71,4 +100,18 @@ test('conditionally mutating quality cases stay in the serial pool', () => {
   assert.equal(parallelIds.has('QUALITY-TRACE-001'), false)
   assert.equal(serialIds.has('QUALITY-NG-001'), true)
   assert.equal(serialIds.has('QUALITY-TRACE-001'), true)
+})
+
+test('read-only WBF-008 is eligible for the parallel pool', () => {
+  assert.equal(parallelSafeCases.has('WBF-008'), true)
+  assert.equal(parallelSafeCases.has('WBF-005'), true)
+})
+
+test('outsource draft builders stay serial because GET probes allocate bill numbers', () => {
+  assert.equal(parallelSafeCases.has('PB151-OUTSOURCE-RECEIPT-QUALITY-001'), false)
+  assert.equal(parallelSafeCases.has('PB153-OUTSOURCE-MATERIAL-001'), false)
+  const { serial } = partitionDefinitions(allDefinitions())
+  const serialIds = new Set(serial.map((item) => item.id))
+  assert.equal(serialIds.has('PB151-OUTSOURCE-RECEIPT-QUALITY-001'), true)
+  assert.equal(serialIds.has('PB153-OUTSOURCE-MATERIAL-001'), true)
 })
