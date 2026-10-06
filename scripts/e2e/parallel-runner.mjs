@@ -215,6 +215,16 @@ export function terminateProcessTree (child, {
   return () => clearTimeout(timer)
 }
 
+export function processTreeHasExited (child, { kill = process.kill } = {}) {
+  if (!child.pid || process.platform === 'win32') return false
+  try {
+    kill(-child.pid, 0)
+    return false
+  } catch (error) {
+    return error?.code === 'ESRCH'
+  }
+}
+
 export function validateParallelPreflight ({ password = config.password } = {}) {
   if (!String(password || '').trim()) {
     throw new Error('缺少 CFOR_PASSWORD/CFOR_PASS，不能启动并行真实浏览器验收')
@@ -281,8 +291,11 @@ export function runChild ({
   caseTimeoutMs,
   spawnChild = spawn,
   terminateChild = terminateProcessTree,
-  terminationTimeoutMs = 7000
+  terminationTimeoutMs = 7000,
+  processTreeExited = processTreeHasExited,
+  terminationPollMs = 50
 }) {
+  const startedAt = new Date().toISOString()
   const caseDir = mkdir(path.join(batchDir, 'workers', definition.id))
   const childEnv = {
     ...process.env,
@@ -309,17 +322,20 @@ export function runChild ({
     let timedOut = false
     let timer
     let timeoutFallback
+    let terminationProbeTimer
     let cancelTermination
+    let closedExit
     const settle = (result, { cancelTerminationTimer = true } = {}) => {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
       if (timeoutFallback) clearTimeout(timeoutFallback)
+      if (terminationProbeTimer) clearTimeout(terminationProbeTimer)
       if (cancelTerminationTimer) cancelTermination?.()
       child.stdout?.unpipe(output)
       child.stderr?.unpipe(output)
       output.end()
-      resolve(result)
+      resolve({ ...result, startedAt, finishedAt: new Date().toISOString() })
     }
     const child = spawnChild(process.execPath, args, {
       cwd: path.resolve(here, '../..'),
@@ -329,20 +345,29 @@ export function runChild ({
     })
     child.stdout?.pipe(output)
     child.stderr?.pipe(output)
+    const confirmTermination = () => {
+      if (settled) return
+      if (!processTreeExited(child)) {
+        terminationProbeTimer = setTimeout(confirmTermination, terminationPollMs)
+        return
+      }
+      settle({
+        caseId: definition.id,
+        suite: definition.suite,
+        title: definition.title,
+        status: 'ERROR',
+        exitCode: closedExit.exitCode,
+        signal: closedExit.signal,
+        error: `子进程超过 ${caseTimeoutMs}ms 未结束，已确认进程组退出并记录为 ERROR`,
+        report: findResultFile(caseDir),
+        logFile,
+        timedOut: true
+      })
+    }
     waitForChildExit(child).then(({ error, exitCode, signal }) => {
       if (timedOut) {
-        settle({
-          caseId: definition.id,
-          suite: definition.suite,
-          title: definition.title,
-          status: 'ERROR',
-          exitCode,
-          signal,
-          error: `子进程超过 ${caseTimeoutMs}ms 未结束，已终止并记录为 ERROR`,
-          report: findResultFile(caseDir),
-          logFile,
-          timedOut: true
-        })
+        closedExit = { exitCode, signal }
+        confirmTermination()
         return
       }
       if (error) {
@@ -407,8 +432,9 @@ export function runChild ({
           suite: definition.suite,
           title: definition.title,
           status: 'ERROR',
-          exitCode: null,
-          error: `子进程超过 ${caseTimeoutMs}ms 未结束，无法确认终止；停止派发后续案例`,
+          exitCode: closedExit?.exitCode ?? null,
+          signal: closedExit?.signal ?? null,
+          error: `子进程超过 ${caseTimeoutMs}ms 未结束，无法确认进程组终止；停止派发后续案例`,
           childPid: child.pid ?? null,
           report: findResultFile(caseDir),
           logFile,

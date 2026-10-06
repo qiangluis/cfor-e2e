@@ -10,6 +10,7 @@ import {
   allDefinitions,
   parallelSafeCases,
   partitionDefinitions,
+  processTreeHasExited,
   resultFromChildReport,
   runPool,
   selectDefinitions,
@@ -127,7 +128,7 @@ test('outsource draft builders stay serial because GET probes allocate bill numb
   assert.equal(serialIds.has('PB153-OUTSOURCE-MATERIAL-001'), true)
 })
 
-test('heavy RDM progress report stays serial after parallel timeout evidence', () => {
+test('RDM progress report stays serial after an unexplained parallel timeout', () => {
   assert.equal(parallelSafeCases.has('RDM-007'), false)
   const { serial } = partitionDefinitions(allDefinitions())
   assert.equal(serial.some((item) => item.id === 'RDM-007'), true)
@@ -188,7 +189,7 @@ test('expected PARTIAL exit 1 stays PARTIAL but fatal exits override stale repor
   assert.equal(resultFromChildReport({ ...args, signal: 'SIGTERM' }).status, 'ERROR')
 })
 
-test('termination escalation can be cancelled after confirmed close', async () => {
+test('termination escalation can be cancelled after confirmed process-group exit', async () => {
   const signals = []
   const cancel = terminateProcessTree({ pid: 12345 }, {
     kill: (pid, signal) => signals.push({ pid, signal }),
@@ -209,6 +210,7 @@ test('timeout waits for actual close before the pool starts another case', async
     workers: 1,
     caseTimeoutMs: 10,
     terminationTimeoutMs: 200,
+    processTreeExited: () => true,
     spawnChild: (_executable, args) => {
       const id = args[args.indexOf('--case') + 1]
       events.push(`start:${id}`)
@@ -290,4 +292,85 @@ test('missing credentials fail CLI preflight without creating a batch or worker'
   assert.match(execution.stderr, /缺少 CFOR_PASSWORD\/CFOR_PASS/)
   assert.doesNotMatch(execution.stdout, /\[parallel\] RUN/)
   assert.deepEqual(fs.readdirSync(root), [])
+})
+
+test('process-group probe accepts only ESRCH as confirmed exit', () => {
+  assert.equal(processTreeHasExited({ pid: 12345 }, { kill: () => {} }), false)
+  assert.equal(processTreeHasExited({ pid: 12345 }, {
+    kill: () => { throw Object.assign(new Error('absent'), { code: 'ESRCH' }) }
+  }), process.platform !== 'win32')
+  assert.equal(processTreeHasExited({ pid: 12345 }, {
+    kill: () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }) }
+  }), false)
+  assert.equal(processTreeHasExited({}), false)
+})
+
+test('root close does not cancel escalation or release worker while descendants survive', async (t) => {
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfor-parallel-descendants-'))
+  t.after(() => fs.rmSync(batchDir, { recursive: true, force: true }))
+  const events = []
+  const groups = new Set()
+  const definitions = ['A', 'B'].map((id) => ({ id, suite: 'unit', title: id }))
+  const results = await runPool(definitions, {
+    batchDir,
+    workers: 1,
+    caseTimeoutMs: 10,
+    terminationTimeoutMs: 200,
+    terminationPollMs: 5,
+    spawnChild: (_executable, args) => {
+      const child = new EventEmitter()
+      child.caseId = args[args.indexOf('--case') + 1]
+      child.pid = child.caseId === 'A' ? 12345 : 12346
+      groups.add(-child.pid)
+      events.push(`start:${child.caseId}`)
+      return child
+    },
+    terminateChild: (child) => terminateProcessTree(child, {
+      killDelayMs: 30,
+      kill: (_pid, signal) => {
+        if (signal === 'SIGTERM') {
+          events.push(`close:${child.caseId}`)
+          child.emit('close', null, 'SIGTERM')
+        } else {
+          events.push(`group-exit:${child.caseId}`)
+          groups.delete(-child.pid)
+        }
+      }
+    }),
+    processTreeExited: (child) => !groups.has(-child.pid)
+  })
+  assert.ok(events.indexOf('start:B') > events.indexOf('group-exit:A'))
+  assert.ok(events.indexOf('group-exit:A') > events.indexOf('close:A'))
+  assert.equal(results.every((item) => item.timedOut && !item.terminationWaitTimedOut), true)
+  assert.equal(results.every((item) => item.startedAt && item.finishedAt), true)
+})
+
+test('root close with unconfirmed surviving descendants aborts the next case', async (t) => {
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfor-parallel-survivors-'))
+  t.after(() => fs.rmSync(batchDir, { recursive: true, force: true }))
+  const started = []
+  let cancelled = false
+  const definitions = ['A', 'B'].map((id) => ({ id, suite: 'unit', title: id }))
+  const results = await runPool(definitions, {
+    batchDir,
+    workers: 1,
+    caseTimeoutMs: 10,
+    terminationTimeoutMs: 30,
+    terminationPollMs: 5,
+    spawnChild: (_executable, args) => {
+      const child = new EventEmitter()
+      child.pid = 12345
+      started.push(args[args.indexOf('--case') + 1])
+      return child
+    },
+    terminateChild: (child) => {
+      child.emit('close', null, 'SIGTERM')
+      return () => { cancelled = true }
+    },
+    processTreeExited: () => false
+  })
+  assert.deepEqual(started, ['A'])
+  assert.equal(results[0].terminationWaitTimedOut, true)
+  assert.equal(results[1].status, 'SKIPPED')
+  assert.equal(cancelled, false)
 })

@@ -169,3 +169,139 @@ test('explicit evidence roots exclude stale trees without excluding sibling pref
     excludePaths: [path.join(directory, 'stale')]
   }), [valid])
 })
+
+test('latest wrapper-only ERROR replaces an older PASS and retains batch/log evidence', (t) => {
+  const directory = tempWorkspace()
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const catalogPath = catalogFile(directory)
+  const old = path.join(directory, 'old', 'result.json')
+  const wrapper = path.join(directory, 'batch', 'parallel-result.json')
+  const logFile = path.join(directory, 'batch', 'workers', 'A-003', 'worker.log')
+  writeJson(old, {
+    runId: 'old', cases: [{ id: 'A-003', status: 'PASS', finishedAt: '2026-10-01T10:00:00Z' }]
+  })
+  writeJson(wrapper, {
+    batchId: 'batch',
+    startedAt: '2026-10-02T10:00:00Z',
+    finishedAt: '2026-10-02T10:03:00Z',
+    results: [{ caseId: 'A-003', status: 'ERROR', report: '', logFile, error: 'worker timeout' }]
+  })
+  const report = buildCoverageReport({ catalogPath, roots: [directory] })
+  const item = report.cases.find((candidate) => candidate.id === 'A-003')
+  assert.equal(item.actualStatus, 'ERROR')
+  assert.equal(item.latestExecution.sourceKind, 'parallel-summary')
+  assert.equal(item.latestExecution.batchId, 'batch')
+  assert.equal(item.latestExecution.startedAt, null)
+  assert.equal(item.latestExecution.finishedAt, null)
+  assert.equal(item.latestExecution.timestampSource, 'batch-window')
+  assert.equal(item.latestExecution.effectiveAt, '2026-10-02T10:03:00.000Z')
+  assert.ok(item.evidencePaths.includes(wrapper))
+  assert.ok(item.evidencePaths.includes(logFile))
+  assert.equal(report.scannedResultPaths.length, 2)
+})
+
+test('wrapper ERROR invalidates its linked child PASS regardless of input order or timestamp', (t) => {
+  const directory = tempWorkspace()
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const catalogPath = catalogFile(directory)
+  const child = path.join(directory, 'child', 'result.json')
+  const wrapper = path.join(directory, 'parallel-result.json')
+  writeJson(child, {
+    runId: 'child',
+    cases: [{ id: 'A-003', status: 'PASS', finishedAt: '2026-10-02T10:04:00Z' }]
+  })
+  writeJson(wrapper, {
+    batchId: 'batch', finishedAt: '2026-10-02T10:03:00Z',
+    results: [{ caseId: 'A-003', status: 'ERROR', reportedStatus: 'PASS', report: child }]
+  })
+  for (const resultPaths of [[child, wrapper], [wrapper, child]]) {
+    const report = buildCoverageReport({ catalogPath, resultPaths })
+    const item = report.cases.find((candidate) => candidate.id === 'A-003')
+    assert.equal(item.actualStatus, 'ERROR')
+    assert.equal(item.latestExecution.sourcePath, wrapper)
+    assert.ok(item.evidencePaths.includes(child))
+  }
+})
+
+test('normal wrapper-child duplication cannot supersede a later serial execution', (t) => {
+  const directory = tempWorkspace()
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const catalogPath = catalogFile(directory)
+  const child = path.join(directory, 'child', 'result.json')
+  const wrapper = path.join(directory, 'parallel-result.json')
+  const later = path.join(directory, 'serial', 'result.json')
+  writeJson(child, {
+    runId: 'child',
+    cases: [{ id: 'A-003', status: 'PARTIAL', finishedAt: '2026-10-02T10:01:00Z' }]
+  })
+  writeJson(wrapper, {
+    batchId: 'batch', finishedAt: '2026-10-02T10:05:00Z',
+    results: [{ caseId: 'A-003', status: 'PARTIAL', report: child }]
+  })
+  writeJson(later, {
+    runId: 'serial',
+    cases: [{ id: 'A-003', status: 'PASS', finishedAt: '2026-10-02T10:04:00Z' }]
+  })
+  const report = buildCoverageReport({ catalogPath, resultPaths: [wrapper, child, later] })
+  const item = report.cases.find((candidate) => candidate.id === 'A-003')
+  assert.equal(item.actualStatus, 'PASS')
+  assert.equal(item.latestExecution.sourcePath, later)
+})
+
+test('subsequent serial PASS supersedes a wrapper-only ERROR but keeps history scan paths', (t) => {
+  const directory = tempWorkspace()
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const catalogPath = catalogFile(directory)
+  const wrapper = path.join(directory, 'parallel-result.json')
+  const later = path.join(directory, 'serial', 'result.json')
+  writeJson(wrapper, {
+    batchId: 'batch', finishedAt: '2026-10-02T10:03:00Z',
+    results: [{ caseId: 'A-003', status: 'ERROR' }]
+  })
+  writeJson(later, {
+    runId: 'serial',
+    cases: [{ id: 'A-003', status: 'PASS', finishedAt: '2026-10-02T10:04:00Z' }]
+  })
+  const report = buildCoverageReport({ catalogPath, roots: [directory] })
+  const item = report.cases.find((candidate) => candidate.id === 'A-003')
+  assert.equal(item.actualStatus, 'PASS')
+  assert.ok(report.scannedResultPaths.includes(wrapper))
+})
+
+test('parallel SKIPPED remains unexecuted and since respects legacy batch-start-only times', (t) => {
+  const directory = tempWorkspace()
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const catalogPath = catalogFile(directory)
+  const wrapper = path.join(directory, 'parallel-result.json')
+  writeJson(wrapper, {
+    batchId: 'legacy', startedAt: '2026-10-02T10:00:00Z',
+    results: [
+      { caseId: 'A-003', status: 'ERROR' },
+      { caseId: 'A-005', status: 'SKIPPED' }
+    ]
+  })
+  const report = buildCoverageReport({ catalogPath, resultPaths: [wrapper] })
+  const byId = Object.fromEntries(report.cases.map((item) => [item.id, item]))
+  assert.equal(byId['A-003'].actualStatus, 'ERROR')
+  assert.equal(byId['A-003'].latestExecution.finishedAt, null)
+  assert.equal(byId['A-003'].latestExecution.effectiveAt, '2026-10-02T10:00:00.000Z')
+  assert.equal(byId['A-005'].actualStatus, 'UNEXECUTED')
+  assert.equal(byId['A-005'].skippedRecordCount, 1)
+  const filtered = buildCoverageReport({
+    catalogPath, resultPaths: [wrapper], since: '2026-10-02T10:01:00Z'
+  })
+  assert.equal(filtered.summary.executedCases, 0)
+})
+
+test('parallel discovery honors exclusions for files and trees without prefix collisions', (t) => {
+  const directory = tempWorkspace()
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const stale = path.join(directory, 'stale', 'parallel-result.json')
+  const sibling = path.join(directory, 'stale-corrected', 'parallel-result.json')
+  const child = path.join(directory, 'stale-corrected', 'worker', 'result.json')
+  for (const filePath of [stale, sibling, child]) writeJson(filePath, { results: [] })
+  assert.deepEqual(findResultFiles({
+    roots: [directory], excludePaths: [path.join(directory, 'stale'), child]
+  }), [sibling])
+  assert.deepEqual(findResultFiles({ roots: [sibling] }), [sibling])
+})

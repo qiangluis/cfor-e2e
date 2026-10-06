@@ -7,6 +7,7 @@ const defaultCatalogPath = path.join(here, 'cases', 'catalog.json')
 const defaultTmpRoot = '/tmp'
 const actualStatuses = new Set(['PASS', 'PARTIAL', 'FAIL', 'BLOCKED', 'ERROR'])
 const catalogOnlyStatuses = new Set(['DESIGNED', 'BLOCKED'])
+const resultFileNames = new Set(['result.json', 'parallel-result.json'])
 
 export const ACTUAL_STATUSES = [...actualStatuses]
 export const UNEXECUTED_STATUS = 'UNEXECUTED'
@@ -38,10 +39,26 @@ function readJson (filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
 
+function canonicalPath (filePath) {
+  const resolved = path.resolve(filePath)
+  try {
+    return fs.realpathSync(resolved)
+  } catch {
+    return resolved
+  }
+}
+
+function resolveEvidencePath (sourcePath, value) {
+  if (typeof value !== 'string' || !value) return null
+  return path.isAbsolute(value)
+    ? path.resolve(value)
+    : path.resolve(path.dirname(sourcePath), value)
+}
+
 function walkResultFiles (root) {
   if (!fs.existsSync(root)) return []
   const stat = fs.statSync(root)
-  if (stat.isFile()) return path.basename(root) === 'result.json' ? [root] : []
+  if (stat.isFile()) return resultFileNames.has(path.basename(root)) ? [root] : []
   if (!stat.isDirectory()) return []
 
   const result = []
@@ -49,7 +66,7 @@ function walkResultFiles (root) {
   for (const entry of entries) {
     const entryPath = path.join(root, entry.name)
     if (entry.isDirectory()) result.push(...walkResultFiles(entryPath))
-    else if (entry.isFile() && entry.name === 'result.json') result.push(entryPath)
+    else if (entry.isFile() && resultFileNames.has(entry.name)) result.push(entryPath)
   }
   return result
 }
@@ -111,9 +128,11 @@ function executionTime (run, caseResult) {
   return latestTimestamp(run?.finishedAt, run?.startedAt)
 }
 
-function evidenceFor (sourcePath, run, caseResult) {
+function evidenceFor (sourcePath, run, caseResult, sourceKind) {
   const evidence = Array.isArray(caseResult?.evidence) ? caseResult.evidence : []
-  const outputDir = typeof run?.outputDir === 'string' ? run.outputDir : null
+  const outputDir = typeof run?.outputDir === 'string'
+    ? run.outputDir
+    : sourceKind === 'parallel-summary' ? path.dirname(sourcePath) : null
   return {
     resultPath: sourcePath,
     outputDir,
@@ -121,29 +140,42 @@ function evidenceFor (sourcePath, run, caseResult) {
     evidencePaths: unique([
       sourcePath,
       ...(outputDir ? [outputDir] : []),
+      ...[caseResult?.report, caseResult?.logFile]
+        .map((item) => resolveEvidencePath(sourcePath, item))
+        .filter(Boolean),
       ...evidence.filter((item) => typeof item === 'string' && path.isAbsolute(item))
     ])
   }
 }
 
-function candidateFrom (sourcePath, run, caseResult, fileMtimeMs, index) {
+function candidateFrom (sourcePath, run, caseResult, fileMtimeMs, index, sourceKind) {
   const status = caseStatus(caseResult)
   const effectiveTimestamp = executionTime(run, caseResult)
-  const evidence = evidenceFor(sourcePath, run, caseResult)
+  const evidence = evidenceFor(sourcePath, run, caseResult, sourceKind)
+  const parallel = sourceKind === 'parallel-summary'
+  const caseTimed = latestTimestamp(caseResult?.finishedAt, caseResult?.startedAt) !== null
   return {
     caseId: caseIdOf(caseResult),
     status,
     effectiveTimestamp,
     effectiveAt: displayTimestamp(effectiveTimestamp),
-    startedAt: caseResult?.startedAt || run?.startedAt || null,
-    finishedAt: caseResult?.finishedAt || run?.finishedAt || null,
-    runId: run?.runId || null,
+    startedAt: caseResult?.startedAt || (parallel ? null : run?.startedAt) || null,
+    finishedAt: caseResult?.finishedAt || (parallel ? null : run?.finishedAt) || null,
+    timestampSource: caseTimed ? 'case' : parallel ? 'batch-window' : 'run-window',
+    batchStartedAt: parallel ? run?.startedAt || null : null,
+    batchFinishedAt: parallel ? run?.finishedAt || null : null,
+    batchId: run?.batchId || null,
+    runId: run?.runId || run?.batchId || null,
+    sourceKind,
     sourcePath,
     fileMtimeMs,
     index,
     evidence: evidence.evidence,
     evidencePaths: evidence.evidencePaths,
-    notes: Array.isArray(caseResult?.notes) ? caseResult.notes : []
+    logFile: caseResult?.logFile || null,
+    report: caseResult?.report || null,
+    notes: Array.isArray(caseResult?.notes) ? caseResult.notes
+      : parallel ? [caseResult?.note, caseResult?.error].filter(Boolean) : []
   }
 }
 
@@ -225,11 +257,14 @@ export function buildCoverageReport ({
     throw new Error(`无效 --since 时间：${since}`)
   }
 
-  const paths = resultPaths || findResultFiles({ roots, tmpRoot, excludePaths })
+  const paths = unique((resultPaths || findResultFiles({ roots, tmpRoot, excludePaths }))
+    .map((filePath) => path.resolve(filePath)))
   const candidatesByCase = new Map()
   const skippedByCase = new Map()
   const parseErrors = []
   const orphanExecutions = []
+  const documents = new Map()
+  const documentsByCanonicalPath = new Map()
 
   for (const sourcePath of paths) {
     let run
@@ -242,8 +277,6 @@ export function buildCoverageReport ({
       })
       continue
     }
-    if (!Array.isArray(run?.cases)) continue
-
     let fileMtimeMs = 0
     try {
       fileMtimeMs = fs.statSync(sourcePath).mtimeMs
@@ -251,8 +284,46 @@ export function buildCoverageReport ({
       // The file may disappear between discovery and reading.
     }
 
-    run.cases.forEach((caseResult, index) => {
-      const candidate = candidateFrom(sourcePath, run, caseResult, fileMtimeMs, index)
+    const document = { run, fileMtimeMs }
+    documents.set(sourcePath, document)
+    documentsByCanonicalPath.set(canonicalPath(sourcePath), document)
+  }
+
+  const overriddenChildren = new Set()
+  const wrapperChildren = new Map()
+  for (const [sourcePath, { run }] of documents) {
+    if (Array.isArray(run?.cases) || !Array.isArray(run?.results)) continue
+    for (const result of run.results) {
+      if (typeof result?.report !== 'string' || !result.report) continue
+      const childPath = resolveEvidencePath(sourcePath, result.report)
+      const childDocument = childPath
+        ? documentsByCanonicalPath.get(canonicalPath(childPath))
+        : null
+      const childCase = childDocument?.run?.cases
+        ?.find((item) => caseIdOf(item) === caseIdOf(result))
+      if (!childCase) continue
+      wrapperChildren.set(result, childCase)
+      // An abnormal worker exit invalidates its own child report, not later reruns.
+      if (caseStatus(result) === 'ERROR') {
+        overriddenChildren.add(`${canonicalPath(childPath)}\0${caseIdOf(result)}`)
+      }
+    }
+  }
+
+  for (const [sourcePath, { run, fileMtimeMs }] of documents) {
+    const sourceKind = Array.isArray(run?.cases) ? 'case' : 'parallel-summary'
+    const results = sourceKind === 'case' ? run.cases : run?.results
+    if (!Array.isArray(results)) continue
+    results.forEach((caseResult, index) => {
+      if (sourceKind === 'case' &&
+        overriddenChildren.has(`${canonicalPath(sourcePath)}\0${caseIdOf(caseResult)}`)) return
+      const childCase = wrapperChildren.get(caseResult)
+      if (sourceKind === 'parallel-summary' && childCase &&
+        caseStatus(caseResult) !== 'ERROR' &&
+        caseStatus(caseResult) === caseStatus(childCase)) return
+      const candidate = candidateFrom(
+        sourcePath, run, caseResult, fileMtimeMs, index, sourceKind
+      )
       if (!candidate.caseId) {
         parseErrors.push({ resultPath: sourcePath, error: `case[${index}] 缺少 id/caseId` })
         return
@@ -351,7 +422,7 @@ export function renderMarkdown (report) {
     lines.push('', '## 结果文件解析问题', '')
     for (const item of report.parseErrors) lines.push(`- ${item.resultPath}：${item.error}`)
   }
-  lines.push('', '说明：SKIPPED 不替代实际执行；无执行记录不会升级为 PASS；DESIGNED/BLOCKED 的 Catalog 状态不会被实际结果提升为可验收 PASS。')
+  lines.push('', '说明：同时扫描 result.json 与 parallel-result.json；并行 ERROR 不被关联子报告掩盖。缺少案例时间的并行记录只用批次窗口排序，不冒充精确案例时间。SKIPPED 不替代实际执行；无执行记录不会升级为 PASS；DESIGNED/BLOCKED 的 Catalog 状态不会被实际结果提升为可验收 PASS。')
   return `${lines.join('\n')}\n`
 }
 
