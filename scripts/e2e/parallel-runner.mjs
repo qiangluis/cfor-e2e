@@ -41,7 +41,6 @@ export const parallelSafeCases = new Set([
   'RDM-004',
   'RDM-005',
   'RDM-006',
-  'RDM-007',
   'MES-PROD-003',
   'PB038-003',
   'PB149-OUTSOURCE-WIP-001',

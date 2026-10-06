@@ -127,6 +127,12 @@ test('outsource draft builders stay serial because GET probes allocate bill numb
   assert.equal(serialIds.has('PB153-OUTSOURCE-MATERIAL-001'), true)
 })
 
+test('heavy RDM progress report stays serial after parallel timeout evidence', () => {
+  assert.equal(parallelSafeCases.has('RDM-007'), false)
+  const { serial } = partitionDefinitions(allDefinitions())
+  assert.equal(serial.some((item) => item.id === 'RDM-007'), true)
+})
+
 test('parallel preflight rejects missing login credentials before workers start', () => {
   assert.doesNotThrow(() => validateParallelPreflight({ password: 'unit-password' }))
   assert.throws(
