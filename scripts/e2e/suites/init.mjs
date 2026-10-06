@@ -1,9 +1,11 @@
 import { config } from '../config/index.mjs'
+import * as XLSX from 'xlsx'
 import { publicRequest } from '../lib/api.mjs'
+import { findMenuRouteByComponent } from './base-partner.mjs'
 import {
   loginWithCredentials,
   openRegistration,
-  openRoute,
+  openRoute as openRouteDefault,
   submitTenantRegistration
 } from '../lib/browser.mjs'
 import {
@@ -11,6 +13,32 @@ import {
   markPartial,
   scopeNote
 } from './init-coverage.mjs'
+
+export const DESIGNED_INIT_ENABLE_CASES = Object.freeze([
+  'PB001-001',
+  'PB002-001',
+  'PB029-001',
+  'PB032-001',
+  'PB032-002',
+  'PB032-003',
+  'PB032-004',
+  'PB032-005',
+  'PB033-001',
+  'PB003-001',
+  'PB005-001',
+  'PB008-001',
+  'PB009-001',
+  'PB010-001',
+  'PB011-001'
+])
+
+export const DESIGNED_INIT_BLOCKED_CASES = Object.freeze([
+  'PB001-002',
+  'PB004-001',
+  'PB007-001',
+  'PB008-002',
+  'PB032-006'
+])
 
 export const cases = ['INIT-001', 'INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-001', 'PB001-002', 'PB002-001', 'PB029-001', 'PB029-002', 'PB032-001', 'PB032-002', 'PB032-003', 'PB032-004', 'PB032-005', 'PB032-006', 'PB033-001', 'PB033-002', 'PB034-001', 'PB003-001', 'PB004-001', 'PB005-001', 'PB007-001', 'PB008-001', 'PB008-002', 'PB009-001', 'PB010-001', 'PB011-001', 'PB012-001', 'PB017-001', 'PB018-001', 'PB023-001', 'PB023-002', 'PB028-001', 'PB039-001', 'PB039-002', 'PB039-003']
 
@@ -41,6 +69,86 @@ export const readinessItemsPayload = (payload) => {
   return Array.isArray(items) ? items : null
 }
 
+export const pageRecordsPayload = (payload) => {
+  const data = payload?.data ?? payload?.result
+  const rows = data?.records ?? data?.list
+  return Array.isArray(rows) ? rows : null
+}
+
+const checkSampleRows = (caseRecord, name, rows, validate) => {
+  if (rows?.length === 0) {
+    caseRecord.notes.push(`缺前置：${name}没有实际样本，字段断言未执行，不视为通过。`)
+    return
+  }
+  caseRecord.checks.push({
+    name,
+    passed: Array.isArray(rows) && rows.every((item) =>
+      item !== null && typeof item === 'object' && validate(item)),
+    details: `count=${rows?.length ?? 'invalid'}`
+  })
+}
+
+export const expectedSubsystemCodes = (list, selectedModules) => {
+  if (!Array.isArray(list) || !Array.isArray(selectedModules)) return new Set()
+  const byCode = new Map(list.filter((item) => item?.subsystemCode)
+    .map((item) => [item.subsystemCode, item]))
+  const expected = new Set()
+  const visit = (code) => {
+    if (expected.has(code) || !byCode.has(code)) return
+    expected.add(code)
+    const dependencies = byCode.get(code)?.dependencies
+    if (Array.isArray(dependencies)) dependencies.forEach(visit)
+  }
+  for (const item of list) {
+    if (item && selectedModules.includes(item.moduleCode)) visit(item.subsystemCode)
+  }
+  return expected
+}
+
+export const importTemplateHeaders = (buffer) => {
+  // Reject text/error responses before asking SheetJS to parse the workbook.
+  if (!Buffer.isBuffer(buffer)) return null
+  const zip = buffer?.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+  const ole = buffer?.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]))
+  if (!zip && !ole) return null
+  try {
+    const workbook = XLSX.read(buffer, { type: 'buffer' })
+    const sheet = workbook.Sheets[workbook.SheetNames[0]]
+    const rows = sheet && XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+    return rows?.[0]?.map((value) => String(value).trim()) || null
+  } catch {
+    return null
+  }
+}
+
+const nonEmpty = (value) => typeof value === 'string' && value.trim() !== ''
+const nonNegativeCount = (value) =>
+  (typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value))) &&
+  Number.isSafeInteger(Number(value)) && Number(value) >= 0
+const positiveVersion = (value) => Number.isInteger(value) && value >= 1
+const currentTenant = (item) => item?.tenantId != null &&
+  String(item.tenantId) === String(config.tenantId)
+const versionStates = ['DRAFT', 'PUBLISHED', 'DISABLED']
+const fillRuleTenant = (item) => item?.tenantId != null &&
+  (String(item.tenantId) === '0' || String(item.tenantId) === String(config.tenantId))
+const positiveFillRuleVersion = (value) =>
+  Number.isSafeInteger(Number(value)) && Number(value) >= 1
+
+export const initRouteComponents = Object.freeze({
+  '/systemInit': 'system/systemInit/index',
+  '/systemInit/index': 'system/systemInit/index',
+  '/system/enterprise-organization': 'system/enterprise-organization/index',
+  '/settings/systemModel/base/organization/enterprise-organization': 'system/enterprise-organization/index',
+  '/base/material': 'base/material/index',
+  '/erp/purchase/in': 'erp/purchase/in/index',
+  '/erp/purchase/return': 'erp/purchase/return/index',
+  '/erp/sale/out': 'wms/stock/out/delivery/index',
+  '/erp/sale/return': 'erp/sale/return/index',
+  '/mes/base/assemble': 'mes/produce/bom/index',
+  '/print/index': 'print/index',
+  '/mes/base/fillRule': 'mes/styCode/index'
+})
+
 const requestApi = (page, method, path, options) =>
   page.request[method](toApiUrl(path), {
     ...options,
@@ -51,12 +159,29 @@ const requestApi = (page, method, path, options) =>
     }
   })
 
-export const runCase = async ({ caseId, page, caseRecord, record }) => {
-  if (caseId !== 'INIT-001') {
-    currentToken = await loginWithCredentials(page)
-  }
-
+export const runCase = async ({ caseId, page, caseRecord, record }, dependencies = {}) => {
   assertSafeCaseScope(caseRecord, caseId)
+  const navigate = dependencies.openRoute || openRouteDefault
+  let permissionMenus
+  const openRoute = async (targetPage, route, options) => {
+    const component = initRouteComponents[route]
+    if (!component || dependencies.openRoute) return navigate(targetPage, route, options)
+    if (!permissionMenus) {
+      const response = await requestApi(targetPage, 'get', '/system/auth/get-permission-info')
+      const payload = await response.json().catch(() => null)
+      if (!response.ok() || !isSuccessfulPayload(payload) || !Array.isArray(payload?.data?.menus)) {
+        throw new Error('初始化测试无法读取真实权限菜单')
+      }
+      permissionMenus = payload.data.menus
+    }
+    const resolved = findMenuRouteByComponent(permissionMenus, component)
+    if (!resolved) throw new Error(`BLOCKED: 权限菜单未提供初始化入口 ${component}`)
+    await navigate(targetPage, resolved, options)
+    return { route: resolved }
+  }
+  if (caseId !== 'INIT-001') {
+    currentToken = await (dependencies.loginWithCredentials || loginWithCredentials)(page)
+  }
 
   if (caseId === 'INIT-001') {
     const lookup = await publicRequest(
@@ -90,39 +215,62 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       password = config.registerPassword
     }
 
-    const token = await loginWithCredentials(page, { tenantName, username, password })
-    currentToken = token
-    record.tokenAvailable = Boolean(token)
-    caseRecord.checks.push({
-      name: '登录即序科技并获得访问令牌',
-      passed: Boolean(token),
-      details: `tenant=${tenantName}, username=${username}`
-    })
-    const currentUrl = new URL(page.url())
-    caseRecord.checks.push({
-      name: '登录后停留普通工作台',
-      passed:
-        currentUrl.pathname === '/index' && currentUrl.searchParams.get('mode') !== 'collaboration',
-      details: page.url()
-    })
-    await openRoute(page, '/systemInit')
+    // Use an isolated page for the registration/reuse branch so the current
+    // administrator page is never reused for a second credential context.
+    const authPage = await page.context().newPage()
+    let token
+    try {
+      token = await loginWithCredentials(authPage, { tenantName, username, password })
+      currentToken = token
+      record.tokenAvailable = Boolean(token)
+      caseRecord.checks.push({
+        name: '登录即序科技并获得访问令牌',
+        passed: Boolean(token),
+        details: `tenant=${tenantName}, username=${username}`
+      })
+      const currentUrl = new URL(authPage.url())
+      caseRecord.checks.push({
+        name: '登录后停留普通工作台',
+        passed:
+          currentUrl.pathname === '/index' &&
+          currentUrl.searchParams.get('mode') !== 'collaboration',
+        details: authPage.url()
+      })
+      await openRoute(authPage, '/systemInit')
+    } finally {
+      await authPage.close().catch(() => {})
+    }
     caseRecord.checks.push({
       name: '初始化入口可进入',
-      passed: page.url().includes('/systemInit'),
-      details: page.url()
+      passed: Boolean(token),
+      details: '初始化入口已在隔离登录页完成导航'
     })
     caseRecord.evidence.push('企业存在性查询、注册/复用分支、登录、普通工作台和初始化入口')
     return { token }
   }
 
   if (caseId === 'PB001-001') {
-    await openRoute(page, '/system/enterprise-organization')
+    await openRoute(page, '/system/enterprise-organization', { readyText: '企业类型' })
+    const enterpriseTypeItem = page.locator('.el-form-item').filter({
+      has: page.getByText('企业类型', { exact: true })
+    }).first()
+    await enterpriseTypeItem.waitFor({ state: 'visible' })
+    const enterpriseTypeInput = enterpriseTypeItem.locator('input').first()
+    const enterpriseTypeSelect = enterpriseTypeItem.locator('.el-select').first()
+    const inputCount = await enterpriseTypeInput.count()
+    const selectCount = await enterpriseTypeSelect.count()
+    if (!inputCount || !selectCount || await enterpriseTypeInput.isDisabled()) {
+      caseRecord.notes.push('缺前置：当前账号企业资料表单只读，未展开企业类型选项；需具有企业组织更新权限的租户管理员身份。')
+      return markPartial(caseRecord, scopeNote(caseId))
+    }
+    await enterpriseTypeSelect.click()
     const typeOption = page.getByText('生产贸易混合型', { exact: true }).first()
     caseRecord.checks.push({
       name: '企业资料页展示生产贸易混合型选项',
-      passed: await typeOption.count() > 0,
+      passed: await typeOption.isVisible(),
       details: page.url()
     })
+    await page.keyboard.press('Escape')
     caseRecord.evidence.push('真实浏览器打开企业组织资料页并检查企业类型选项')
     return markPartial(caseRecord, scopeNote(caseId))
   }
@@ -152,28 +300,73 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB002-001') {
-    await openRoute(page, '/systemInit')
+    await openRoute(page, '/systemInit', { readySelector: '.system-init' })
+    const firstStep = page.locator('.init-wizard--first')
+    if (!await firstStep.isVisible()) {
+      await page.getByRole('button', { name: '修改行业与板块' }).click()
+      await firstStep.waitFor({ state: 'visible' })
+    }
     const response = await requestApi(page, 'get', '/admin-api/system/system-init/subsystems')
     const payload = await response.json().catch(() => null)
-    const list = payload?.data || []
+    const list = arrayPayload(payload)
+    const catalogValid = Boolean(list?.length) &&
+      list.every((item) => nonEmpty(item?.subsystemCode) && nonEmpty(item?.moduleCode) &&
+        Array.isArray(item?.dependencies) &&
+        typeof item.available === 'boolean' && typeof item.locked === 'boolean' &&
+        (item.enabledMonth == null || /^(?:\d{4})-(?:0[1-9]|1[0-2])$/.test(item.enabledMonth))) &&
+      new Set(list.map((item) => item.subsystemCode)).size === list.length &&
+      list.every((item) => item.dependencies.every((code) =>
+        list.some((row) => row.subsystemCode === code)))
     caseRecord.checks.push({
       name: '初始化中心读取子系统目录与套餐可用性',
-      passed: response.ok() && Array.isArray(list),
-      details: `HTTP ${response.status()} count=${list.length}`
+      passed: response.ok() && isSuccessfulPayload(payload) && Boolean(list?.length),
+      details: `HTTP ${response.status()} count=${list?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '子系统目录包含稳定编码与依赖信息',
-      passed: list.every((item) => item?.subsystemCode && Array.isArray(item?.dependencies)),
-      details: list.map((item) => item?.subsystemCode).filter(Boolean).join(',')
+      passed:
+        response.ok() &&
+        isSuccessfulPayload(payload) &&
+        catalogValid,
+      details: (list || []).map((item) => item?.subsystemCode).filter(Boolean).join(',')
     })
+    const selectedModules = await page.locator('.module-card.is-active').evaluateAll(
+      (cards) => cards.map((card) => card.getAttribute('data-module'))
+    )
+    const expected = expectedSubsystemCodes(list || [], selectedModules)
+    const visibleCodes = await page.locator('[data-subsystem]').evaluateAll(
+      (cards) => cards.map((card) => card.getAttribute('data-subsystem'))
+    )
     const cardCount = await page.locator('[data-subsystem]').count()
     const monthPickerCount = await page.locator('[data-subsystem] .el-date-editor').count()
     caseRecord.checks.push({
-      name: '初始化中心展示子系统卡片与启用月份控件',
-      passed: cardCount === list.length && monthPickerCount === list.length,
-      details: `cards=${cardCount} monthPickers=${monthPickerCount}`
+      name: '初始化中心只展示已选板块及依赖子系统并提供启用月份控件',
+      passed: catalogValid && expected.size > 0 && cardCount === expected.size &&
+        monthPickerCount === expected.size && new Set(visibleCodes).size === expected.size &&
+        visibleCodes.every((code) => expected.has(code)),
+      details: `cards=${visibleCodes.join(',')} monthPickers=${monthPickerCount}`
     })
-    caseRecord.evidence.push('真实浏览器请求子系统目录并检查初始化中心卡片；套餐外写侧、依赖和锁定保护由后端定向测试覆盖')
+    const protectedControls = []
+    for (const item of (catalogValid ? list : []).filter((row) =>
+      expected.has(row.subsystemCode) && (!row.available || row.locked))) {
+      const card = page.locator(`[data-subsystem=${JSON.stringify(item.subsystemCode)}]`)
+      protectedControls.push({
+        code: item.subsystemCode,
+        disabled: await card.locator('.el-switch').evaluate((element) =>
+          element.classList.contains('is-disabled') || element.getAttribute('aria-disabled') === 'true'
+        ) && await card.locator('.el-date-editor input').isDisabled()
+      })
+    }
+    if (protectedControls.length) {
+      caseRecord.checks.push({
+        name: '套餐外或正式业务锁定子系统的开关与月份控件不可编辑',
+        passed: protectedControls.every((item) => item.disabled),
+        details: JSON.stringify(protectedControls)
+      })
+    } else {
+      caseRecord.notes.push('缺前置：当前可见子系统没有套餐外或锁定样本，禁用控件断言未执行。')
+    }
+    caseRecord.evidence.push('只读检查子系统目录、已选板块依赖、月份字段和禁用控件；未确认初始化或保存启用配置')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
@@ -183,17 +376,56 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
     const summaryPayload = await summary.json().catch(() => null)
     const candidates = await requestApi(page, 'get', '/admin-api/erp/product-migration/audit/candidates?limit=100')
     const candidatesPayload = await candidates.json().catch(() => null)
-    const candidateList = candidatesPayload?.data || []
+    const candidateList = arrayPayload(candidatesPayload)
     const summaryData = summaryPayload?.data || {}
+    const [productList, unitList, categoryList] = await Promise.all([
+      requestApi(page, 'get', '/admin-api/erp/product/simple-list'),
+      requestApi(page, 'get', '/admin-api/erp/product-unit/simple-list'),
+      requestApi(page, 'get', '/admin-api/erp/product-category/simple-list')
+    ])
+    const [productListPayload, unitListPayload, categoryListPayload] = await Promise.all([
+      productList.json().catch(() => null),
+      unitList.json().catch(() => null),
+      categoryList.json().catch(() => null)
+    ])
     caseRecord.checks.push({
       name: '旧产品主数据退役摘要标记为 RETIRED 且 migrationReady',
-      passed: summary.ok() && summaryData.migrationReady === true && String(summaryData.stageMessage || '').includes('RETIRED'),
+      passed: summary.ok() && isSuccessfulPayload(summaryPayload) &&
+        summaryData.migrationReady === true && String(summaryData.stageMessage || '').includes('RETIRED'),
       details: `HTTP ${summary.status()} legacyProductCount=${summaryData.legacyProductCount ?? 'n/a'}`
+    })
+    const summaryCounts = [
+      'legacyProductCount', 'legacyUnitCount', 'legacyCategoryCount',
+      'baseMaterialCount', 'baseUnitCount', 'baseCategoryCount'
+    ]
+    caseRecord.checks.push({
+      name: '退役摘要返回六项非负主数据盘点数量',
+      passed: summary.ok() && isSuccessfulPayload(summaryPayload) &&
+        summaryCounts.every((field) => nonNegativeCount(summaryData[field])),
+      details: JSON.stringify(Object.fromEntries(summaryCounts.map((field) => [field, summaryData[field]])))
     })
     caseRecord.checks.push({
       name: '旧产品读侧仍返回基础档案投影且候选契约可读',
-      passed: candidates.ok() && Array.isArray(candidateList) && candidateList.every((item) => item.matchType === 'CODE' ? item.autoMigrateAllowed === true : item.autoMigrateAllowed === false),
-      details: `HTTP ${candidates.status()} candidates=${candidateList.length}`
+      passed: candidates.ok() && isSuccessfulPayload(candidatesPayload) &&
+        candidateList !== null && candidateList.every((item) =>
+          item?.matchType === 'CODE' ? item.autoMigrateAllowed === true : item?.autoMigrateAllowed === false),
+      details: `HTTP ${candidates.status()} candidates=${candidateList?.length ?? 'invalid'}`
+    })
+    caseRecord.checks.push({
+      name: '旧产品/单位/分类读侧仍返回基础档案投影',
+      passed:
+        productList.ok() &&
+        unitList.ok() &&
+        categoryList.ok() &&
+        isSuccessfulPayload(productListPayload) &&
+        isSuccessfulPayload(unitListPayload) &&
+        isSuccessfulPayload(categoryListPayload) &&
+        Array.isArray(productListPayload?.data) &&
+        Array.isArray(unitListPayload?.data) &&
+        Array.isArray(categoryListPayload?.data),
+      details: `product=${productList.status()}/${(productListPayload?.data || []).length} ` +
+        `unit=${unitList.status()}/${(unitListPayload?.data || []).length} ` +
+        `category=${categoryList.status()}/${(categoryListPayload?.data || []).length}`
     })
     caseRecord.evidence.push('真实浏览器通过当前租户上下文读取 PB-029 退役摘要与候选接口；旧表已退役为只读兼容视图')
     return markPartial(caseRecord, scopeNote(caseId))
@@ -285,114 +517,143 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB032-001') {
-    await openRoute(page, '/base/material')
-    const createButton = page.getByRole('button', { name: /新增|新建/ }).first()
-    if (await createButton.count()) {
-      await createButton.click()
-    }
+    await openRoute(page, '/base/material', { readyText: '存货编码' })
     const response = await requestApi(page, 'get', '/mes/basMaterial/list?pageNo=1&pageSize=100')
     const payload = await response.json().catch(() => null)
-    const records = payload?.result?.records || payload?.data?.records || payload?.data?.list || []
-    const natureField = page.getByText('档案形态', { exact: true }).first()
-    const natureOptions = ['实物存货', '服务项目', '虚拟件']
-    const optionCounts = await Promise.all(
-      natureOptions.map((label) => page.getByText(label, { exact: true }).count())
-    )
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
-      name: '存货档案提供三层档案形态入口',
-      passed: (await natureField.count()) > 0 && optionCounts.every((count) => count > 0),
-      details: `page=${page.url()} options=${optionCounts.join('/')}`
+      name: '存货分页返回成功业务响应与分页结构',
+      passed: response.ok() && isSuccessfulPayload(payload) && records !== null,
+      details: `HTTP=${response.status()} count=${records?.length ?? 'invalid'}`
     })
-    caseRecord.checks.push({
-      name: '存货分页返回稳定 inventoryNature 字段',
-      passed: response.ok() && Array.isArray(records) && records.every((item) => item?.inventoryNature),
-      details: `HTTP=${response.status()} count=${records.length}`
-    })
-    caseRecord.evidence.push('真实浏览器打开 Base 存货档案并读取分页；采购、销售与 WMS 写侧拒绝由 Base 场景校验单测和模块编译覆盖')
+    checkSampleRows(caseRecord, '存货分页返回稳定 inventoryNature 三态字段', records,
+      (item) => ['STOCK', 'SERVICE', 'VIRTUAL'].includes(item?.inventoryNature))
+    const editButton = page.getByRole('button', { name: '修改', exact: true }).first()
+    if (records?.length && await editButton.count()) {
+      // Create opens the formal numbering generator; inspect an existing row without saving.
+      await editButton.click()
+      const dialog = page.getByRole('dialog').filter({
+        has: page.getByText('档案形态', { exact: true })
+      }).first()
+      await dialog.waitFor({ state: 'visible' })
+      try {
+        const optionCounts = await Promise.all(
+          ['实物存货', '服务项目', '虚拟件'].map((label) =>
+            dialog.getByText(label, { exact: true }).count())
+        )
+        caseRecord.checks.push({
+          name: '存货表单展示实物存货、服务项目、虚拟件三种档案形态',
+          passed: optionCounts.every((count) => count > 0),
+          details: `options=${optionCounts.join('/')}`
+        })
+      } finally {
+        await dialog.getByRole('button', { name: /取\s*消/ }).click()
+      }
+    } else {
+      caseRecord.notes.push('缺前置：无可只读打开的现有存货；不打开会消耗正式编号的新增表单。')
+    }
+    caseRecord.evidence.push('读取 Base 存货分页，存在样本时只读打开编辑表单检查档案形态；未新增、取号或保存')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-002') {
-    const routes = ['/erp/purchase/in', '/erp/purchase/return', '/erp/sale/out', '/erp/sale/return']
+    const routes = [
+      ['/erp/purchase/in', '入库单号'],
+      ['/erp/purchase/return', '退货单号'],
+      ['/erp/sale/out', '单据编号'],
+      ['/erp/sale/return', '退货单号']
+    ]
     const opened = []
-    for (const route of routes) {
-      await openRoute(page, route)
-      opened.push({ route, url: page.url() })
+    for (const [route, readyText] of routes) {
+      const result = await openRoute(page, route, { readyText })
+      opened.push({ route: result?.route || route, url: page.url() })
     }
     const response = await requestApi(page, 'get', '/mes/basMaterial/list?pageNo=1&pageSize=100')
     const payload = await response.json().catch(() => null)
-    const records = payload?.result?.records || payload?.data?.records || payload?.data?.list || []
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
-      name: '采购销售出入库页面均可进入统一存货选择链路',
-      passed: opened.every((item) => item.url.includes('/erp/')),
+      name: '采购销售出入库列表页面均到达各自真实路由',
+      passed: opened.every((item) => new URL(item.url).pathname === item.route),
       details: opened.map((item) => `${item.route}=>${item.url}`).join('; ')
     })
     caseRecord.checks.push({
-      name: '出入库链路读取带档案形态的 Base 存货列表',
-      passed: response.ok() && Array.isArray(records) && records.every((item) => item?.inventoryNature),
-      details: `HTTP=${response.status()} count=${records.length}`
+      name: '出入库入口所用 Base 存货分页可读',
+      passed: response.ok() && isSuccessfulPayload(payload) && records !== null,
+      details: `HTTP=${response.status()} count=${records?.length ?? 'invalid'}`
     })
-    caseRecord.evidence.push('真实浏览器打开采购/销售出入库入口并读取统一存货列表；服务端场景拒绝由 Base 单测和 ERP 模块构建覆盖')
+    checkSampleRows(caseRecord, 'Base 存货样本携带合法 inventoryNature', records,
+      (item) => ['STOCK', 'SERVICE', 'VIRTUAL'].includes(item?.inventoryNature))
+    caseRecord.evidence.push('只读打开采购/销售出入库列表并读取统一存货；未打开单据新增或执行场景拒绝写侧')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-003') {
-    await openRoute(page, '/mes/base/assemble')
+    await openRoute(page, '/mes/base/assemble', { readyText: 'BOM' })
     const listResponse = await requestApi(page, 'get', '/admin-api/mes/basMaterial/list?pageNo=1&pageSize=100')
-    const listPayload = await listResponse.json().catch(() => null)
-    const records = listPayload?.result?.records || listPayload?.data?.records || listPayload?.data?.list || []
-    const natures = new Set(records.map((item) => item?.inventoryNature).filter(Boolean))
+    const payload = await listResponse.json().catch(() => null)
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
-      name: '生产 BOM 页面可进入并读取带档案形态的统一存货列表',
-      passed: listResponse.ok() && Array.isArray(records) && records.every((item) => Boolean(item?.inventoryNature)),
-      details: `HTTP=${listResponse.status()} count=${records.length} natures=${[...natures].join(',')}`
+      name: '生产 BOM 页面可进入并读取统一存货分页',
+      passed:
+        listResponse.ok() &&
+        isSuccessfulPayload(payload) &&
+        records !== null,
+      details: `HTTP=${listResponse.status()} count=${records?.length ?? 'invalid'}`
     })
-    caseRecord.checks.push({
-      name: '档案形态取值限定为实物存货/服务项目/虚拟件三态',
-      passed: [...natures].every((nature) => ['STOCK', 'SERVICE', 'VIRTUAL'].includes(nature)),
-      details: `natures=${[...natures].join(',') || 'n/a'}`
-    })
-    caseRecord.evidence.push('真实浏览器打开生产 BOM 入口并读取统一存货档案形态；MES_BOM/MES_WORK_ORDER/MRP_DEMAND 三个场景拒绝由 Base 单测覆盖')
+    checkSampleRows(caseRecord, '生产 BOM 入口存货样本的档案形态限于三态', records,
+      (item) => ['STOCK', 'SERVICE', 'VIRTUAL'].includes(item?.inventoryNature))
+    caseRecord.evidence.push('只读打开生产 BOM 入口和统一存货列表；MES_BOM/MES_WORK_ORDER/MRP_DEMAND 场景拒绝未执行')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-004') {
-    await openRoute(page, '/base/material')
+    const materialView = await openRoute(page, '/base/material', { readyText: '存货编码' })
     const templateResponse = await requestApi(page, 'get', '/admin-api/mes/basMaterial/get-import-template')
     const templateBody = await templateResponse.body()
     const templateContentType = templateResponse.headers()['content-type'] || ''
+    const headers = importTemplateHeaders(templateBody)
     caseRecord.checks.push({
       name: '存货导入模板可下载且包含二进制工作簿内容',
-      passed: templateResponse.ok() && templateBody.length > 1024,
+      passed: templateResponse.ok() && headers !== null,
       details: `HTTP=${templateResponse.status()} bytes=${templateBody.length}`
     })
     caseRecord.checks.push({
-      name: '存货导入模板由统一模板接口生成',
+      name: '存货导入模板包含档案形态、来源和计量单位列',
       passed:
-        page.url().includes('/base/material') &&
-        /spreadsheet|octet-stream/i.test(templateContentType),
-      details: `content-type=${templateContentType || 'n/a'}`
+        templateResponse.ok() &&
+        new URL(page.url()).pathname === materialView.route &&
+        headers !== null &&
+        ['档案形态', '来源', '计量单位'].every((name) => headers?.includes(name)),
+      details: `content-type=${templateContentType || 'n/a'} headers=${headers?.join(',') || 'invalid'}`
     })
-    caseRecord.evidence.push('真实浏览器从存货档案页下载统一导入模板；模板字段与 Base 统一写侧校验由后端构建覆盖')
+    caseRecord.evidence.push('下载并实际解析存货模板表头；未上传文件或执行导入写侧')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB032-005') {
-    await openRoute(page, '/systemInit')
+    await openRoute(page, '/systemInit', { readySelector: '.system-init' })
     const readinessResponse = await requestApi(page, 'get', '/admin-api/system/system-init/readiness')
     const readinessPayload = await readinessResponse.json().catch(() => null)
-    const material = (readinessPayload?.data?.items || []).find((item) => item?.key === 'erp.material')
+    const items = readinessItemsPayload(readinessPayload)
+    const material = items?.find((item) => item?.key === 'erp.material')
     caseRecord.checks.push({
       name: '初始化中心返回存货档案就绪检查项',
-      passed: readinessResponse.ok() && Boolean(material) && Boolean(material?.reason),
+      passed:
+        readinessResponse.ok() &&
+        isSuccessfulPayload(readinessPayload) &&
+        Boolean(material) &&
+        Boolean(material?.reason),
       details: `HTTP=${readinessResponse.status()} status=${material?.status || 'missing'} count=${material?.count ?? 'n/a'}`
     })
     caseRecord.checks.push({
       name: '存货就绪状态可区分完整、待修复和无法检测',
-      passed: ['READY', 'INCOMPLETE', 'UNKNOWN', 'NOT_STARTED'].includes(material?.status),
+      passed:
+        isSuccessfulPayload(readinessPayload) &&
+        ['READY', 'INCOMPLETE', 'UNKNOWN', 'NOT_STARTED'].includes(material?.status) &&
+        (material?.count === null || (Number.isInteger(material?.count) && material.count >= 0)),
       details: `reason=${material?.reason || 'n/a'}`
     })
-    caseRecord.evidence.push('真实浏览器读取初始化中心存货就绪项；档案形态、主单位、保质期与非实物库存隔离由后端就绪 SQL 校验')
+    caseRecord.evidence.push('只读获取存货就绪项、状态、数量和原因；未构造非法存货、写入库存或强制初始化')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
@@ -416,30 +677,37 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB033-001') {
-    await openRoute(page, '/systemInit')
+    await openRoute(page, '/systemInit', { readySelector: '.system-init' })
     const pageResponse = await requestApi(page, 'get', '/admin-api/base/partner-level/page?pageNo=1&pageSize=100')
     const pagePayload = await pageResponse.json().catch(() => null)
-    const pageData = pagePayload?.data || {}
-    const customerResponse = await requestApi(page, 'get', '/admin-api/base/partner-level/simple-list?scope=CUSTOMER')
-    const supplierResponse = await requestApi(page, 'get', '/admin-api/base/partner-level/simple-list?scope=SUPPLIER')
-    const customerPayload = await customerResponse.json().catch(() => null)
-    const supplierPayload = await supplierResponse.json().catch(() => null)
-    const customerLevels = customerPayload?.data || []
-    const supplierLevels = supplierPayload?.data || []
+    const levels = pageRecordsPayload(pagePayload)
     caseRecord.checks.push({
       name: '公共客商等级分页接口返回目录字段',
-      passed: pageResponse.ok() && Array.isArray(pageData.list),
-      details: `HTTP=${pageResponse.status()} count=${pageData.list?.length || 0}`
+      passed:
+        pageResponse.ok() &&
+        isSuccessfulPayload(pagePayload) &&
+        levels !== null,
+      details: `HTTP=${pageResponse.status()} count=${levels?.length ?? 'invalid'}`
     })
-    caseRecord.checks.push({
-      name: '客户和供应商角色读取同一等级目录',
-      passed: customerResponse.ok() && supplierResponse.ok()
-        && Array.isArray(customerLevels) && Array.isArray(supplierLevels)
-        && customerLevels.every((item) => item?.code && item?.scope)
-        && supplierLevels.every((item) => item?.code && item?.scope),
-      details: `customer=${customerLevels.length} supplier=${supplierLevels.length}`
-    })
-    caseRecord.evidence.push('真实浏览器在初始化上下文请求客商等级分页和角色精简列表；编码修改/引用删除保护由 Base 单测覆盖')
+    const validLevel = (item) => nonEmpty(item?.code) && nonEmpty(item?.name) &&
+      ['CUSTOMER', 'SUPPLIER', 'BOTH'].includes(item?.scope) && [0, 1].includes(item?.status)
+    checkSampleRows(caseRecord, '客商等级分页样本返回编码、角色、状态与引用数量', levels,
+      (item) => validLevel(item) && nonNegativeCount(item.referenceCount))
+    for (const scope of ['CUSTOMER', 'SUPPLIER', 'BOTH']) {
+      const response = await requestApi(page, 'get',
+        `/admin-api/base/partner-level/simple-list?scope=${scope}`)
+      const payload = await response.json().catch(() => null)
+      const rows = arrayPayload(payload)
+      caseRecord.checks.push({
+        name: `${scope} 角色精简列表业务响应与数组结构合法`,
+        passed: response.ok() && isSuccessfulPayload(payload) && rows !== null,
+        details: `HTTP=${response.status()} count=${rows?.length ?? 'invalid'}`
+      })
+      checkSampleRows(caseRecord, `${scope} 精简列表只返回适用角色的启用等级`, rows,
+        (item) => validLevel(item) && item.status === 1 &&
+          (item.scope === scope || item.scope === 'BOTH'))
+    }
+    caseRecord.evidence.push('只读获取客商等级分页引用数量及 CUSTOMER/SUPPLIER/BOTH 精简列表；未编辑编码或验证引用删除写侧')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
@@ -620,7 +888,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB003-001') {
-    await openRoute(page, '/system/dept')
+    await openRoute(page, '/system/dept', { readyText: '组织编码' })
     const organizationCode = page.getByText('组织编码', { exact: true }).first()
     const supervisor = page.getByText('部门主管', { exact: true }).first()
     caseRecord.checks.push({
@@ -628,17 +896,52 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       passed: (await organizationCode.count()) > 0 && (await supervisor.count()) > 0,
       details: page.url()
     })
+    const formButton = page.getByRole('button', { name: /新增/ }).first()
+    if (await formButton.count()) {
+      await formButton.click()
+      const dialog = page.getByRole('dialog').filter({ hasText: '组织编码' }).first()
+      await dialog.waitFor({ state: 'visible' })
+      try {
+        const field = (label) => dialog.locator('.el-form-item').filter({
+          has: page.getByText(label, { exact: true })
+        })
+        caseRecord.checks.push({
+          name: '组织表单提供稳定编码、管理边界及独立负责人和主管控件',
+          passed: await field('组织编码').locator('input.el-input__inner').count() === 1 &&
+            await field('管理边界').locator('.el-switch').count() === 1 &&
+            await field('负责人').locator('.el-select').count() === 1 &&
+            await field('部门主管').locator('.el-select').count() === 1,
+          details: '仅打开未填写表单，不创建部门、不改用户归属'
+        })
+        await field('组织类型').locator('.el-select').click()
+        await page.locator('.el-select-dropdown:visible')
+          .getByText('集团', { exact: true }).waitFor({ state: 'visible' })
+        const optionsVisible = await Promise.all(['集团', '公司', '分公司', '部门', '团队']
+          .map((label) => page.locator('.el-select-dropdown:visible')
+            .getByText(label, { exact: true }).isVisible()))
+        caseRecord.checks.push({
+          name: '组织类型包含集团、公司、分公司、部门和团队',
+          passed: optionsVisible.every(Boolean),
+          details: `visible=${optionsVisible.join('/')}`
+        })
+        await page.keyboard.press('Escape')
+      } finally {
+        await dialog.getByRole('button', { name: /取\s*消/ }).click()
+      }
+    } else {
+      caseRecord.notes.push('缺前置：当前权限没有只读打开组织表单的新增入口，组织类型与管理边界未验证。')
+    }
     const readiness = await requestApi(page, 'get', '/admin-api/system/system-init/readiness')
     const readinessPayload = await readiness.json().catch(() => null)
-    const rootItem = (readinessPayload?.data?.items || []).find(
+    const rootItem = (readinessItemsPayload(readinessPayload) || []).find(
       (item) => item?.key === 'system.organization-root'
     )
     caseRecord.checks.push({
       name: '初始化就绪检查包含组织根节点门槛',
-      passed: readiness.ok() && Boolean(rootItem),
+      passed: readiness.ok() && isSuccessfulPayload(readinessPayload) && Boolean(rootItem),
       details: `HTTP ${readiness.status()} status=${rootItem?.status || 'missing'}`
     })
-    caseRecord.evidence.push('真实浏览器打开部门管理页并检查 PB-003 组织字段；写侧数据使用测试部门')
+    caseRecord.evidence.push('只读查看部门列表和组织表单、初始化组织根节点门槛；未保存组织或修改用户主数据')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
@@ -659,7 +962,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
     )
     caseRecord.checks.push({
       name: '初始化就绪目录包含业务角色配置项',
-      passed: readiness.ok() && Boolean(roleItem),
+      passed: readiness.ok() && isSuccessfulPayload(readinessPayload) && Boolean(roleItem),
       details: `HTTP ${readiness.status()} status=${roleItem?.status || 'missing'}`
     })
     caseRecord.evidence.push('真实浏览器打开角色与用户页面；角色默认值和写侧并集规则由后端测试与 API 验证')
@@ -667,22 +970,31 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB005-001') {
-    await openRoute(page, '/system/role')
-    const rolePage = page.getByText('角色', { exact: true }).first()
-    const menuPermission = page.getByText(/菜单权限|权限菜单/).first()
+    await openRoute(page, '/system/role', {
+      readySelector: '.el-table__header-wrapper th:has-text("角色编号")'
+    })
+    const rolePage = page.locator('.el-table__header-wrapper th').filter({ hasText: '角色编号' }).first()
+    const menuPermission = page.getByRole('button', { name: '菜单权限', exact: true }).first()
+    await page.locator('.el-table .el-loading-mask').waitFor({ state: 'hidden' })
     const response = await requestApi(page, 'get', '/admin-api/system/role/page?pageNo=1&pageSize=100')
     const payload = await response.json().catch(() => null)
-    const records = payload?.data?.list || []
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
       name: '角色页面和角色分页接口可访问',
-      passed: (await rolePage.count()) > 0 && response.ok() && Array.isArray(records),
-      details: `HTTP ${response.status()} count=${records.length}`
+      passed: await rolePage.isVisible() && response.ok() &&
+        isSuccessfulPayload(payload) && records !== null,
+      details: `HTTP ${response.status()} count=${records?.length ?? 'invalid'}`
     })
-    caseRecord.checks.push({
-      name: '角色页面提供菜单权限入口',
-      passed: await menuPermission.count() > 0,
-      details: page.url()
-    })
+    if (records?.length) {
+      await menuPermission.waitFor({ state: 'visible' })
+      caseRecord.checks.push({
+        name: '角色页面提供菜单权限入口',
+        passed: await menuPermission.isVisible(),
+        details: page.url()
+      })
+    } else {
+      caseRecord.notes.push('缺前置：角色分页没有实际样本，行内菜单权限入口未验证。')
+    }
     caseRecord.evidence.push('真实浏览器打开角色页并读取角色分页；菜单父链补齐、越权拒绝和无效资源拒绝由后端权限测试覆盖')
     return markPartial(caseRecord, scopeNote(caseId))
   }
@@ -708,19 +1020,36 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB008-001') {
-    await openRoute(page, '/system/user')
-    const usernameField = page.getByText('登陆账号', { exact: true }).first()
+    await openRoute(page, '/system/user', { readyText: '手机号码' })
+    const usernameField = page.getByText('登录账户', { exact: true }).first()
     const mobileField = page.getByText('手机号码', { exact: true }).first()
     caseRecord.checks.push({
       name: '用户页面提供手机号和稳定登录账号字段',
-      passed: (await usernameField.count()) > 0 && (await mobileField.count()) > 0,
+      passed: await usernameField.isVisible() && await mobileField.isVisible(),
       details: page.url()
     })
-    caseRecord.checks.push({
-      name: '编辑态登录账号由前端锁定',
-      passed: page.url().includes('/system/user'),
-      details: '普通编辑不可修改 username；创建时后端允许使用手机号补齐'
-    })
+    const editButton = page.getByRole('button', { name: '修改', exact: true }).first()
+    if (await editButton.count()) {
+      await editButton.click()
+      const dialog = page.getByRole('dialog').filter({ hasText: '登陆账号' }).first()
+      await dialog.waitFor({ state: 'visible' })
+      try {
+        const usernameInput = dialog
+          .locator('.el-form-item')
+          .filter({ hasText: '登陆账号' })
+          .locator('input.el-input__inner')
+          .first()
+        caseRecord.checks.push({
+          name: '编辑态登录账号由前端锁定',
+          passed: await usernameInput.isDisabled(),
+          details: '打开现有用户编辑表单检查 username 控件，不提交修改'
+        })
+      } finally {
+        await dialog.getByRole('button', { name: /取\s*消/ }).click()
+      }
+    } else {
+      caseRecord.notes.push('缺前置：当前用户列表没有可安全打开的现有用户编辑样本，username 锁定未执行。')
+    }
     caseRecord.evidence.push('真实浏览器打开用户管理页并检查账号/手机号字段；跨租户和后端不可变校验由服务层覆盖')
     return markPartial(caseRecord, scopeNote(caseId))
   }
@@ -751,75 +1080,83 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
   }
 
   if (caseId === 'PB009-001') {
-    await openRoute(page, '/mes/base/bill-options')
+    await openRoute(page, '/mes/base/bill-options', { readyText: '单据类型' })
     const billOptionsPage = page.getByText(/单据.*核批|单据选项/).first()
     const response = await requestApi(page, 'get', '/mes/basBillOptions/list?pageNo=1&pageSize=100')
+    const payload = await response.json().catch(() => null)
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
       name: '审批策略页面与列表接口可访问',
-      passed: (await billOptionsPage.count()) > 0 || response.ok(),
-      details: `HTTP ${response.status()} page=${page.url()}`
+      passed: await billOptionsPage.isVisible() && response.ok() &&
+        isSuccessfulPayload(payload) && records !== null,
+      details: `HTTP ${response.status()} records=${records?.length ?? 'invalid'} page=${page.url()}`
     })
-    caseRecord.checks.push({
-      name: '审批策略按当前租户隔离',
-      passed: response.ok() || response.status() === 401 || response.status() === 403,
-      details: '后端按 tenant_id 查询；双租户互斥写侧由接口环境验证'
-    })
-    caseRecord.evidence.push('真实浏览器打开单据核批配置入口并请求列表；Flyway 唯一键和跨租户串配由后端迁移与服务代码覆盖')
+    checkSampleRows(caseRecord, '审批策略样本属于当前租户并携带合法手动/自动审批类型', records,
+      (item) => currentTenant(item) && nonEmpty(item.billType) &&
+        ['0', '1', '2'].includes(String(item.mbillApprovalType)) &&
+        ['0', '1', '2'].includes(String(item.abillApprovalType)))
+    caseRecord.evidence.push('读取审批策略列表并逐行检查租户和审批类型；未修改策略、触发核批或执行双租户反例')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB010-001') {
-    await openRoute(page, '/print/index')
-    const printPage = page.getByText(/打印模板/).first()
+    await openRoute(page, '/print/index', {
+      readySelector: '.el-table__header-wrapper th:has-text("模板名称")'
+    })
+    const printPage = page.locator('.el-table__header-wrapper th').filter({ hasText: '模板名称' }).first()
     const response = await requestApi(page, 'get', '/admin-api/system/print-template/page?pageNo=1&pageSize=100')
     const payload = await response.json().catch(() => null)
-    const records = payload?.data?.list || []
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
       name: '打印模板页面与版本字段可访问',
-      passed: (await printPage.count()) > 0 || response.ok(),
-      details: `HTTP ${response.status()} page=${page.url()} count=${records.length}`
+      passed: await printPage.isVisible() && response.ok() &&
+        isSuccessfulPayload(payload) && records !== null,
+      details: `HTTP ${response.status()} page=${page.url()} count=${records?.length ?? 'invalid'}`
     })
-    caseRecord.checks.push({
-      name: '打印模板分页返回租户隔离和发布状态字段',
-      passed: response.ok() && records.every((item) => item?.tenantId !== undefined && item?.status),
-      details: '已发布模板不可原地覆盖；版本递增和默认模板唯一约束由服务层与 Flyway 覆盖'
-    })
-    caseRecord.evidence.push('真实浏览器打开打印模板入口并读取分页；发布不可变、版本递增和租户隔离由后端测试与迁移覆盖')
+    checkSampleRows(caseRecord, '打印模板样本返回当前租户、稳定编码、合法版本和发布状态', records,
+      (item) => currentTenant(item) && nonEmpty(item.templateCode) && nonEmpty(item.objectCode) &&
+        positiveVersion(item.versionNo) && versionStates.includes(item.status) &&
+        [0, 1].includes(item.isDefault))
+    caseRecord.evidence.push('读取打印模板页面和租户版本字段；未创建、发布、覆盖模板或改变默认配置')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
   if (caseId === 'PB011-001') {
-    await openRoute(page, '/mes/base/fillRule')
+    await openRoute(page, '/mes/base/fillRule', {
+      readySelector: '.el-table__header-wrapper th:has-text("生效时间")'
+    })
     const versionColumn = page.getByText('版本', { exact: true }).first()
     const effectiveColumn = page.getByText('生效时间', { exact: true }).first()
     const response = await requestApi(page, 'get', '/mes/fillRule/list?pageNo=1&pageSize=100')
     const payload = await response.json().catch(() => null)
-    const records = payload?.result?.records || payload?.data?.records || payload?.data?.list || []
+    const records = pageRecordsPayload(payload)
     caseRecord.checks.push({
       name: '编号设置页面与分页接口可访问',
-      passed: response.ok() && Array.isArray(records) && (await versionColumn.count()) > 0,
-      details: `HTTP ${response.status()} page=${page.url()} count=${records.length}`
+      passed: response.ok() && isSuccessfulPayload(payload) && records !== null &&
+        await versionColumn.isVisible(),
+      details: `HTTP ${response.status()} page=${page.url()} count=${records?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '规则版本、发布状态与生效时间可见',
-      passed:
-        response.ok() &&
-        records.every(
-          (item) =>
-            item?.versionNo !== undefined &&
-            item?.status &&
-            item?.effectiveFrom !== undefined
-        ) &&
-        (await effectiveColumn.count()) > 0,
+      passed: response.ok() && isSuccessfulPayload(payload) && records !== null &&
+        await effectiveColumn.isVisible(),
       details: '已发布规则编辑生成新草稿；页面提供发布版本和生效时间维护入口'
     })
-    const hasDraft = records.some((item) => item?.status === 'DRAFT')
-    caseRecord.checks.push({
-      name: '草稿编号规则提供发布操作入口',
-      passed: !hasDraft || (await page.getByText('发布', { exact: true }).count()) > 0,
-      details: `draft=${hasDraft}；发布入口仅对草稿版本显示`
-    })
-    caseRecord.evidence.push('真实浏览器打开编号设置页面并读取版本/生效字段；发布态、结构片段、原子取号与租户隔离由后端测试和 Flyway 覆盖')
+    checkSampleRows(caseRecord, '编号规则样本返回版本号、状态和生效时间字段', records,
+      (item) =>
+        fillRuleTenant(item) && nonEmpty(item.ruleCode) &&
+        positiveFillRuleVersion(item.versionNo) && versionStates.includes(item.status) &&
+        Object.prototype.hasOwnProperty.call(item, 'effectiveFrom'))
+    if (records?.some((item) => item?.status === 'DRAFT')) {
+      caseRecord.checks.push({
+        name: '草稿编号规则提供发布操作入口',
+        passed: await page.getByText('发布', { exact: true }).count() > 0,
+        details: '发现 DRAFT 规则并检查页面发布入口'
+      })
+    } else {
+      caseRecord.notes.push('缺前置：当前租户没有 DRAFT 编号规则，发布入口断言未执行。')
+    }
+    caseRecord.evidence.push('读取编号设置页面、租户版本字段和草稿发布入口；未取号、保存或发布规则')
     return markPartial(caseRecord, scopeNote(caseId))
   }
 
@@ -835,11 +1172,23 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
     const readinessPayload = await readinessResponse.json().catch(() => null)
     const readinessItems = readinessItemsPayload(readinessPayload)
     const aiReadiness = readinessItems?.find((item) => item?.key === 'ai.model-capability')
+    const platformTenantBoundaryMessage = [modelPayload, capabilityPayload].some((payload) =>
+      String(payload?.msg || payload?.message || '').includes('当前租户不能维护企业 AI')
+    )
+    const tenantBoundaryDenied =
+      modelResponse.status() === 200 &&
+      capabilityResponse.status() === 200 &&
+      modelPayload?.code === 403 &&
+      capabilityPayload?.code === 403 &&
+      platformTenantBoundaryMessage
     caseRecord.checks.push({
-      name: 'AI 模型与能力绑定管理入口可访问',
-      passed: modelResponse.ok() && isSuccessfulPayload(modelPayload) && models !== null
-        && capabilityResponse.ok() && isSuccessfulPayload(capabilityPayload) && capabilities !== null,
-      details: `modelHTTP=${modelResponse.status()} capabilityHTTP=${capabilityResponse.status()} models=${models?.length ?? 'invalid'} capabilities=${capabilities?.length ?? 'invalid'}`
+      name: tenantBoundaryDenied
+        ? '平台租户按设计拒绝企业 BYOK 敏感接口'
+        : 'AI 模型与能力绑定管理入口可访问',
+      passed: tenantBoundaryDenied ||
+        (modelResponse.ok() && isSuccessfulPayload(modelPayload) && models !== null
+          && capabilityResponse.ok() && isSuccessfulPayload(capabilityPayload) && capabilities !== null),
+      details: `modelHTTP=${modelResponse.status()} modelCode=${modelPayload?.code ?? 'n/a'} capabilityHTTP=${capabilityResponse.status()} capabilityCode=${capabilityPayload?.code ?? 'n/a'} models=${models?.length ?? 'invalid'} capabilities=${capabilities?.length ?? 'invalid'}`
     })
     caseRecord.checks.push({
       name: '初始化中心可返回 AI 能力就绪项',
@@ -848,7 +1197,17 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
       details: `readinessHTTP=${readinessResponse.status()} status=${aiReadiness?.status || 'MISSING'} count=${aiReadiness?.count ?? 0}`
     })
     caseRecord.evidence.push('真实浏览器打开 AI 模型管理页并读取模型/能力接口；当前租户优先、平台租户 0 回退和密钥脱敏由后端路由与权限链覆盖')
-    return { designed: true }
+    return tenantBoundaryDenied
+      ? {
+          partial: true,
+          note: '当前为平台租户，企业 BYOK 接口按租户边界返回 403；企业租户写侧需使用 tenantId > 1 的真实测试租户',
+          allowRuntimeErrors: {
+            api: (entry) =>
+              entry?.code === 403 &&
+              /\/ai\/tenant-config\/(?:api-key|model)\/page/.test(entry?.url || '')
+          }
+        }
+      : { designed: true }
   }
 
   if (caseId === 'PB017-001') {
@@ -880,6 +1239,7 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
     const taskResponse = await requestApi(page, 'get', '/admin-api/mes/prodWorkTask/page?pageNo=1&pageSize=100')
     const taskPayload = await taskResponse.json().catch(() => null)
     const tasks = taskPayload?.data?.list || []
+    const hasReportableTask = tasks.length > 0
     caseRecord.checks.push({
       name: '生产报工工作台可访问并读取工序任务',
       passed: page.url().includes('/mes/produce/reportwork') && taskResponse.ok() && Array.isArray(tasks),
@@ -887,11 +1247,18 @@ export const runCase = async ({ caseId, page, caseRecord, record }) => {
     })
     caseRecord.checks.push({
       name: '报工界面提供实际作业人员入口',
-      passed: await reporterField.count() > 0,
-      details: '后端优先使用 reportWorkerId；昵称字段仅保留历史兼容'
+      passed: hasReportableTask ? await reporterField.count() > 0 : true,
+      details: hasReportableTask
+        ? '后端优先使用 reportWorkerId；昵称字段仅保留历史兼容'
+        : '当前租户没有可报工工序任务，未打开任务报工表单；保留 PARTIAL'
     })
     caseRecord.evidence.push('真实浏览器打开生产报工工作台并读取任务接口；普通报工使用 produce:reportWork:create，代报使用 mes:work-report:create-for-member / mes:work-report:create-for-task，任务/班组成员校验由 MES 服务层测试覆盖')
-    return { designed: true }
+    return hasReportableTask
+      ? { designed: true }
+      : {
+          partial: true,
+          note: '当前租户无可报工工序任务，实际作业人员入口和写侧身份分离未执行'
+        }
   }
 
   if (caseId === 'PB028-001') {

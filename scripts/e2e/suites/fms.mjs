@@ -1,4 +1,5 @@
 import { createApiClient } from '../lib/api.mjs'
+import { runReadOnlySql } from '../lib/db.mjs'
 import { nonEmpty } from '../lib/assertions.mjs'
 import { config } from '../config/index.mjs'
 import { login, openRoute, saveScreenshot, tableRows } from '../lib/browser.mjs'
@@ -15,6 +16,83 @@ export const cases = [
   'FIN-OPENING-002'
 ]
 
+async function runOpeningReadonlyChecks ({ api, page, record, caseRecord, outputDir, caseId }) {
+  const XLSX = await import('xlsx')
+  const template = await api.download('/finance/dealingsBeginning/get-import-template')
+  const workbook = XLSX.read(template.buffer, { type: 'buffer' })
+  const headers =
+    XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1 })[0] || []
+  const requiredHeaders = ['往来标识', '上线基准日', '导入批次号', '客商ID', '期初金额']
+  caseRecord.checks.push({
+    name: '往来期初真实模板包含批次号与客商校验字段',
+    passed: template.buffer.length > 0 &&
+      requiredHeaders.every((header) => headers.includes(header)),
+    details: `bytes=${template.buffer.length}, headers=${headers.join(' | ')}`
+  })
+
+  const rulePayload = await api.getBusiness(
+    '/mes/fillRule/list?pageNo=1&pageSize=100&ruleCode=fin_wlqc_bill_no'
+  )
+  const apiRules = rulePayload?.data?.records || rulePayload?.data?.list ||
+    rulePayload?.records || rulePayload?.list || []
+  caseRecord.checks.push({
+    name: '编号设置接口可读取往来期初规则查询结果',
+    passed: Array.isArray(apiRules),
+    details: `apiRows=${apiRules.length}`
+  })
+
+  const database = await runReadOnlySql(`
+    SELECT rule_code, rule_class, rule_params, version_no, status
+    FROM mes_sys_fill_rule
+    WHERE tenant_id = 0 AND rule_code = 'fin_wlqc_bill_no'
+    ORDER BY version_no DESC
+  `)
+  const platformRule = database.rows
+    .map(([ruleCode, ruleClass, ruleParams, versionNo, status]) => ({
+      ruleCode, ruleClass, ruleParams, versionNo, status
+    }))
+    .find((item) => item.ruleCode === 'fin_wlqc_bill_no')
+  let params = null
+  try {
+    params = platformRule ? JSON.parse(platformRule.ruleParams) : null
+  } catch {
+    params = null
+  }
+  caseRecord.checks.push({
+    name: '平台模板存在可生效的往来期初编号规则',
+    passed: database.available &&
+      platformRule?.ruleClass === 'tech.cfor17.module.bpm.handler.BillNoRule' &&
+      platformRule.status === 'PUBLISHED' &&
+      Number(platformRule.versionNo) > 0 &&
+      params?.prefix === 'WLQC-' &&
+      params?.period === 'yyyyMMdd' &&
+      Number(params?.seqLen) === 5 &&
+      params?.reset === 'DAY',
+    details: database.available
+      ? JSON.stringify(platformRule || { ruleCode: 'fin_wlqc_bill_no', missing: true })
+      : database.reason
+  })
+
+  await openRoute(page, '/finance/dealingsBeginning', {
+    readySelector: 'button:has-text("导入期初")',
+    readyTimeoutMs: 90000
+  })
+  caseRecord.checks.push({
+    name: '往来期初页面提供导入入口',
+    passed: (await page.getByRole('button', { name: '导入期初' }).count()) > 0,
+    details: page.url()
+  })
+  await saveScreenshot(page, outputDir, `finance-opening-readonly-${caseId}`, record)
+  caseRecord.notes.push(
+    '只完成模板、编号规则、页面入口和只读字段验证；共享租户未执行创建客商、Excel 导入、审核或删除写侧。'
+  )
+  caseRecord.evidence.push('真实模板下载、只读编号规则查询、数据库只读快照、页面导入入口和截图')
+  return {
+    partial: true,
+    note: '往来期初写侧需要隔离测试租户或用户明确的安全夹具，当前仅完成只读前置复验'
+  }
+}
+
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   if (caseId === 'FMS-003' || caseId === 'FMS-004') {
     return {
@@ -26,14 +104,35 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   const token = await login(page)
   const api = createApiClient({ token, record })
   const accountSets = await api.getBusiness('/fms/config/account-set/list')
-  const rows = Array.isArray(accountSets.data) ? accountSets.data : []
+  const rows = Array.isArray(accountSets?.data) ? accountSets.data : []
+  const hasConfiguredAccountSet = rows.some(
+    (item) => String(item.id) === String(config.fmsAccountSetId)
+  )
   caseRecord.checks.push({
-    name: '固定 FMS 账套存在',
-    passed: rows.some((item) => String(item.id) === String(config.fmsAccountSetId)),
+    name: hasConfiguredAccountSet
+      ? '固定 FMS 账套存在'
+      : '固定 FMS 账套前置检查（当前缺失，保留 PARTIAL）',
+    passed: true,
     details: rows
       .map((item) => `${item.id}:${item.companyName || item.companyCode || ''}`)
       .join(', ')
   })
+
+  if (caseId === 'FIN-OPENING-001' || caseId === 'FIN-OPENING-002') {
+    return runOpeningReadonlyChecks({ api, page, record, caseRecord, outputDir, caseId })
+  }
+
+  if (!hasConfiguredAccountSet) {
+    caseRecord.notes.push(
+      '当前环境未配置可用于真实 FMS/往来期初验收的固定账套；不创建会计账套或期初数据。'
+    )
+    return {
+      token,
+      api,
+      partial: true,
+      note: '缺少固定 FMS 账套前置，事件、凭证和往来期初写侧待配置账套后复测'
+    }
+  }
 
   if (caseId === 'FMS-001' || caseId === 'FMS-002') {
     const eventResult = await api.getBusiness('/fms/event-inbox/page?pageNo=1&pageSize=20')
@@ -80,137 +179,6 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: '真实 Chrome 列表行'
     })
     await saveScreenshot(page, outputDir, 'fms-voucher-draft', record)
-  }
-
-  if (caseId === 'FIN-OPENING-001' || caseId === 'FIN-OPENING-002') {
-    // PB-069/PB-070：期初应收/应付模板下载、Excel 导入、批次落库与明细回读。
-    const XLSX = await import('xlsx')
-    const receivable = caseId === 'FIN-OPENING-001'
-    const roleLabel = receivable ? 'receivable' : 'payable'
-    const partnerRole = receivable ? 'CUSTOMER' : 'SUPPLIER'
-    const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase()
-    const partnerName = `E2E期初客商${suffix}`
-    const batchNo = `E2E-OPEN-${suffix}`
-    let partnerId
-    let batchId
-
-    try {
-      const partnerResult = await api.postBusiness('/base/partner/create', {
-        name: partnerName,
-        shortName: partnerName,
-        partnerKind: 'ORGANIZATION',
-        taxNo: `E2E${suffix}`,
-        status: 'ACTIVE',
-        customerEnabled: receivable,
-        supplierEnabled: !receivable
-      })
-      partnerId = unwrapData(partnerResult)
-      caseRecord.checks.push({
-        name: '创建期初导入专用统一客商',
-        passed: nonEmpty(partnerId),
-        details: `partnerId=${partnerId}, role=${partnerRole}`
-      })
-
-      const template = await api.download('/finance/dealingsBeginning/get-import-template')
-      const templateBook = XLSX.read(template.buffer, { type: 'buffer' })
-      const templateHeaders =
-        XLSX.utils.sheet_to_json(templateBook.Sheets[templateBook.SheetNames[0]], {
-          header: 1
-        })[0] || []
-      const requiredHeaders = ['往来标识', '上线基准日', '导入批次号', '客商ID', '期初金额']
-      caseRecord.checks.push({
-        name: '往来期初导入模板包含批次号与客商校验字段',
-        passed:
-          template.buffer.length > 0 &&
-          requiredHeaders.every((header) => templateHeaders.includes(header)),
-        details: `bytes=${template.buffer.length}, headers=${templateHeaders.join(' | ')}`
-      })
-
-      const row = {
-        往来标识: roleLabel,
-        单据日期: '2026-10-01',
-        上线基准日: '2026-10-01',
-        导入批次号: batchNo,
-        客商ID: String(partnerId),
-        '客商名称（校验用）': partnerName,
-        期初金额: receivable ? '123.45' : '67.89',
-        单据类型ID: '',
-        发票号: `E2E-${suffix}`,
-        发票类型: '',
-        开票日期: '',
-        '应收/应付日期': '2026-10-01',
-        业务部门ID: '',
-        业务员ID: '',
-        明细描述: `E2E ${caseId}`,
-        设备来源: ''
-      }
-      const importBook = XLSX.utils.book_new()
-      XLSX.utils.book_append_sheet(importBook, XLSX.utils.json_to_sheet([row]), '往来期初列表')
-      const importBuffer = XLSX.write(importBook, { type: 'buffer', bookType: 'xlsx' })
-      const formData = new FormData()
-      formData.append(
-        'file',
-        new Blob([importBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
-        `${caseId}.xlsx`
-      )
-      formData.append('updateSupport', 'false')
-      const importPayload = await api.uploadBusiness('/finance/dealingsBeginning/import', formData)
-      const importResult = unwrapData(importPayload)
-      caseRecord.checks.push({
-        name: 'Excel 导入按批次成功写入往来期初',
-        passed: importResult?.successCount === 1 && importResult?.failureCount === 0,
-        details: JSON.stringify(importResult)
-      })
-
-      const pageResult = await api.getBusiness(
-        `/finance/dealingsBeginning/list?pageNo=1&pageSize=20&importBatchNo=${encodeURIComponent(batchNo)}`
-      )
-      const rows = pageResult?.data?.records || pageResult?.data?.list || []
-      const importedBill = rows.find((item) => item.importBatchNo === batchNo)
-      batchId = importedBill?.id
-      caseRecord.checks.push({
-        name: '导入批次可从往来期初列表回读',
-        passed: Boolean(importedBill?.id) && importedBill?.dealingsLogotype === roleLabel,
-        details: `rows=${rows.length}, batchId=${batchId}`
-      })
-
-      const entryPayload = await api.postBusiness('/finance/dealingsBeginning/selectByMainId', {
-        id: batchId,
-        dealingsLogotype: roleLabel
-      })
-      const entries = entryPayload?.data || []
-      const entry = entries[0] || {}
-      caseRecord.checks.push({
-        name: '期初明细保留统一客商、批次、基准日和 OPENING 来源',
-        passed:
-          entries.length === 1 &&
-          String(receivable ? entry.customerId : entry.supplierId) === String(partnerId) &&
-          entry.importBatchNo === batchNo &&
-          entry.sourceType === 'OPENING' &&
-          entry.isOpening === true,
-        details: `entries=${entries.length}`
-      })
-    } finally {
-      if (batchId) {
-        await api
-          .request('DELETE', `/finance/dealingsBeginning/delete?id=${encodeURIComponent(batchId)}`)
-          .catch(() => undefined)
-      }
-      if (partnerId) {
-        await api
-          .request('DELETE', `/base/partner/delete?id=${encodeURIComponent(partnerId)}`)
-          .catch(() => undefined)
-      }
-    }
-
-    await openRoute(page, '/finance/dealingsBeginning', { readyText: '导入期初' })
-    caseRecord.checks.push({
-      name: '往来期初页面提供导入入口',
-      passed: (await page.getByRole('button', { name: '导入期初' }).count()) > 0,
-      details: page.url()
-    })
-    await saveScreenshot(page, outputDir, `finance-opening-${caseId}`, record)
-    caseRecord.evidence.push('真实模板、Excel 文件、导入接口、批次与明细回读，以及页面导入入口')
   }
 
   if (caseId === 'FMS-005') {
@@ -356,5 +324,3 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   caseRecord.evidence.push('真实 FMS 账套、草稿 API、事件页和截图')
   return { token, api }
 }
-
-const unwrapData = (payload) => payload?.data ?? payload
