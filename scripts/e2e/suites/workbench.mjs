@@ -1,5 +1,6 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { decryptResponse, ENCRYPT_HEADER } from '../lib/crypto.mjs'
 
 // 工作台/index 门户化改造（PB-342~PB-377）真实浏览器案例。
 export const cases = [
@@ -35,11 +36,13 @@ const PORTAL_SECTION_SELECTORS = {
   performance: '.performance-panel'
 }
 
-async function waitForTodoContent (todoPanel) {
-  // Wait for the async todo request to render either real rows or the explicit empty state.
-  const content = todoPanel.locator('.todo-body .work-list-row, .todo-body .el-empty').first()
-  await content.waitFor({ state: 'visible', timeout: 60000 })
-  return content
+export function validateWorkbenchTodoPage (response, payload) {
+  const data = payload?.data
+  if (!response.ok() || payload?.code !== 0 || !Array.isArray(data?.list) ||
+    !Number.isInteger(data.total) || data.total < 0 || data.total < data.list.length) {
+    throw new Error('待办真实分页响应或业务契约无效，不能用空态替代失败请求')
+  }
+  return data
 }
 
 async function waitForProcessDetail (dialog) {
@@ -49,26 +52,180 @@ async function waitForProcessDetail (dialog) {
   return detail
 }
 
-async function openWorkbenchAndWaitForTodo (page) {
-  // The initial Vue render briefly exposes an empty state before the async request starts.
+async function waitForTodoContent (page, todoPanel, expectedRowCount) {
+  // The empty state can exist during the initial Vue render. Require both the
+  // loading mask to be gone and the DOM row count to match the response body.
+  await todoPanel.locator('.todo-body .el-loading-mask').waitFor({
+    state: 'hidden',
+    timeout: 60000
+  })
+  await page.waitForFunction(({ expectedRowCount }) => {
+    const body = document.querySelector('.todo-panel .todo-body')
+    if (!body) return false
+    const mask = body.querySelector('.el-loading-mask')
+    const maskStyle = mask && window.getComputedStyle(mask)
+    const maskVisible = Boolean(mask && maskStyle.display !== 'none' &&
+      maskStyle.visibility !== 'hidden' && maskStyle.opacity !== '0')
+    if (maskVisible) return false
+
+    const rowCount = body.querySelectorAll('.work-list-row').length
+    if (rowCount !== expectedRowCount) return false
+
+    const empty = body.querySelector('.el-empty')
+    const emptyStyle = empty && window.getComputedStyle(empty)
+    const emptyVisible = Boolean(empty && emptyStyle.display !== 'none' &&
+      emptyStyle.visibility !== 'hidden')
+    return expectedRowCount > 0 ? !emptyVisible : emptyVisible
+  }, { expectedRowCount }, { timeout: 60000 })
+  return todoPanel.locator(expectedRowCount > 0
+    ? '.todo-body .work-list-row'
+    : '.todo-body .el-empty').first()
+}
+
+async function readTodoResponse (response) {
+  return validateWorkbenchTodoPage(response, await readBrowserResponsePayload(response))
+}
+
+async function waitForTodoResponse (page) {
+  const response = await page.waitForResponse(
+    (candidate) =>
+      candidate.url().includes('/workbench/todo/page') &&
+      candidate.request().method() === 'GET',
+    { timeout: 60000 }
+  )
+  return { response, todoPage: await readTodoResponse(response) }
+}
+
+export async function openWorkbenchAndWaitForTodo (page, navigate = openRoute) {
+  // Register before navigation so the assertion cannot race the initial Vue render.
   const todoResponse = page.waitForResponse(
     response =>
       response.url().includes('/workbench/todo/page') &&
-      response.request().method() === 'GET' &&
-      response.ok(),
+      response.request().method() === 'GET',
     { timeout: 60000 }
-  )
-  await openRoute(page, WORKBENCH_PATH)
-  await todoResponse
+  ).then(async (response) => ({
+    response,
+    todoPage: await readTodoResponse(response)
+  }))
+  await navigate(page, WORKBENCH_PATH)
+  const { todoPage } = await todoResponse
   const todoPanel = page.locator('.todo-panel').first()
   await todoPanel.waitFor({ state: 'visible' })
-  await waitForTodoContent(todoPanel)
-  return todoPanel
+  await waitForTodoContent(page, todoPanel, todoPage.list.length)
+  return { todoPanel, todoPage }
 }
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+const REPORT_QUERIES = [
+  { type: 'DAILY', label: '日报', path: '/pm/daily-report/page', owner: 'reporterId' },
+  { type: 'WEEKLY', label: '周报', path: '/crm/work-report/page', owner: 'ownerUserId' },
+  { type: 'MONTHLY', label: '月报', path: '/crm/work-report/page', owner: 'ownerUserId' }
+]
+
+export function validateWorkbenchReportPage (response, payload, query, userId, scope = 'self') {
+  const url = new URL(response.url())
+  const params = url.searchParams
+  const data = payload?.data
+  if (!response.ok() || payload?.code !== 0 || !Array.isArray(data?.list) ||
+    !Number.isInteger(data.total) || data.total < data.list.length ||
+    data.list.length > 100 || params.get('pageNo') !== '1' || params.get('pageSize') !== '100' ||
+    !url.pathname.endsWith(query.path) || response.request().method() !== 'GET' ||
+    params.get('reportType') !== query.type) {
+    throw new Error(`${query.label}真实分页响应或查询契约无效，不能用空态替代失败请求`)
+  }
+  const owner = params.get(query.owner)
+  if ((scope === 'self' && owner !== String(userId)) || (scope === 'team' && owner !== null)) {
+    throw new Error(`${query.label}请求范围不符：预期=${scope}`)
+  }
+  if (data.list.some((row) => !row || row.reportType !== query.type ||
+    (scope === 'self' && String(row[query.owner]) !== String(userId)))) {
+    throw new Error(`${query.label}响应包含类型错误或非当前用户报告`)
+  }
+  return data
+}
+
+async function readBrowserResponsePayload (response) {
+  const headers = response.headers()
+  const text = await response.text()
+  return headers[ENCRYPT_HEADER.toLowerCase()] === 'true'
+    ? decryptResponse(text)
+    : JSON.parse(text)
+}
+
+export async function captureWorkbenchReports (page, action, userId, scope = 'self') {
+  // Tabs use preloaded arrays; statistics changes issue a fresh batch of three GETs.
+  const pending = REPORT_QUERIES.map((query) => page.waitForResponse(
+    (response) => {
+      const url = new URL(response.url())
+      return response.request().method() === 'GET' && url.pathname.endsWith(query.path) &&
+        url.searchParams.get('reportType') === query.type
+    },
+    { timeout: 15000 }
+  ).catch(() => null))
+  const responses = Promise.all(pending)
+  await action()
+  const captured = await responses
+  const pages = {}
+  const missing = []
+  for (const [index, query] of REPORT_QUERIES.entries()) {
+    const response = captured[index]
+    if (!response) {
+      missing.push(`${query.label}未捕获真实 GET 响应`)
+      continue
+    }
+    const payload = await readBrowserResponsePayload(response)
+    pages[query.type] = validateWorkbenchReportPage(response, payload, query, userId, scope)
+  }
+  return { pages, missing }
+}
+
+async function reportIdentity (api) {
+  const permission = await api.get('/system/auth/get-permission-info')
+  const userId = permission?.data?.user?.id
+  const permissions = permission?.data?.permissions || []
+  if (permission?.code !== 0 || !userId || !Array.isArray(permissions)) {
+    return { gap: '未获得有效当前用户及查询权限，未执行报告范围请求' }
+  }
+  const unrestricted = permissions.includes('*:*:*')
+  const missing = ['pm:daily-report:query', 'crm:work-report:query']
+    .filter((key) => !unrestricted && !permissions.includes(key))
+  return missing.length
+    ? { gap: `当前用户缺少查询权限：${missing.join('、')}` }
+    : { userId, unrestricted }
+}
+
+function reportPartial (token, api, caseRecord, gaps) {
+  const note = `未验收：${gaps.join('；')}`
+  caseRecord.notes.push(note)
+  return { token, api, partial: true, note }
+}
+
+export function summarizeWorkbenchReports (pages, period, today) {
+  const [year, month] = today.split('-').map(Number)
+  const firstMonth = period === 'year' ? 1 : period === 'quarter'
+    ? Math.floor((month - 1) / 3) * 3 + 1 : month
+  const lastMonth = period === 'year' ? 12 : period === 'quarter' ? firstMonth + 2 : month
+  const start = `${year}-${String(firstMonth).padStart(2, '0')}-01`
+  const end = new Date(Date.UTC(year, lastMonth, 0)).toISOString().slice(0, 10)
+  const inRange = (value) => typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}/.test(value) && value.slice(0, 10) >= start && value.slice(0, 10) <= end
+  return REPORT_QUERIES.map(({ type, label }) => {
+    const list = pages[type].list.filter((row) => type === 'DAILY'
+      ? inRange(row.periodKey) : inRange(row.periodStart) || inRange(row.periodEnd))
+    return [label, list.length, list.filter((row) => row.status === 'SUBMITTED').length,
+      list.filter((row) => row.status === 'APPROVED').length,
+      list.filter((row) => ['REJECTED', 'OVERDUE'].includes(row.status)).length].map(String)
+  })
+}
+
+async function waitForReportRendering (panel) {
+  await panel.locator('.focus-body .el-loading-mask').waitFor({ state: 'hidden', timeout: 15000 })
+  await panel.locator('.focus-body .work-list-row, .focus-body .el-empty').first()
+    .waitFor({ state: 'visible', timeout: 15000 })
+}
+
+export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  const token = await (dependencies.login || login)(page)
+  const api = (dependencies.createApiClient || createApiClient)({ token, record })
   caseRecord.checks.push({
     name: '真实登录成功',
     passed: Boolean(token),
@@ -76,7 +233,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   })
 
   if (caseId === 'WBF-001') {
-    const todoPanel = await openWorkbenchAndWaitForTodo(page)
+    const { todoPanel, todoPage } = await openWorkbenchAndWaitForTodo(
+      page, dependencies.openRoute || openRoute
+    )
+    const renderedRows = await todoPanel.locator('.todo-body .work-list-row').count()
+    caseRecord.checks.push({
+      name: '待办真实 GET 业务成功且 DOM 行数同步',
+      passed: renderedRows === todoPage.list.length,
+      details: `响应 total=${todoPage.total}，响应 rows=${todoPage.list.length}，DOM rows=${renderedRows}`
+    })
     const todoHeading = (await todoPanel.locator('h2').first().innerText()).trim()
     caseRecord.checks.push({
       name: '工作台/index 渲染待办中心（统一工作入口）',
@@ -95,17 +260,31 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'WBF-002') {
-    const todoPanel = await openWorkbenchAndWaitForTodo(page)
+    const { todoPanel, todoPage } = await openWorkbenchAndWaitForTodo(
+      page, dependencies.openRoute || openRoute
+    )
     const firstRow = todoPanel.locator('.todo-body .work-list-row').first()
-    const hasTodo = (await firstRow.count()) > 0
+    const renderedRows = await todoPanel.locator('.todo-body .work-list-row').count()
+    const hasTodo = renderedRows > 0
+    caseRecord.checks.push({
+      name: '待办真实 GET 业务成功且 DOM 行数同步',
+      passed: renderedRows === todoPage.list.length,
+      details: `响应 total=${todoPage.total}，响应 rows=${todoPage.list.length}，DOM rows=${renderedRows}`
+    })
     caseRecord.checks.push({
       name: '工作台待办清单存在可处理条目',
       passed: hasTodo,
-      details: hasTodo ? '存在至少一条待办' : '当前账号无待办（该分面为空）'
+      details: hasTodo
+        ? `真实响应存在 ${todoPage.list.length} 条当前页待办`
+        : `真实响应 total=${todoPage.total} 且当前页 rows=0（该分面为空）`
     })
     if (!hasTodo) {
-      caseRecord.notes.push('当前账号待办为空，弹窗交互无法取真实单据；保留清单渲染证据。')
-      await saveScreenshot(page, outputDir, 'wbf002-workbench-todo-empty', record)
+      caseRecord.notes.push(
+        `当前账号真实待办 total=${todoPage.total}/当前页 rows=${todoPage.list.length}，弹窗交互无法取真实单据；保留清单渲染证据。`
+      )
+      await (dependencies.saveScreenshot || saveScreenshot)(
+        page, outputDir, 'wbf002-workbench-todo-empty', record
+      )
       throw new Error('BLOCKED: 需先通过真实 BPM 流程创建待办，不得跳过弹窗验证')
     }
     const pathBefore = new URL(page.url()).pathname
@@ -126,96 +305,169 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: pathAfter === pathBefore && !pathAfter.includes(PROCESS_DETAIL_PATH),
       details: `点击前=${pathBefore}，点击后=${pathAfter}`
     })
-    await saveScreenshot(page, outputDir, 'wbf002-workbench-todo-dialog', record)
+    await (dependencies.saveScreenshot || saveScreenshot)(
+      page, outputDir, 'wbf002-workbench-todo-dialog', record
+    )
     caseRecord.evidence.push('WBF-002 校验待办在门户内弹窗打开原始单据，不离开工作台路由')
     return { token, api }
   }
 
   if (caseId === 'WBF-003') {
-    const todoPanel = await openWorkbenchAndWaitForTodo(page)
+    const { todoPanel, todoPage } = await openWorkbenchAndWaitForTodo(
+      page, dependencies.openRoute || openRoute
+    )
     const firstRow = todoPanel.locator('.todo-body .work-list-row').first()
-    const hasTodo = (await firstRow.count()) > 0
+    const renderedRows = await todoPanel.locator('.todo-body .work-list-row').count()
+    const hasTodo = renderedRows > 0
+    caseRecord.checks.push({
+      name: '待办真实 GET 业务成功且 DOM 行数同步',
+      passed: renderedRows === todoPage.list.length,
+      details: `响应 total=${todoPage.total}，响应 rows=${todoPage.list.length}，DOM rows=${renderedRows}`
+    })
     if (!hasTodo) {
+      caseRecord.notes.push(
+        `当前账号真实待办 total=${todoPage.total}/当前页 rows=${todoPage.list.length}，关闭刷新链路无可执行待办。`
+      )
       throw new Error('BLOCKED: 需先通过真实 BPM 流程创建待办，不得把未执行的刷新链路记为通过')
     }
     await firstRow.click()
     const dialog = page.locator('.todo-detail-dialog').first()
     await dialog.waitFor({ state: 'visible' })
     await waitForProcessDetail(dialog)
-    const refresh = page.waitForResponse(
-      response => response.url().includes('/workbench/todo/page') && response.ok()
-    )
+    const refresh = waitForTodoResponse(page)
     await dialog.locator('.el-dialog__headerbtn').first().click()
     await dialog.waitFor({ state: 'hidden' })
-    await refresh
+    const refreshed = await refresh
+    await waitForTodoContent(page, todoPanel, refreshed.todoPage.list.length)
+    const refreshedRows = await todoPanel.locator('.todo-body .work-list-row').count()
     const pathAfterClose = new URL(page.url()).pathname
     caseRecord.checks.push({
       name: '关闭处理弹窗后回到工作台并刷新待办（PB-352）',
-      passed: pathAfterClose === WORKBENCH_PATH,
-      details: `关闭后路由=${pathAfterClose}`
+      passed: pathAfterClose === WORKBENCH_PATH && refreshedRows === refreshed.todoPage.list.length,
+      details: `关闭后路由=${pathAfterClose}；刷新响应 total=${refreshed.todoPage.total}，响应 rows=${refreshed.todoPage.list.length}，DOM rows=${refreshedRows}`
     })
     caseRecord.checks.push({
       name: '待办中心仍然可用',
       passed: await todoPanel.isVisible(),
       details: '关闭后待办中心仍在门户内渲染'
     })
-    await saveScreenshot(page, outputDir, 'wbf003-workbench-todo-refresh', record)
+    await (dependencies.saveScreenshot || saveScreenshot)(
+      page, outputDir, 'wbf003-workbench-todo-refresh', record
+    )
     caseRecord.evidence.push('WBF-003 校验关闭处理弹窗后待办清单刷新且停留在工作台')
     return { token, api }
   }
 
   if (caseId === 'WBF-004') {
-    await openRoute(page, WORKBENCH_PATH)
+    const identity = await reportIdentity(api)
+    if (identity.gap) return reportPartial(token, api, caseRecord, [identity.gap])
+    const { pages, missing } = await captureWorkbenchReports(
+      page, () => (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH), identity.userId
+    )
+    if (missing.length) return reportPartial(token, api, caseRecord, missing)
     const reportPanel = page.locator('.report-panel').first()
     await reportPanel.waitFor({ state: 'visible' })
-    const reportTabs = reportPanel.locator('.panel-tabs button')
-    const labels = await reportTabs.allTextContents()
-    caseRecord.checks.push({
-      name: '工作台聚合日报、周报、月报（PB-359~365）',
-      passed: ['日报', '周报', '月报'].every((label) => labels.some((text) => text.includes(label))),
-      details: `报告页签=${labels.map((item) => item.trim()).join(' / ')}`
-    })
+    await waitForReportRendering(reportPanel)
+    for (const query of REPORT_QUERIES) {
+      const tab = reportPanel.locator('.panel-tabs button').filter({ hasText: query.label }).first()
+      await tab.click()
+      const titles = pages[query.type].list.slice(0, 5).map((row) => query.type === 'DAILY'
+        ? `${row.periodKey || '当前周期'} 项目日报`
+        : row.periodLabel || row.reportNo || query.label)
+      await page.waitForFunction(({ label, titles }) => {
+        const panel = document.querySelector('.report-panel')
+        const active = panel?.querySelector('.panel-tabs button.active')
+        const rendered = [...(panel?.querySelectorAll('.focus-body .work-list-row') || [])]
+          .filter((row) => row.querySelector('.el-tag'))
+          .map((row) => row.querySelector('strong')?.textContent?.trim())
+        return active?.textContent?.includes(label) && JSON.stringify(rendered) === JSON.stringify(titles) &&
+          (titles.length > 0 || Boolean(panel?.querySelector('.focus-body .el-empty')))
+      }, { label: query.label, titles }, { timeout: 15000 })
+      caseRecord.checks.push({
+        name: `${query.label}实际切换并匹配当前用户真实响应（PB-359~365）`,
+        passed: true,
+        details: `GET ${query.path}；${query.owner}=${identity.userId}；返回=${pages[query.type].list.length}，展示=${titles.length}`
+      })
+    }
     caseRecord.checks.push({
       name: '工作报告区块保持在统一门户内',
       passed: new URL(page.url()).pathname === WORKBENCH_PATH,
       details: `当前路由=${new URL(page.url()).pathname}`
     })
-    await saveScreenshot(page, outputDir, 'wbf004-work-report', record)
-    caseRecord.evidence.push('WBF-004 校验 PMS 日报与 CRM 周报/月报在工作台聚合展示')
-    return { token, api }
+    await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'wbf004-work-report', record)
+    caseRecord.evidence.push('WBF-004 已等待三份真实响应、核对请求及返回归属，实际切换三个页签并逐项匹配展示')
+    return reportPartial(token, api, caseRecord, [
+      '未使用受限账号和他人报告验证权限反例；空列表合法但不证明跨用户隔离'
+    ])
   }
 
   if (caseId === 'WBF-005') {
-    await openRoute(page, WORKBENCH_PATH)
+    const quickPreference = page.waitForResponse((response) =>
+      new URL(response.url()).pathname.endsWith('/system/user-preference/get') &&
+      new URL(response.url()).searchParams.get('key') === 'workbench.quick-actions' &&
+      response.request().method() === 'GET', { timeout: 15000 }).catch(() => null)
+    await (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH)
+    if (!await quickPreference) {
+      return reportPartial(token, api, caseRecord, ['快捷配置未捕获真实加载响应，未点击采购动作'])
+    }
     const quickActions = page.locator('.quick-actions-strip').first()
     await quickActions.waitFor({ state: 'visible' })
     const purchaseOrderAction = quickActions.getByRole('button', { name: '新增采购订单' })
     const purchaseExecutionAction = quickActions.getByRole('button', { name: '采购执行表' })
     const hasPurchaseOrder = (await purchaseOrderAction.count()) > 0
     const hasPurchaseExecution = (await purchaseExecutionAction.count()) > 0
+    if (!hasPurchaseOrder || !hasPurchaseExecution) {
+      caseRecord.notes.push('当前用户个人快捷配置未包含采购动作，需在“添加快捷”中启用后复测。')
+      await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'wbf005-procurement-actions-missing', record)
+      return reportPartial(token, api, caseRecord, ['个人快捷配置缺少采购动作，未修改共享用户配置'])
+    }
     caseRecord.checks.push({
       name: '采购快捷动作已提供（PB-367/368）',
       passed: hasPurchaseOrder && hasPurchaseExecution,
       details: `采购订单=${hasPurchaseOrder}，采购执行表=${hasPurchaseExecution}`
     })
-    if (!hasPurchaseOrder || !hasPurchaseExecution) {
-      caseRecord.notes.push('当前用户个人快捷配置未包含采购动作，需在“添加快捷”中启用后复测。')
-      await saveScreenshot(page, outputDir, 'wbf005-procurement-actions-missing', record)
-      return { token, api }
-    }
+    // Opening formDialog.vue immediately PUTs executeRuleByCode/erp_purchase_no.
+    // BillNoRule -> BasSequenceServiceImpl -> BasSequenceMapper increments mes_bas_sequence.
+    const purchaseGap = '新增采购订单未点击：formDialog.vue:740 打开即 PUT /mes/fillRule/executeRuleByCode/erp_purchase_no，分配正式号并递增 mes_bas_sequence；表单就绪及关闭未验收'
+    caseRecord.notes.push(purchaseGap)
     const pathBefore = new URL(page.url()).pathname
+    const executionResponse = page.waitForResponse((response) =>
+      new URL(response.url()).pathname.endsWith('/erp/purchase-order/page') &&
+      response.request().method() === 'GET', { timeout: 15000 }).catch(() => null)
     await purchaseExecutionAction.click()
     const executionDialog = page.getByRole('dialog', { name: '采购执行表' }).first()
     await executionDialog.waitFor({ state: 'visible' })
+    const response = await executionResponse
+    if (!response) {
+      await executionDialog.locator('.el-dialog__headerbtn').first().click()
+      await executionDialog.waitFor({ state: 'hidden' })
+      return reportPartial(token, api, caseRecord, [purchaseGap, '采购执行表未捕获真实列表响应'])
+    }
+    const executionPage = await readBrowserResponsePayload(response)
+    caseRecord.checks.push({
+      name: '采购执行表真实只读列表加载成功',
+      passed: response.ok() && executionPage?.code === 0 && Array.isArray(executionPage?.data?.list),
+      details: `GET /erp/purchase-order/page；code=${executionPage?.code}`
+    })
+    await executionDialog.locator('.el-loading-mask').first()
+      .waitFor({ state: 'hidden', timeout: 15000 })
+    await executionDialog.locator('.search-form').waitFor({ state: 'visible' })
     const pathAfter = new URL(page.url()).pathname
     caseRecord.checks.push({
       name: '采购执行表在门户弹窗打开（PB-368）',
       passed: pathAfter === pathBefore && (await executionDialog.isVisible()),
       details: `点击前=${pathBefore}，点击后=${pathAfter}`
     })
-    await saveScreenshot(page, outputDir, 'wbf005-procurement-dialog', record)
-    caseRecord.evidence.push('WBF-005 校验采购快捷动作以门户弹窗形式打开')
-    return { token, api }
+    await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'wbf005-procurement-dialog', record)
+    await executionDialog.locator('.el-dialog__headerbtn').first().click()
+    await executionDialog.waitFor({ state: 'hidden' })
+    caseRecord.checks.push({
+      name: '采购执行表关闭且保持工作台、不保存订单',
+      passed: new URL(page.url()).pathname === WORKBENCH_PATH,
+      details: '仅打开并关闭采购执行表；未点击新增、保存或正式取号'
+    })
+    caseRecord.evidence.push('WBF-005 仅验收采购执行表真实列表加载、门户弹窗及关闭；未打开有取号副作用的新增订单')
+    return reportPartial(token, api, caseRecord, [purchaseGap])
   }
 
   if (caseId === 'WBF-006') {
@@ -335,14 +587,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'WBF-008') {
-    // 报表统计/提醒汇总与个人周报格式（PB-363~365）
-    const preferenceKey = 'workbench.report.weekly-metrics'
-    const previousPreference = await api.get(
-      `/system/user-preference/get?key=${encodeURIComponent(preferenceKey)}`
+    const gaps = ['共享用户未改选或保存周报格式；未验证精确保存值、刷新后回显、用户隔离及完整偏好还原',
+      '提醒仅核对文案，未逐项核对已填/未填及待审批数值']
+    const identity = await reportIdentity(api)
+    if (identity.gap) return reportPartial(token, api, caseRecord, [...gaps, identity.gap])
+    const { missing } = await captureWorkbenchReports(
+      page, () => (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH), identity.userId
     )
-    await openRoute(page, WORKBENCH_PATH)
+    if (missing.length) return reportPartial(token, api, caseRecord, [...gaps, ...missing])
     const reportPanel = page.locator('.report-panel').first()
     await reportPanel.waitFor({ state: 'visible' })
+    await waitForReportRendering(reportPanel)
     const reminderText = await reportPanel.locator('.focus-body').innerText()
     const reminderKinds = ['日报', '周报', '月报'].filter((kind) => reminderText.includes(kind))
     caseRecord.checks.push({
@@ -368,29 +623,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       await dialog.waitFor({ state: 'visible' })
       const checkboxes = dialog.locator('.el-checkbox')
       const checkboxCount = await checkboxes.count()
-      await checkboxes.first().click()
-      await dialog.getByRole('button', { name: '保存' }).first().click()
-      await dialog.waitFor({ state: 'hidden' })
-      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
-      const savedPreference = await api.get(
-        `/system/user-preference/get?key=${encodeURIComponent(preferenceKey)}`
-      )
       caseRecord.checks.push({
-        name: '周报格式按用户维度持久化（PB-363）',
-        passed: typeof savedPreference?.data === 'string' && savedPreference.data.length > 0,
-        details: `可选字段数=${checkboxCount}，保存值=${JSON.stringify(savedPreference?.data)}`
+        name: '周报格式弹窗只读展示字段选项（不证明持久化）',
+        passed: checkboxCount === 4,
+        details: `可选字段数=${checkboxCount}；未修改共享用户偏好`
       })
+      await dialog.getByRole('button', { name: '取消', exact: true }).click()
+      await dialog.waitFor({ state: 'hidden' })
     }
-    await saveScreenshot(page, outputDir, 'wbf008-report-reminders-format', record)
-    caseRecord.evidence.push('WBF-008 校验报表提醒汇总与个人周报格式保存')
-    // 还原用例开始前的个人格式偏好
-    if (typeof previousPreference?.data === 'string' && previousPreference.data.length > 0) {
-      await api.put(
-        `/system/user-preference/save?key=${encodeURIComponent(preferenceKey)}`,
-        { value: previousPreference.data }
-      )
-    }
-    return { token, api }
+    await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'wbf008-report-reminders-format', record)
+    caseRecord.evidence.push('WBF-008 仅验收已加载提醒文案和格式弹窗只读打开/取消，不证明保存或刷新持久化')
+    return reportPartial(token, api, caseRecord, gaps)
   }
 
   if (caseId === 'WBF-009') {
@@ -682,63 +925,81 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'WBF-012') {
-    // 报表统计（PB-364）：按周期与数据权限范围汇总日报/周报/月报口径。
-    await openRoute(page, WORKBENCH_PATH)
+    const identity = await reportIdentity(api)
+    if (identity.gap) return reportPartial(token, api, caseRecord, [identity.gap])
+    const initial = await captureWorkbenchReports(
+      page, () => (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH), identity.userId
+    )
+    if (initial.missing.length) return reportPartial(token, api, caseRecord, initial.missing)
     const reportPanel = page.locator('.report-panel').first()
     await reportPanel.waitFor({ state: 'visible' })
-    await reportPanel.getByRole('button', { name: '统计' }).first().click()
+    await waitForReportRendering(reportPanel)
     const statsDialog = page.locator('.report-stats-dialog').first()
-    await statsDialog.waitFor({ state: 'visible' })
-
-    const rowLabels = await statsDialog.locator('.el-table__body tr td:first-child').allInnerTexts()
-    const normalizedRows = rowLabels.map((text) => text.trim()).filter(Boolean)
-    caseRecord.checks.push({
-      name: '报表统计覆盖日报/周报/月报口径（PB-364）',
-      passed: ['日报', '周报', '月报'].every((label) => normalizedRows.includes(label)),
-      details: `统计行=${normalizedRows.join('/') || '（无）'}`
-    })
-
-    await statsDialog
-      .locator('label.el-radio-button')
-      .filter({ hasText: '本季度' })
-      .first()
-      .click()
-    await page.waitForTimeout(300)
-    caseRecord.checks.push({
-      name: '报表统计支持周期切换（PB-364）',
-      passed: (await statsDialog
-        .locator('label.el-radio-button')
-        .filter({ hasText: '本季度' })
-        .first()
-        .getAttribute('class') || '').includes('is-active'),
-      details: '切换到本季度统计周期'
-    })
-
-    await statsDialog
-      .locator('label.el-radio-button')
-      .filter({ hasText: '团队（按数据权限）' })
-      .first()
-      .click()
-    await page.waitForTimeout(300)
-    caseRecord.checks.push({
-      name: '报表统计支持按数据权限范围查看（PB-364）',
-      passed: (await statsDialog
-        .locator('label.el-radio-button')
-        .filter({ hasText: '团队（按数据权限）' })
-        .first()
-        .getAttribute('class') || '').includes('is-active'),
-      details: '团队范围由后端数据权限限定，工作台不放大可见范围'
-    })
-
-    await statsDialog.getByRole('button', { name: '关闭', exact: true }).click()
-    await statsDialog.waitFor({ state: 'hidden' })
+    const gaps = ['未使用无权限账号及他人报告验证团队权限反例',
+      'CRM Mapper 当前强制仅本人；PMS getReportPage 未见团队数据权限过滤，不能声明团队隔离已通过']
+    const steps = [
+      { period: 'month', scope: 'self', action: () => reportPanel.getByRole('button', { name: '统计' }).first().click() },
+      { period: 'quarter', scope: 'self', label: '本季度' },
+      { period: 'year', scope: 'self', label: '本年度' }
+    ]
+    // Broad PMS reads are safe only for an explicitly unrestricted account.
+    if (identity.unrestricted) {
+      steps.push({ period: 'year', scope: 'team', label: '团队（按数据权限）' })
+      steps.push({ period: 'year', scope: 'self', label: '本人' })
+    } else {
+      gaps.push('未点击团队：PMS 团队权限未确认，当前账号无 *:*:* 全范围授权')
+    }
+    try {
+      for (const step of steps) {
+        const captured = await captureWorkbenchReports(page, step.action || (() => statsDialog
+          .locator('label.el-radio-button').filter({ hasText: step.label }).first().click()),
+        identity.userId, step.scope)
+        if (captured.missing.length) {
+          gaps.push(...captured.missing)
+          break
+        }
+        await statsDialog.waitFor({ state: 'visible' })
+        await statsDialog.locator('.el-loading-mask').waitFor({ state: 'hidden', timeout: 15000 })
+        const today = await page.evaluate(() => {
+          const now = new Date()
+          return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+        })
+        const expected = summarizeWorkbenchReports(captured.pages, step.period, today)
+        const periodLabel = { month: '本月', quarter: '本季度', year: '本年度' }[step.period]
+        const scopeLabel = step.scope === 'self' ? '本人' : '团队（按数据权限）'
+        await page.waitForFunction(({ expected, periodLabel, scopeLabel }) => {
+          const rows = [...document.querySelectorAll('.report-stats-dialog .el-table__body tr')]
+            .map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent.trim()))
+          const selected = [...document.querySelectorAll('.report-stats-dialog label.el-radio-button.is-active')]
+            .map((label) => label.textContent.trim())
+          return selected.includes(periodLabel) && selected.includes(scopeLabel) &&
+            JSON.stringify(rows) === JSON.stringify(expected)
+        }, { expected, periodLabel, scopeLabel }, { timeout: 15000 })
+        caseRecord.checks.push({
+          name: `${step.period}/${step.scope}真实范围请求与统计数值一致（PB-364）`,
+          passed: true,
+          details: `三份 GET 的归属参数已核对；合计/待审批/已通过/退回逾期=${JSON.stringify(expected)}；仅核对返回页`
+        })
+        caseRecord.evidence.push(`WBF-012 已核对 ${step.period}/${step.scope} 三份 GET 归属参数、加载完成和三行四项数值`)
+        for (const query of REPORT_QUERIES) {
+          const data = captured.pages[query.type]
+          if (data.total > data.list.length) gaps.push(
+            `${step.period}/${step.scope}/${query.label}仅加载 ${data.list.length}/${data.total} 条，完整汇总未验收`
+          )
+        }
+      }
+      await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'wbf012-report-stats', record)
+    } finally {
+      if (await statsDialog.isVisible()) {
+        await statsDialog.getByRole('button', { name: '关闭', exact: true }).click()
+        await statsDialog.waitFor({ state: 'hidden' })
+      }
+    }
     caseRecord.checks.push({
       name: '关闭统计后仍停留在工作台',
       passed: new URL(page.url()).pathname === WORKBENCH_PATH,
       details: `当前路由=${new URL(page.url()).pathname}`
     })
-    await saveScreenshot(page, outputDir, 'wbf012-report-stats', record)
-    caseRecord.evidence.push('WBF-012 校验报表统计周期切换与数据权限范围口径')
-    return { token, api }
+    return reportPartial(token, api, caseRecord, gaps)
   }
 }
