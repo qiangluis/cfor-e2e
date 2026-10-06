@@ -915,7 +915,7 @@
         {
           "id": "ERP-SALES-001",
           "title": "客户、商机、合同审批通过并确认签署",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["客户档案、商机状态、合同提醒和 BPM 标准角色已就绪"],
           "routes": ["/crm/customer", "/crm/business", "/crm/contract"],
           "assertions": [
@@ -930,7 +930,7 @@
         {
           "id": "ERP-SALES-002",
           "title": "合同确认后生成应收、收款并自动核销",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["ERP 结算账户", "合同已确认签署"],
           "routes": ["/finance/finReceivable", "/finance/finReceipt"],
           "assertions": ["应收来源唯一", "收款确认", "收付款自动核销", "核销金额不超应收"],
@@ -940,7 +940,7 @@
         {
           "id": "ERP-SALES-003",
           "title": "销售订单审核后按 WMS ATP 分支发货或人工转生产",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["合同审批通过且确认签署", "WMS 可用库存为唯一判断", "发货通知必经"],
           "routes": ["/erp/sale/order", "/mes/wms/shipment-notice"],
           "assertions": [
@@ -957,7 +957,7 @@
         {
           "id": "ERP-SALES-004",
           "title": "发货通知、拣货、销售出库检和发货完成回写",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["ERP-SALES-003 PASS"],
           "routes": ["/mes/wms/shipment-notice", "/mes/wms/outbound", "/quality"],
           "assertions": [
@@ -1027,7 +1027,7 @@
         {
           "id": "ERP-SALES-007",
           "title": "销售类型与销售计划类型正式单据快照",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "字典 erp_sale_type 与 crm_sales_plan_type 已启用",
             "具备销售订单与 CRM 销售计划维护权限"

@@ -16,6 +16,13 @@ export const cases = [
 ]
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+  if (caseId === 'FMS-003' || caseId === 'FMS-004') {
+    return {
+      notImplemented: true,
+      note: `${caseId} 尚未实现真实业务步骤，不能以账套存在或通用检查作为通过证据`
+    }
+  }
+
   const token = await login(page)
   const api = createApiClient({ token, record })
   const accountSets = await api.getBusiness('/fms/config/account-set/list')
