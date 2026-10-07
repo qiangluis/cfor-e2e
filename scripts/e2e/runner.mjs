@@ -152,6 +152,16 @@ function clearCheckpoint () {
   try { fs.unlinkSync(checkpointPath()) } catch {}
 }
 
+function filterAllowedRuntimeErrors (runtimeErrors, allowRuntimeErrors = {}) {
+  return Object.fromEntries(
+    Object.entries(runtimeErrors).map(([type, errors]) => {
+      const allow = allowRuntimeErrors[type]
+      if (typeof allow !== 'function') return [type, errors]
+      return [type, errors.filter((error) => !allow(error))]
+    })
+  )
+}
+
 async function loadSuite (suiteId) {
   const file = suiteFiles[suiteId] || `${suiteId}.mjs`
   const target = path.join(here, 'suites', file)
@@ -334,12 +344,16 @@ async function main () {
             5000
           )
           const hasAssertions = caseRecord.checks.length + check.steps.length > 0
-          caseRecord.runtimeErrors = {
+          const runtimeErrors = {
             console: record.consoleErrors.slice(errorsBefore.console),
             page: record.pageErrors.slice(errorsBefore.page),
             api: record.failedApiResponses.slice(errorsBefore.api),
             request: record.requestFailures.slice(errorsBefore.request)
           }
+          caseRecord.runtimeErrors = filterAllowedRuntimeErrors(
+            runtimeErrors,
+            result?.allowRuntimeErrors
+          )
           caseRecord.checks.push({
             name: '本用例无控制台错误、页面异常、浏览器业务 API 错误或请求失败',
             passed: Object.values(caseRecord.runtimeErrors).every((items) => items.length === 0),

@@ -17,12 +17,54 @@ export const cases = [
 
 const payloadData = (payload) => payload?.data ?? payload
 
+export const outsourceRoute = '/mes/produce/outsource/outsource-work'
+export const outsourceReadySelector = 'button:has-text("新增")'
+export const paymentRequestRoute = '/mes/produce/outsource/payment-request'
+export const paymentRequestReadySelector = 'button:has-text("新增")'
+export const paymentSourceReadySelector = 'button:has-text("选委外应付")'
+
+export const hasOutsourceBusinessFixture = (rows) =>
+  Array.isArray(rows) && rows.some((row) => row?.id)
+export const hasOutsourcePaymentFixture = (rows) =>
+  Array.isArray(rows) && rows.some((row) =>
+    row?.entryId && Number.isFinite(Number(row.uncheckedAmt)) && Number(row.uncheckedAmt) !== 0
+  )
+
+export const outsourceListRows = (response) => {
+  const data = response?.data ?? response
+  if (Array.isArray(data)) return data
+  if (Array.isArray(data?.records)) return data.records
+  if (Array.isArray(data?.list)) return data.list
+  throw new Error('委外查询必须返回数组、data.records 或 data.list，不能将无效响应当作空前置')
+}
+
+const openOutsourceList = async (page) => {
+  await openRoute(page, outsourceRoute, { readySelector: outsourceReadySelector })
+  await page.getByPlaceholder('请输入委外单号', { exact: true }).waitFor({ state: 'visible' })
+  await page.locator('.vxe-header--column').filter({ hasText: '总金额' }).first().waitFor({ state: 'visible' })
+  await page.locator('.vxe-loading:visible').waitFor({ state: 'hidden' })
+}
+
+const openPaymentRequest = async (page) => {
+  await openRoute(page, paymentRequestRoute, { readySelector: paymentRequestReadySelector })
+  await page.getByPlaceholder('请输入付款单号', { exact: true }).waitFor({ state: 'visible' })
+  await page.locator('.vxe-loading:visible').waitFor({ state: 'hidden' })
+}
+
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
 
   const outsourcePage = await api.getBusiness('/mes/prodOutsource/list/dictText?pageNo=1&pageSize=100')
-  const outsourceRows = asList(payloadData(outsourcePage?.data ?? outsourcePage))
+  const targetedCase = [
+    'PB147-OUTSOURCE-001',
+    'PB148-OUTSOURCE-001',
+    'PB152-OUTSOURCE-NG-HANDLING-001',
+    'PB156-OUTSOURCE-PAYMENT-001'
+  ].includes(caseId)
+  const outsourceRows = targetedCase
+    ? outsourceListRows(outsourcePage)
+    : asList(payloadData(outsourcePage?.data ?? outsourcePage))
   if (caseId === 'PB148-OUTSOURCE-001') {
     const sample = outsourceRows[0]
     if (sample?.id) {
@@ -42,25 +84,22 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `actionLogs=${logRows.length}`
       })
     } else {
-      caseRecord.checks.push({
-        name: '委外生命周期字段和动作审计接口契约',
-        passed: true,
-        details: '当前租户无委外订单，写侧状态流转由后端定向测试覆盖'
-      })
+      caseRecord.notes.push('缺少委外订单，未验证生命周期字段、动作审计和状态流转')
     }
-    await openRoute(page, '/mes/produce/outsource/outsource-work')
+    await openOutsourceList(page)
     const bodyText = await page.locator('body').innerText()
+    const hasAddButton = await page.locator(outsourceReadySelector).count() > 0
     caseRecord.checks.push({
-      name: '委外页面具备审批、下达和生命周期审计入口',
+      name: '委外列表真实渲染单据查询和金额列',
       passed:
-        page.url().includes('/mes/produce/outsource/outsource-work') &&
-        bodyText.includes('提交审批') &&
-        bodyText.includes('生命周期审计'),
+        page.url().includes(outsourceRoute) &&
+        hasAddButton &&
+        bodyText.includes('总金额'),
       details: page.url()
     })
     await saveScreenshot(page, outputDir, 'pb148-outsource-lifecycle', record)
-    caseRecord.evidence.push('委外生命周期字段、动作审计接口和审批/下达页面入口')
-    return { token, api }
+    caseRecord.evidence.push('委外列表页面截图；有样本时读取生命周期字段和动作审计')
+    return { token, api, partial: true, note: '已验证列表入口；审批、下达及十态流转未执行，待专用业务夹具复测' }
   }
 
   if (caseId === 'PB149-OUTSOURCE-WIP-001') {
@@ -332,12 +371,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const rulePage = await api.getBusiness(
       '/mes/quality-ng-handle-rule/page?pageNo=1&pageSize=100&status=0'
     )
-    const ruleRows = asList(payloadData(rulePage?.data ?? rulePage))
+    const ruleRows = outsourceListRows(rulePage)
     const allowedActions = ['REWORK', 'REPAIR', 'CONCESSION', 'RETURN', 'SCRAP']
-    caseRecord.checks.push({
+    if (ruleRows.length) caseRecord.checks.push({
       name: '委外收货质检处置规则引用质量基础且动作受控',
       passed:
-        ruleRows.length === 0 ||
         ruleRows.every(
           (row) =>
             allowedActions.includes(String(row.coreAction || '')) &&
@@ -349,14 +387,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const ngBillPage = await api.getBusiness(
       '/mes/stkIo/list/dictText?pageNo=1&pageSize=100&srcBillType=MesQualityNgRecords'
     )
-    const ngBillRows = asList(payloadData(ngBillPage?.data ?? ngBillPage))
+    const ngBillRows = outsourceListRows(ngBillPage)
     const reverseRows = ngBillRows.filter((row) =>
       ['299', '210', '199'].includes(String(row.stockIoType || ''))
     )
-    caseRecord.checks.push({
+    if (reverseRows.length) caseRecord.checks.push({
       name: '不合格反向/返工单据保留不合格记录主来源并使用正确库存类型',
       passed:
-        reverseRows.length === 0 ||
         reverseRows.every(
           (row) =>
             String(row.srcBillType || '') === 'MesQualityNgRecords' &&
@@ -364,25 +401,31 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ),
       details: `reverseRows=${reverseRows.length}`
     })
-    caseRecord.checks.push({
+    if (reverseRows.length) caseRecord.checks.push({
       name: '反向处置仅生成待审核草稿，不绕过审批与库存审核',
-      passed: reverseRows.length === 0 || reverseRows.every((row) => Number(row.isEffective || 0) === 0),
+      passed: reverseRows.every((row) => Number(row.isEffective || 0) === 0),
       details: reverseRows.length ? JSON.stringify(reverseRows.map((row) => row.isEffective)) : '当前租户无不合格反向单'
     })
 
-    await openRoute(page, '/mes/produce/outsource/outsource-work')
+    await openOutsourceList(page)
     const bodyText = await page.locator('body').innerText()
+    const hasAddButton = await page.locator(outsourceReadySelector).count() > 0
     caseRecord.checks.push({
-      name: '委外订单收货后可追溯质检与不合格处置',
+      name: '委外列表真实渲染单据查询和金额列',
       passed:
-        page.url().includes('/mes/produce/outsource/outsource-work') &&
-        bodyText.includes('委外') &&
-        (bodyText.includes('收货') || bodyText.includes('完工')),
+        page.url().includes(outsourceRoute) &&
+        hasAddButton &&
+        bodyText.includes('总金额'),
       details: page.url()
     })
     await saveScreenshot(page, outputDir, 'pb152-outsource-ng-handling', record)
-    caseRecord.evidence.push('不合格处置规则、质量来源反向草稿、110 收货追溯与委外收货页面截图')
-    return { token, api }
+    caseRecord.evidence.push(`委外列表截图，规则=${ruleRows.length}，反向单=${reverseRows.length}；未执行不合格处置写侧`)
+    return {
+      token,
+      api,
+      partial: true,
+      note: `委外订单=${outsourceRows.length}，处置规则=${ruleRows.length}，反向单=${reverseRows.length}；未执行专用夹具的处置与审核链路，保留 PARTIAL`
+    }
   }
 
   if (caseId === 'PB157-OUTSOURCE-CLOSE-001') {
@@ -480,7 +523,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: outsourceInvoices.every((row) => String(row.srcBillType) === 'MesOutsourcePayable'),
       details: `outsourceInvoices=${outsourceInvoices.length}`
     })
-    await openRoute(page, '/erp/purchase/invoice')
+    await openRoute(page, '/erp/purchase/invoice', {
+      readyText: '待开票对账',
+      readyTimeoutMs: 30000,
+      retries: 1
+    })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '采购发票页面提供发票号与委外应付选单入口',
@@ -499,11 +546,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const sourcePage = await api.getBusiness(
       '/finance/finPayable/outsourcePayableSource/dictText?pageNo=1&pageSize=100'
     )
-    const sourceRows = asList(payloadData(sourcePage?.data ?? sourcePage))
-    caseRecord.checks.push({
+    const sourceRows = outsourceListRows(sourcePage)
+    if (sourceRows.length) caseRecord.checks.push({
       name: '委外可付款来源返回205应付明细与未核销余额',
       passed:
-        sourceRows.length === 0 ||
         sourceRows.every(
           (row) =>
             Object.prototype.hasOwnProperty.call(row, 'entryId') &&
@@ -515,7 +561,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const paymentPage = await api.getBusiness(
       '/finance/finPayment/list?pageNo=1&pageSize=100&isRequest=1'
     )
-    const paymentRows = asList(payloadData(paymentPage?.data ?? paymentPage))
+    const paymentRows = outsourceListRows(paymentPage)
     caseRecord.checks.push({
       name: '付款申请列表可读且区分 isRequest=1',
       passed:
@@ -523,29 +569,28 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         paymentRows.every((row) => Number(row.isRequest) === 1),
       details: `rows=${paymentRows.length}`
     })
-    await openRoute(page, '/mes/produce/outsource/payment-request')
+    await openPaymentRequest(page)
+    await page.locator(paymentRequestReadySelector).first().click()
+    await page.locator(paymentSourceReadySelector).first().waitFor({ state: 'visible' })
     const bodyText = await page.locator('body').innerText()
+    const hasPaymentSourceButton = await page.locator(paymentSourceReadySelector).count() > 0
     caseRecord.checks.push({
       name: '委外付款申请页面提供选委外应付入口',
       passed:
-        page.url().includes('/mes/produce/outsource/payment-request') &&
+        page.url().includes(paymentRequestRoute) &&
         bodyText.includes('付款申请') &&
-        bodyText.includes('选委外应付'),
+        hasPaymentSourceButton,
       details: page.url()
     })
-    caseRecord.checks.push({
-      name: '委外付款核销供应链路复用 fin_payment/fin_payable_check',
-      passed: true,
-      details: '源单类型 FinPayable:205，付款明细按应付分录核销，余额回写走 FinPayableCheck 终审链路'
-    })
-    caseRecord.checks.push({
-      name: '委外付款明细允许负数罚款单且保留原始金额',
-      passed: true,
-      details: '应付侧按绝对值冲减未核销余额，付款侧保留负数原始金额并推进付款执行状态；金额为0或超过未核销余额时拒绝'
-    })
+    caseRecord.notes.push(`可付款前置=${hasOutsourcePaymentFixture(sourceRows)}；未保存付款申请、执行核销或验证负数罚款金额`)
     await saveScreenshot(page, outputDir, 'pb156-outsource-payment', record)
-    caseRecord.evidence.push('委外可付款来源、付款申请列表、委外付款申请页面、负数罚款单核销链路截图')
-    return { token, api }
+    caseRecord.evidence.push('委外可付款来源、付款申请列表和新增表单选委外应付按钮截图；未保存表单')
+    return {
+      token,
+      api,
+      partial: true,
+      note: '已验证选委外应付入口；付款与核销写侧未执行，待专用委外应付夹具复测'
+    }
   }
 
   if (caseId === 'PB154-OUTSOURCE-PAYABLE-001') {
@@ -636,8 +681,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   const servicePage = await api.getBusiness(
     "/mes/basMaterial/list/dictText?pageNo=1&pageSize=100&inventoryNature=SERVICE"
   )
-  const serviceRows = asList(payloadData(servicePage?.data ?? servicePage))
-  caseRecord.checks.push({
+  const serviceRows = outsourceListRows(servicePage)
+  if (serviceRows.length) caseRecord.checks.push({
     name: '加工费存货选择器只返回服务类存货',
     passed:
       Array.isArray(serviceRows) &&
@@ -679,24 +724,26 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `auditRows=${auditRows.length}`
     })
   } else {
-    caseRecord.checks.push({
-      name: '委外订单详情与价格审计接口字段契约',
-      passed: true,
-      details: '当前租户无委外订单，写侧字段由后端测试与接口模型覆盖'
-    })
+    caseRecord.notes.push('缺少委外订单，未验证详情金额快照、价格调整和价格审计')
   }
 
-  await openRoute(page, '/mes/produce/outsource/outsource-work')
+  await openOutsourceList(page)
   const bodyText = await page.locator('body').innerText()
+  const hasAddButton = await page.locator(outsourceReadySelector).count() > 0
   caseRecord.checks.push({
-    name: '委外订单页面真实渲染金额和价格调整入口',
+    name: '委外列表真实渲染新增入口和总金额列',
     passed:
-      page.url().includes('/mes/produce/outsource/outsource-work') &&
-      bodyText.includes('委外') &&
+      page.url().includes(outsourceRoute) &&
+      hasAddButton &&
       bodyText.includes('总金额'),
     details: page.url()
   })
   await saveScreenshot(page, outputDir, 'pb147-outsource-pricing', record)
-  caseRecord.evidence.push('委外列表、服务类存货过滤、订单/明细金额快照、价格审计接口和页面截图')
-  return { token, api }
+  caseRecord.evidence.push(`委外列表和页面截图，服务存货=${serviceRows.length}；有样本时读取金额快照和价格审计`)
+  return {
+    token,
+    api,
+    partial: true,
+    note: `委外订单前置=${hasOutsourceBusinessFixture(outsourceRows)}，服务存货=${serviceRows.length}；价格调整写侧未执行，保留 PARTIAL`
+  }
 }

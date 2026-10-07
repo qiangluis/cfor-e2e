@@ -12,6 +12,79 @@ export const cases = [
   'ERP-SALES-007'
 ]
 
+export const priceCenterRoute = '/settings/erp/price-center'
+export const priceCenterReadySelector = 'button:has-text("统一取价")'
+const fixtureRemark = 'ERP-SALES-006 automated e2e'
+
+export const isSalesPriceFixture = (row, priority) =>
+  row?.id != null &&
+  row.priceDirection === 'SALE' &&
+  Number(row.status) === 1 &&
+  Number(row.priority) === Number(priority) &&
+  row.remark === fixtureRemark &&
+  /^(E2E_SALE_[A-Z0-9]+|AUTOTEST[-_]ERP[-_]SALES[-_]006[-_][A-Za-z0-9_-]+)$/.test(row.code)
+
+const disabledScheme = (scheme) => ({
+  id: scheme.id,
+  priceDirection: scheme.priceDirection,
+  code: scheme.code,
+  name: scheme.name,
+  priority: scheme.priority,
+  businessTypeCode: scheme.businessTypeCode,
+  currencyCode: scheme.currencyCode,
+  status: 0,
+  remark: scheme.remark
+})
+
+export async function stopPreviousSalesPriceFixtures(api, priority, caseRecord) {
+  const fixtures = []
+  // Read all pages before disabling rows, otherwise status filtering shifts pages.
+  for (let pageNo = 1; ; pageNo++) {
+    const response = await api.getBusiness(
+      `/erp/price-scheme/page?pageNo=${pageNo}&pageSize=100&priceDirection=SALE&status=1`
+    )
+    const data = response?.data
+    if (!Array.isArray(data?.list) || !Number.isInteger(data.total) || data.total < 0) {
+      throw new Error('价格方案分页响应结构无效，未停用任何已有方案')
+    }
+    fixtures.push(...data.list.filter((row) => isSalesPriceFixture(row, priority)))
+    if (pageNo * 100 >= data.total) break
+    if (data.list.length === 0) throw new Error('价格方案分页提前为空，未停用任何已有方案')
+  }
+  for (const scheme of fixtures) {
+    await api.putBusiness('/erp/price-scheme/update', disabledScheme(scheme))
+    caseRecord.notes.push(`已停用 ERP-SALES-006 同优先级历史测试夹具 ${scheme.code} (${scheme.id})`)
+  }
+}
+
+export async function withSalesPriceFixture(api, scheme, caseRecord, run) {
+  let id
+  let failed = false
+  try {
+    id = (await api.postBusiness('/erp/price-scheme/create', scheme))?.data
+    if (!/^[1-9]\d*$/.test(String(id))) throw new Error('价格方案创建未返回有效 ID')
+    return await run(id)
+  } catch (error) {
+    failed = true
+    throw error
+  } finally {
+    if (/^[1-9]\d*$/.test(String(id))) {
+      try {
+        await api.putBusiness('/erp/price-scheme/update', disabledScheme({ ...scheme, id }))
+        caseRecord.notes.push(`已停用 ERP-SALES-006 本轮专用方案 ${scheme.code} (${id})`)
+      } catch (error) {
+        caseRecord.checks.push({
+          name: 'ERP-SALES-006 专用价格方案已停用',
+          passed: false,
+          details: `schemeId=${id}, ${error.message}`
+        })
+        caseRecord.notes.push(`价格方案清理失败：${error.message}`)
+        if (!failed) throw error
+      }
+    }
+  }
+}
+
 const stableId = (value) =>
   (typeof value === 'string' && /^[1-9]\d*$/.test(value)) ||
   (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
@@ -603,27 +676,25 @@ export const runCase = async (
     const materials = Array.isArray(materialResponse?.data) ? materialResponse.data : []
     const material = materials.find((item) => item?.id && item?.unitId)
     if (!material) {
-      caseRecord.checks.push({
-        name: '价格中心取价需要启用存货',
-        passed: true,
-        details: '当前租户无启用存货，字段与计算契约由 ERP 模块单测保证'
-      })
-      return { token, api }
+      caseRecord.notes.push('当前租户无启用存货，未执行真实取价和报价/订单快照，保留 PARTIAL')
+      return { token, api, partial: true }
     }
 
     const schemeCode = `E2E_SALE_${Date.now().toString(36).toUpperCase()}`
-    const schemeId = (
-      await api.postBusiness('/erp/price-scheme/create', {
-        priceDirection: 'SALE',
-        code: schemeCode,
-        name: 'E2E 销售价格方案',
-        priority: 1,
-        businessTypeCode: 'NORMAL',
-        currencyCode: 'CNY',
-        status: 1,
-        remark: 'ERP-SALES-006 automated e2e'
-      })
-    )?.data
+    const scheme = {
+      priceDirection: 'SALE',
+      code: schemeCode,
+      name: 'E2E 销售价格方案',
+      // Keep the fixture ahead of existing tenant schemes so inquiry proves
+      // the version created by this case instead of an older equal-priority rule.
+      priority: 0,
+      businessTypeCode: 'NORMAL',
+      currencyCode: 'CNY',
+      status: 1,
+      remark: fixtureRemark
+    }
+    await stopPreviousSalesPriceFixtures(api, scheme.priority, caseRecord)
+    return withSalesPriceFixture(api, scheme, caseRecord, async (schemeId) => {
     const versionId = (
       await api.postBusiness('/erp/price-scheme/publish', {
         schemeId,
@@ -667,26 +738,18 @@ export const runCase = async (
       details: JSON.stringify(inquiry)
     })
 
-    await openRoute(page, '/erp/settings/price-center')
+    await openRoute(page, priceCenterRoute, { readySelector: priceCenterReadySelector })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: 'ERP 设置下存在统一价格中心页面',
-      passed: bodyText.includes('价格中心') && bodyText.includes('取价'),
-      details: bodyText.includes('价格中心') ? '命中价格中心页面' : '未命中价格中心页面'
+      passed:
+        new URL(page.url()).pathname === priceCenterRoute &&
+        bodyText.includes('方案编码') &&
+        bodyText.includes('统一取价'),
+      details: page.url()
     })
     await saveScreenshot(page, outputDir, 'erp-sales-price-center', record)
 
-    await api.putBusiness('/erp/price-scheme/update', {
-      id: schemeId,
-      priceDirection: 'SALE',
-      code: schemeCode,
-      name: 'E2E 销售价格方案',
-      priority: 1,
-      businessTypeCode: 'NORMAL',
-      currencyCode: 'CNY',
-      status: 0,
-      remark: 'ERP-SALES-006 automated e2e'
-    })
     caseRecord.evidence.push(
       `PB-047/048/056 价格中心方案 ${schemeId} 发布版本 ${versionId} 后取价命中 ${inquiry?.price}`
     )
@@ -698,12 +761,8 @@ export const runCase = async (
       (item) => item?.customerId && item?.quoteQualificationStatus === 2
     )
     if (!approvedBusiness) {
-      caseRecord.checks.push({
-        name: '报价明细取价快照需要已通过报价资格的商机',
-        passed: true,
-        details: '当前租户无报价资格已通过的商机，报价/合同快照契约由 CRM 模块单测保证'
-      })
-      return { token, api }
+      caseRecord.notes.push('当前租户无报价资格已通过的商机，未执行报价/合同及订单快照，保留 PARTIAL')
+      return { token, api, partial: true }
     }
     const quoteId = (
       await api.postBusiness('/crm/quote/create', {
@@ -740,7 +799,9 @@ export const runCase = async (
     caseRecord.evidence.push(
       `PB-047/048 报价 ${quoteId} 明细落取价快照 scheme=${quoteProduct?.priceSchemeId} version=${quoteProduct?.priceVersionId}`
     )
-    return { token, api }
+    caseRecord.notes.push('已验证报价明细快照；销售/采购订单及合同快照未执行，不能登记完整验收')
+    return { token, api, partial: true }
+    })
   }
 
   if (erpSalesReadOnlyCases.includes(caseId)) {

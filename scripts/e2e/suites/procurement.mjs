@@ -7,6 +7,41 @@ import { databaseConfigured, assertLocalWriteSafety, runReadOnlySql } from '../l
 import { createPurchaseReader } from '../fixtures/purchase-reader.mjs'
 import { collectPagePerformance } from '../lib/performance.mjs'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { findMenuRouteByComponent, isStableId } from './base-partner.mjs'
+import {
+  cases as procurementFoundationReadonlyCases,
+  runProcurementFoundationReadonlyContract
+} from './procurement-foundation-readonly.mjs'
+
+export const procurementReadOnlyViews = Object.freeze({
+  'PROC-006': {
+    component: 'erp/settings/settleMethodRule/index',
+    readySelector: '.el-table__header-wrapper th:has-text("允许账户类型")',
+    headers: ['结算方式', '适用方向', '允许账户类型', '版本']
+  },
+  'PROC-008': {
+    component: 'erp/settings/purchaseTypeRule/index',
+    readySelector: '.el-table__header-wrapper th:has-text("适用组织")',
+    headers: ['单据类型', '适用组织', '统计口径', '审批流程', '版本']
+  }
+})
+
+const readonlyFact = (record, name, passed, details = '') => {
+  record.checks.push({ name, passed: Boolean(passed), details })
+  if (!passed) throw new Error(`${name}：${details}`)
+}
+const missingReadonlyFact = (record, detail) =>
+  record.notes.push(`前置缺失：${detail}；保留 PARTIAL，不以空集判通过`)
+const ruleText = (value) => typeof value === 'string' && value.trim().length > 0
+
+const readonlyData = (payload, label) => assertBusinessSuccess(payload, label).data
+const readonlyArray = (payload, label) => {
+  const rows = readonlyData(payload, label)
+  if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+    throw new Error(`${label} data 必须为对象数组`)
+  }
+  return rows
+}
 
 const normalizeTenantId = (value, label = 'tenantId') => {
   if (typeof value !== 'string' &&
@@ -77,6 +112,121 @@ export const assertProcurementApproverCredentials = (settings = config) => {
   }
 }
 
+const procurementTaskList = (payload) => {
+  const value = payload?.data ?? payload
+  if (Array.isArray(value)) return value
+  if (Array.isArray(value?.list)) return value.list
+  if (Array.isArray(value?.records)) return value.records
+  return []
+}
+
+export const findProcurementTask = (tasks, taskDefinitionKey) =>
+  (Array.isArray(tasks) ? tasks : []).find((task) =>
+    task?.taskDefinitionKey === taskDefinitionKey &&
+    (!task?.endTime || Number(task?.status) === 1)
+  ) || null
+
+export const formatProcurementTaskEvidence = (task, configuredUsername = '') => {
+  const actualAssigneeId = task?.assigneeUser?.id ?? task?.assignee ?? ''
+  const actualAssigneeName = task?.assigneeUser?.nickname ?? ''
+  return [
+    `taskId=${task?.id || ''}`,
+    `node=${task?.taskDefinitionKey || ''}`,
+    `status=${task?.status ?? ''}`,
+    `configuredUsername=${configuredUsername}`,
+    `actualAssigneeId=${actualAssigneeId || 'unknown'}`,
+    `actualAssigneeName=${actualAssigneeName || 'unknown'}`
+  ].join(', ')
+}
+
+export const assertProcurementTaskAssignee = ({ task, identity, label } = {}) => {
+  const evidence = formatProcurementTaskEvidence(task, identity?.username)
+  if (!task?.id || !task?.taskDefinitionKey) {
+    throw new Error(`BLOCKED: PROC-018 ${label || '审批'}未获得可核对的任务节点：${evidence}`)
+  }
+  const actualAssigneeId = task?.assigneeUser?.id ?? task?.assignee
+  const expectedAssigneeId = identity?.userId
+  if (!actualAssigneeId || !expectedAssigneeId ||
+      String(actualAssigneeId) !== String(expectedAssigneeId)) {
+    throw new Error(`BLOCKED: PROC-018 ${label || '审批'}实际 assignee 不匹配：${evidence}`)
+  }
+  return task
+}
+
+export const withdrawProcurementApproval = async ({
+  api,
+  taskId,
+  processInstanceId,
+  caseRecord
+} = {}) => {
+  if (!api?.putBusiness || !taskId) {
+    throw new Error(
+      `BLOCKED: PROC-018 无法执行正式撤回：processInstanceId=${processInstanceId || ''}, taskId=${taskId || ''}`
+    )
+  }
+  const response = await api.putBusiness(
+    `/bpm/task/withdraw?taskId=${encodeURIComponent(taskId)}`
+  )
+  caseRecord?.checks?.push({
+    name: '实际 assignee 不匹配后通过 BPM 正式撤回清理',
+    passed: true,
+    details: `processInstanceId=${processInstanceId || ''}, withdrawnTaskId=${taskId}`
+  })
+  return response
+}
+
+const authenticateProcurementApprover = async ({
+  label,
+  username,
+  password,
+  tenantId,
+  record,
+  approverBrowsers,
+  loginImpl = loginWithCredentials,
+  browserFactory = launchBrowser,
+  apiFactory = createApiClient
+} = {}) => {
+  const approverBrowser = await browserFactory({ record })
+  approverBrowsers.push(approverBrowser)
+  const loginContext = await loginImpl(approverBrowser.page, {
+    tenantName: config.tenantName,
+    username,
+    password
+  }, { returnContext: true })
+  const token = typeof loginContext === 'string' ? loginContext : loginContext?.token
+  if (!token) throw new Error(`BLOCKED: PROC-018 ${label}登录成功后未获得 token`)
+
+  const bootstrapApi = apiFactory({ token, tenantId, record })
+  const permissionInfo = assertBusinessSuccess(
+    await bootstrapApi.getPermissionInfo(),
+    `${label}权限上下文`
+  )
+  const resolvedTenantId = resolveProcurementTenantId({
+    loginContext: typeof loginContext === 'string' ? undefined : loginContext,
+    permissionInfo,
+    expectedTenantId: tenantId
+  })
+  const permission = permissionInfo?.data ?? permissionInfo
+  const user = permission?.user
+  if (!user?.id) {
+    throw new Error(`BLOCKED: PROC-018 ${label}权限上下文缺少用户 ID，未创建或提审请购`)
+  }
+  if (user.username && String(user.username) !== String(username)) {
+    throw new Error(
+      `BLOCKED: PROC-018 ${label}登录身份不一致：configuredUsername=${username}, actualUsername=${user.username}`
+    )
+  }
+  return {
+    browser: approverBrowser,
+    api: apiFactory({ token, tenantId: resolvedTenantId, record }),
+    identity: {
+      username: String(username),
+      userId: String(user.id),
+      nickname: user.nickname || ''
+    }
+  }
+}
+
 const resolveProcurementTenantContext = async ({
   page,
   record,
@@ -104,6 +254,180 @@ const resolveProcurementTenantContext = async ({
   }
 }
 
+export const procurementReadonlyPage = (payload, label) => {
+  const data = readonlyData(payload, label)
+  if (!data || !Array.isArray(data.list) || !Number.isSafeInteger(data.total) ||
+      data.total < data.list.length || data.list.length > 100 ||
+      data.list.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+    throw new Error(`${label} 必须返回有效 data.list/total 分页`)
+  }
+  return data
+}
+
+const validateRuleVersion = (row, record) => {
+  readonlyFact(record, '规则 ID、版本及启停状态有效',
+    isStableId(row?.id) && Number.isSafeInteger(row.version) && row.version > 0 &&
+      [0, 1].includes(row.status), `id=${row?.id}, version=${row?.version}, status=${row?.status}`)
+  const validDate = (value) => value == null ||
+    (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+      Number.isFinite(Date.parse(value)) &&
+      new Date(value).toISOString().slice(0, 10) === value)
+  readonlyFact(record, '规则生效日期及先后顺序有效',
+    validDate(row.effectiveFrom) && validDate(row.effectiveTo) &&
+      (!row.effectiveFrom || !row.effectiveTo || row.effectiveFrom <= row.effectiveTo),
+    `id=${row.id}`)
+}
+
+export async function runFinanceRuleReadonlyContract({ api, caseRecord }) {
+  const types = procurementReadonlyPage(await api.getBusiness(
+    '/system/document/type/page?pageNo=1&pageSize=100'), '系统单据类型').list
+    .filter((row) => typeof row.code === 'string' && row.code.startsWith('FIN_'))
+  const rules = procurementReadonlyPage(await api.getBusiness(
+    '/erp/finance-document-type-rule/page?pageNo=1&pageSize=100'), '财务类型规则').list
+  readonlyFact(caseRecord, '财务单据类型与规则分页结构有效', true,
+    `financeTypes=${types.length}, rules=${rules.length}；仅验证首100条`)
+  if (!types.length) missingReadonlyFact(caseRecord, '没有 FIN_ 财务单据类型')
+  if (!rules.length) missingReadonlyFact(caseRecord, '没有财务类型规则样本')
+  for (const row of rules) {
+    readonlyFact(caseRecord, '财务规则 ID、类型、默认审批及手工创建字段有效',
+      isStableId(row.id) && isStableId(row.documentTypeId) &&
+        typeof row.defaultApproval === 'boolean' && typeof row.allowManualCreate === 'boolean' &&
+        (row.requiredFields == null || typeof row.requiredFields === 'string'),
+      `ruleId=${row.id}, documentTypeId=${row.documentTypeId}`)
+    const detail = readonlyData(await api.getBusiness(
+      `/erp/finance-document-type-rule/get?id=${encodeURIComponent(row.id)}`), '财务规则详情')
+    readonlyFact(caseRecord, '财务类型规则详情与分页的策略一致',
+      detail && String(detail.id) === String(row.id) &&
+        String(detail.documentTypeId) === String(row.documentTypeId) &&
+        ['defaultApproval', 'allowManualCreate', 'requiredFields']
+          .every((key) => detail[key] === row[key]), `ruleId=${row.id}`)
+  }
+  return {
+    partial: true,
+    note: '未创建共享规则或财务单据；手工创建拒绝、必填字段拒绝、审批覆盖、重复启用规则拒绝四项需分别用隔离夹具验证'
+  }
+}
+
+// Only GET endpoints are used; formal writes and historical snapshot consumption remain unverified.
+export async function runProcurementReadOnlyContract({ caseId, api, caseRecord }) {
+  if (!procurementReadOnlyViews[caseId]) throw new Error(`非目标只读案例：${caseId}`)
+  const settlement = caseId === 'PROC-006'
+  const base = settlement ? '/erp/settle-method-rule' : '/erp/purchase-type-rule'
+  const page = procurementReadonlyPage(
+    await api.getBusiness(`${base}/page?pageNo=1&pageSize=100`), base)
+  readonlyFact(caseRecord, '规则分页返回真实 list/total', true,
+    `rows=${page.list.length}, total=${page.total}；仅验收当前页`)
+  if (!page.list.length) missingReadonlyFact(caseRecord, `${base} 没有规则样本，详情与版本契约未验证`)
+  let dictionaries = []
+  const completeDictionaries = new Set()
+  if (settlement) {
+    for (const dictType of ['x_settle_method', 'erp_account_type']) {
+      const path = `/system/dict-data/page?pageNo=1&pageSize=100&dictType=${dictType}`
+      const dictPage = procurementReadonlyPage(await api.getBusiness(path), path)
+      if (dictPage.list.length) readonlyFact(caseRecord, '字典返回稳定编码、名称、类型和状态',
+        dictPage.list.every((row) => ruleText(row.value) && ruleText(row.label) &&
+          row.dictType === dictType && [0, 1].includes(row.status)), dictType)
+      if (!dictPage.list.length) missingReadonlyFact(caseRecord, `${dictType} 字典为空`)
+      dictionaries.push(...dictPage.list)
+      if (dictPage.list.length && dictPage.total === dictPage.list.length) {
+        completeDictionaries.add(dictType)
+      }
+      if (dictPage.total > dictPage.list.length) {
+        missingReadonlyFact(caseRecord, `${dictType} 超过首100条，未覆盖其余目录`)
+      }
+    }
+    caseRecord.notes.push('结算规则 RespVO 无 orgId；不虚构组织契约，组织范围只在 PROC-008 验证')
+  } else {
+    const path = '/system/document/type/page?pageNo=1&pageSize=100&isOpen=true'
+    const types = procurementReadonlyPage(await api.getBusiness(path), path).list
+    if (types.length) readonlyFact(caseRecord, '启用单据类型目录返回稳定 ID、编码、名称及布尔启用值',
+      types.every((row) => isStableId(row.id) && ruleText(row.code) &&
+        ruleText(row.name) && row.isOpen === true), `rows=${types.length}`)
+    if (!types.some((row) => row.code.startsWith('PURCHASE'))) {
+      missingReadonlyFact(caseRecord, '启用目录首100条没有 PURCHASE 采购类型选项')
+    }
+  }
+  for (const row of page.list) {
+    validateRuleVersion(row, caseRecord)
+    if (settlement) {
+      readonlyFact(caseRecord, '结算规则方向、账户与票据账期字段类型正确',
+        ruleText(row.settleMethodCode) && ruleText(row.settleMethodName) &&
+          ['RECEIPT', 'PAYMENT', 'BOTH'].includes(row.direction) &&
+          (row.allowedAccountTypes == null || typeof row.allowedAccountTypes === 'string') &&
+          ['requireBillNo', 'requireDueDate', 'allowCredit'].every((key) => typeof row[key] === 'boolean') &&
+          (row.defaultCreditDays == null ||
+            (Number.isSafeInteger(row.defaultCreditDays) && row.defaultCreditDays >= 0)),
+        `id=${row.id}`)
+      const references = [
+        ['x_settle_method', row.settleMethodCode],
+        ...(row.allowedAccountTypes || '').split(',').filter(Boolean).map((code) => ['erp_account_type', code])
+      ]
+      for (const [type, code] of references) {
+        const found = dictionaries.find((item) => item.dictType === type && item.value === code)
+        if (!found && completeDictionaries.has(type)) {
+          readonlyFact(caseRecord, '完整字典目录必须包含规则引用编码', false, `${type}:${code}`)
+        } else if (!found) missingReadonlyFact(caseRecord, `规则 ${row.id} 的 ${type}:${code} 未在当前目录页找到`)
+        else readonlyFact(caseRecord, '规则引用真实字典编码', true, `${type}:${code}`)
+      }
+    } else {
+      readonlyFact(caseRecord, '采购规则单据类型和组织/流程/模板字段类型正确',
+        isStableId(row.documentTypeId) && ruleText(row.documentTypeCode) &&
+          row.documentTypeCode.startsWith('PURCHASE') && ruleText(row.documentTypeName) &&
+          ['orgId', 'approvalProcessKey', 'statisticsBasis', 'displayTemplate', 'printTemplate']
+            .every((key) => row[key] == null || typeof row[key] === 'string'), `id=${row.id}`)
+      const type = readonlyData(await api.getBusiness(
+        `/system/document/type/get?id=${encodeURIComponent(row.documentTypeId)}`), '单据类型详情')
+      readonlyFact(caseRecord, '采购规则引用真实单据类型 ID/稳定编码/名称',
+        type && String(type.id) === String(row.documentTypeId) &&
+          type.code === row.documentTypeCode && type.name === row.documentTypeName &&
+          typeof type.isOpen === 'boolean', `ruleId=${row.id}`)
+      if (!type.isOpen) missingReadonlyFact(caseRecord, `规则 ${row.id} 的单据类型已停用，正式消费未验证`)
+      if (!row.orgId?.trim()) caseRecord.notes.push(`规则 ${row.id} orgId 为空，按页面契约为全组织适用`)
+      else {
+        const orgIds = row.orgId.split(',').map((id) => id.trim())
+        readonlyFact(caseRecord, '适用组织为无重复的稳定组织 ID',
+          orgIds.every(isStableId) && new Set(orgIds).size === orgIds.length, `ruleId=${row.id}`)
+        for (const id of orgIds) {
+          const org = readonlyData(await api.getBusiness(
+            `/system/dept/get?id=${encodeURIComponent(id)}`), '组织详情')
+          readonlyFact(caseRecord, '组织范围引用当前租户可读的真实组织',
+            org && String(org.id) === id && ruleText(org.name) && [0, 1].includes(org.status),
+            `ruleId=${row.id}, orgId=${id}`)
+        }
+      }
+    }
+    const detail = readonlyData(await api.getBusiness(
+      `${base}/get?id=${encodeURIComponent(row.id)}`), `${base}/get`)
+    const fields = settlement
+      ? ['id', 'version', 'status', 'settleMethodCode', 'direction', 'allowedAccountTypes',
+        'requireBillNo', 'requireDueDate', 'allowCredit', 'defaultCreditDays', 'effectiveFrom', 'effectiveTo']
+      : ['id', 'version', 'status', 'documentTypeId', 'documentTypeCode', 'orgId',
+        'approvalProcessKey', 'statisticsBasis', 'displayTemplate', 'printTemplate',
+        'effectiveFrom', 'effectiveTo']
+    readonlyFact(caseRecord, '规则详情与当前分页快照一致',
+      detail && fields.every((field) => (detail[field] ?? null) === (row[field] ?? null)),
+      `id=${row.id}`)
+    const versionPath = settlement
+      ? `${base}/list-by-code?settleMethodCode=${encodeURIComponent(row.settleMethodCode)}`
+      : `${base}/list-by-document-type?documentTypeId=${encodeURIComponent(row.documentTypeId)}`
+    const versions = readonlyArray(await api.getBusiness(versionPath), versionPath)
+    readonlyFact(caseRecord, '版本列表包含当前规则且来源限定正确',
+      versions.length > 0 && versions.some((item) => String(item.id) === String(row.id) &&
+        item.version === row.version) && new Set(versions.map((item) => String(item.id))).size === versions.length &&
+        versions.every((item) => settlement
+          ? item.settleMethodCode === row.settleMethodCode
+          : String(item.documentTypeId) === String(row.documentTypeId)), versionPath)
+    versions.forEach((item) => validateRuleVersion(item, caseRecord))
+    if (settlement) readonlyFact(caseRecord, '同一结算方式至多一条启用规则',
+      versions.filter((item) => item.status === 1).length <= 1, versionPath)
+    readonlyFact(caseRecord, '版本列表按后端版本降序返回',
+      versions.every((item, index) => index === 0 || versions[index - 1].version >= item.version),
+      versionPath)
+  }
+  const note = '仅真实只读设置/列表/详情/版本与引用契约；未执行配置写入、引用删除保护、订单消费或历史快照，始终 PARTIAL'
+  caseRecord.notes.push(note)
+  return { partial: true, note }
+}
 
 const readBrowserBusinessResponse = async (response) => {
   const text = await response.text()
@@ -134,7 +458,39 @@ export const cases = [
   'PROC-019'
 ]
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  if (procurementFoundationReadonlyCases.includes(caseId)) {
+    const token = await (dependencies.login || login)(page)
+    const api = (dependencies.createApiClient || createApiClient)({ token, record })
+    const result = await runProcurementFoundationReadonlyContract({
+      caseId, api, caseRecord
+    })
+    caseRecord.evidence.push(
+      '仅执行当前租户认证后的 GET 只读前置；未创建请购、采购、发票、应付、入库或审批事实'
+    )
+    return { token, api, ...result }
+  }
+  if (procurementReadOnlyViews[caseId]) {
+    const token = await (dependencies.login || login)(page)
+    const api = (dependencies.createApiClient || createApiClient)({ token, record })
+    const permission = readonlyData(
+      await api.getBusiness('/system/auth/get-permission-info'), '权限菜单')
+    if (!Array.isArray(permission?.menus)) throw new Error('权限响应 data.menus 必须为数组')
+    const view = procurementReadOnlyViews[caseId]
+    const route = findMenuRouteByComponent(permission.menus, view.component)
+    if (!route) throw new Error(`BLOCKED: 权限菜单缺少 component=${view.component}`)
+    const result = await runProcurementReadOnlyContract({ caseId, api, caseRecord })
+    await (dependencies.openRoute || openRoute)(page, route, { readySelector: view.readySelector })
+    const headers = await page.locator('.el-table__header-wrapper th').allInnerTexts()
+    readonlyFact(caseRecord, '实际权限菜单路由和领域表头已就绪',
+      new URL(page.url()).pathname === route &&
+        view.headers.every((label) => headers.some((header) => header.trim() === label)),
+      `route=${route}, component=${view.component}`)
+    const screenshot = await (dependencies.saveScreenshot || saveScreenshot)(
+      page, outputDir, `${caseId}-readonly-settings`, record)
+    caseRecord.evidence.push(screenshot)
+    return { token, api, ...result }
+  }
   caseRecord.notes.push(
     '案例已锁定 MRP 净需求、缺料禁止开工、采购发票复核生成应付、入库检阻断可用库存、采购数量回写，以及请购/对账开关的后端来源门禁。'
   )
@@ -175,69 +531,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'PROC-007') {
     const token = await login(page)
     const api = createApiClient({ token, record })
-    const typePage = await api.getBusiness('/system/document/type/page?pageNo=1&pageSize=100')
-    const financeTypes = (Array.isArray(typePage?.data?.list) ? typePage.data.list : []).filter(
-      (item) => typeof item?.code === 'string' && item.code.startsWith('FIN_')
-    )
-    caseRecord.checks.push({
-      name: '系统单据类型存在 FIN_ 前缀的固定财务类型',
-      passed: financeTypes.length > 0,
-      details: `命中 ${financeTypes.length} 个财务单据类型`
+    const result = await runFinanceRuleReadonlyContract({ api, caseRecord })
+    await openRoute(page, '/settings/erp/finance-document-type-rule', {
+      readySelector: '.el-table__header-wrapper th:has-text("手工创建")'
     })
-    if (financeTypes.length === 0) {
-      return { token, api }
-    }
-    const financeType = financeTypes[0]
-    const ruleId = (
-      await api.postBusiness('/erp/finance-document-type-rule/create', {
-        documentTypeId: financeType.id,
-        defaultApproval: false,
-        allowManualCreate: false,
-        requiredFields: 'bankAccountId,settleMethod',
-        status: 1,
-        remark: 'PROC-007 automated e2e'
-      })
-    )?.data
-    const rulePage = await api.getBusiness(
-      `/erp/finance-document-type-rule/page?pageNo=1&pageSize=100&documentTypeId=${encodeURIComponent(financeType.id)}`
-    )
-    const createdRule = (Array.isArray(rulePage?.data?.list) ? rulePage.data.list : []).find(
-      (item) => String(item.id) === String(ruleId)
-    )
-    caseRecord.checks.push({
-      name: '规则保存允许手工创建与必填字段策略并回读一致',
-      passed:
-        createdRule != null &&
-        createdRule.allowManualCreate === false &&
-        String(createdRule.requiredFields || '') === 'bankAccountId,settleMethod',
-      details: JSON.stringify(createdRule || {})
-    })
-
-    // PB-066 runtime: finance document types that disallow manual creation must reject writes.
-    const manualCreate = await api.request('POST', '/finance/finReceipt/add/save', {
-      documentTypeId: String(financeType.id),
-      billDate: new Date().toISOString().slice(0, 19).replace('T', ' '),
-      receiptType: '102',
-      amt: 1,
-      remark: 'PROC-007 automated e2e manual create probe'
-    })
-    const manualCreateMessage = String(manualCreate?.message || manualCreate?.msg || '')
-    caseRecord.checks.push({
-      name: '收款单按单据类型规则拒绝手工创建或缺少必填字段',
-      passed:
-        manualCreate?.code !== 0 &&
-        (manualCreateMessage.includes('不允许手工创建') ||
-          manualCreateMessage.includes('缺少必填字段')),
-      details: JSON.stringify(manualCreate || {})
-    })
-
-    await api.delete(`/erp/finance-document-type-rule/delete?id=${ruleId}`)
-    await openRoute(page, '/settings/erp/finance-document-type-rule')
-    await saveScreenshot(page, outputDir, 'erp-finance-document-type-rule', record)
-    caseRecord.evidence.push(
-      `PROC-007/PB-066 财务单据类型规则 ${ruleId} 绑定 ${financeType.code}，写侧拒绝手工创建 response=${manualCreateMessage}`
-    )
-    return { token, api }
+    caseRecord.evidence.push(await saveScreenshot(
+      page, outputDir, 'erp-finance-document-type-rule-readonly', record))
+    return { token, api, ...result }
   }
 
   if (caseId === 'PROC-009') {
@@ -252,11 +552,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       '/base/partner/page?pageNo=1&pageSize=100&status=ACTIVE&supplierEnabled=true'
     )
     const partnerRows = Array.isArray(partnerPage?.data?.list) ? partnerPage.data.list : []
-    caseRecord.checks.push({
+    readonlyFact(caseRecord, '供应商门户账号分页结构有效',
+      Array.isArray(accountPage?.data?.list), `accounts=${accountRows.length}`)
+    if (!accountRows.length) missingReadonlyFact(caseRecord, '没有供应商门户账号，详情脱敏及账号操作入口未验证')
+    else caseRecord.checks.push({
       name: '供应商门户账号分页返回脱敏账号结构',
-      passed:
-        Array.isArray(accountPage?.data?.list) &&
-        accountRows.every(
+      passed: accountRows.every(
           (row) =>
             row?.id &&
             row?.loginName &&
@@ -295,8 +596,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `accountId=${accountRows[0].id}`
       })
     }
-    await openRoute(page, '/settings/erp/supplierPortal')
     const renderStartedAt = Date.now()
+    await openRoute(page, '/settings/erp/supplierPortal', {
+      readySelector: '.supplier-portal-settings'
+    })
     await page.locator('.supplier-portal-settings').waitFor({
       state: 'visible',
       timeout: 30000
@@ -324,18 +627,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: renderDurationMs <= 5000,
       details: `renderMs=${renderDurationMs}`
     })
-    caseRecord.checks.push({
+    if (inviteCandidate) caseRecord.checks.push({
       name: '邀请中或停用账号可看到邮件邀请入口',
-      passed: !inviteCandidate || inviteEntryVisible,
-      details: inviteCandidate
-        ? `candidate=${inviteCandidate.loginName}, visible=${inviteEntryVisible}`
-        : '当前无邀请中或停用账号，只校验设置页配置入口'
+      passed: inviteEntryVisible,
+      details: `candidateId=${inviteCandidate.id}, visible=${inviteEntryVisible}`
     })
+    else missingReadonlyFact(caseRecord, '没有邀请中或停用账号，未验证邮件邀请入口')
     await saveScreenshot(page, outputDir, 'supplier-portal-account-settings', record)
     caseRecord.evidence.push(
-      '真实登录、账号分页、统一客商供应商角色过滤、详情脱敏、邀请配置契约、邀请入口和设置页截图'
+      '真实登录、账号/客商分页、配置及设置页面；仅在存在样本时验证详情和邀请按钮，不发送邀请邮件'
     )
-    return { token, api }
+    return { token, api, partial: true,
+      note: '未执行账号创建、编辑、启停、密码重置及独立供应商身份隔离，不能将设置页面冒称完整 PASS' }
   }
 
   if (caseId === 'PROC-011') {
@@ -354,7 +657,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ),
       details: `openingRows=${openingRows.length}`
     })
-    caseRecord.checks.push({
+    if (!openingRows.length) missingReadonlyFact(caseRecord, '没有已审核期初采购入库，来源映射和剩余开票数量金额未验证')
+    else caseRecord.checks.push({
       name: '期初采购入库返回开票数量和金额控制字段',
       passed: openingRows.every(
         (row) =>
@@ -410,7 +714,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     }
     await saveScreenshot(page, outputDir, 'erp-purchase-opening-invoice-source', record)
     caseRecord.evidence.push('真实登录、期初采购入库分页字段检查、采购发票入口和来源弹窗截图')
-    return { token, api }
+    return { token, api, partial: true,
+      note: '只读来源与表单入口已检查，未选择专属来源、核对本次数量金额或保存 purchaseInId/srcBillType 映射' }
   }
 
   if (caseId === 'PROC-012') {
@@ -420,6 +725,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       '/erp/price-scheme/page?pageNo=1&pageSize=100&priceDirection=PURCHASE'
     )
     const rows = Array.isArray(pageResult?.data?.list) ? pageResult.data.list : []
+    if (!rows.length) missingReadonlyFact(caseRecord, '没有采购价格方案样本，方案字段和版本未验证')
     caseRecord.checks.push({
       name: '统一价格中心提供 PURCHASE 方向方案分页',
       passed:
@@ -448,7 +754,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     await saveScreenshot(page, outputDir, 'erp-purchase-price-center', record)
     caseRecord.evidence.push('真实登录、PURCHASE 方向分页和价格中心页面截图')
-    return { token, api }
+    return { token, api, partial: true,
+      note: '价格中心入口不代表采购订单取价成功；方案、版本、规则、命中依据和计算时间的正式订单快照未验证' }
   }
 
   if (caseId === 'PROC-013') {
@@ -1155,9 +1462,36 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const session = await resolveProcurementTenantContext({ page, record })
     const { token, tenantId, api } = session
     const tenantPredicate = purchaseOrderTenantPredicate(tenantId)
-    const fixture = await createPurchaseRequest(api, caseRecord)
     const approverBrowsers = []
+    const approverSessions = {}
+    let fixture
     try {
+      // Authenticate all configured approvers before creating any business fixture.
+      approverSessions.purchase = await authenticateProcurementApprover({
+        label: '采购负责人',
+        username: config.purchaseApproverUsername,
+        password: config.purchaseApproverPassword,
+        tenantId,
+        record,
+        approverBrowsers
+      })
+      approverSessions.finance = await authenticateProcurementApprover({
+        label: '财务复核',
+        username: config.financeApproverUsername,
+        password: config.financeApproverPassword,
+        tenantId,
+        record,
+        approverBrowsers
+      })
+      approverSessions.final = await authenticateProcurementApprover({
+        label: '负责人终审',
+        username: config.finalApproverUsername,
+        password: config.finalApproverPassword,
+        tenantId,
+        record,
+        approverBrowsers
+      })
+      fixture = await createPurchaseRequest(api, caseRecord)
       await openRoute(page, '/erp/purchase/purchaseRequest')
       await page.locator('.request-status-tabs').waitFor({ state: 'visible', timeout: 60000 })
       await page.getByPlaceholder('请输入请购单号', { exact: true }).fill(fixture.billNo)
@@ -1220,46 +1554,53 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         return null
       }
 
-      const approveInBrowser = async ({ label, username, password, opinionText }) => {
-        if (!password) {
-          throw new Error(`BLOCKED: 缺少 ${label} 的密码配置，不能登录真实审批账号 ${username}`)
+      const readProcessTasks = async (approverApi) => {
+        const payload = await approverApi.getBusiness(
+          `/bpm/task/list-by-process-instance-id?processInstanceId=${encodeURIComponent(submitted.processInstanceId)}`
+        )
+        return procurementTaskList(payload)
+      }
+
+      const waitForProcessTask = async (approverApi, taskDefinitionKey, timeoutMs = 60000) => {
+        const deadline = Date.now() + timeoutMs
+        let latest = []
+        while (Date.now() < deadline) {
+          latest = await readProcessTasks(approverApi)
+          const task = findProcurementTask(latest, taskDefinitionKey)
+          if (task?.id) return task
+          await new Promise((resolve) => setTimeout(resolve, 1000))
         }
-        const approverBrowser = await launchBrowser({ record })
-        approverBrowsers.push(approverBrowser)
-        const approverContext = await loginWithCredentials(approverBrowser.page, {
-          tenantName: config.tenantName,
-          username,
-          password
-        }, { returnContext: true })
-        const approverToken = typeof approverContext === 'string'
-          ? approverContext
-          : approverContext?.token
-        if (!approverToken) throw new Error(`${label}登录成功后未获得 token`)
-        let approverPermission
-        if (!approverContext?.tenantId) {
-          approverPermission = assertBusinessSuccess(
-            await createApiClient({
-              token: approverToken, tenantId: '', record
-            }).getPermissionInfo(),
-            `${label}权限上下文`
-          )
-        }
-        resolveProcurementTenantId({
-          loginContext: typeof approverContext === 'string' ? undefined : approverContext,
-          permissionInfo: approverPermission,
-          expectedTenantId: tenantId
-        })
-        const approverApi = createApiClient({ token: approverToken, tenantId, record })
-        const task = await waitForTodo(approverApi)
+        return findProcurementTask(latest, taskDefinitionKey)
+      }
+
+      const approveInBrowser = async ({
+        label,
+        session: approverSession,
+        taskDefinitionKey,
+        opinionText
+      }) => {
+        const { browser: approverBrowser, api: approverApi, identity } = approverSession
+        const processTask = await waitForProcessTask(api, taskDefinitionKey)
         caseRecord.checks.push({
-          name: `${label}独立 Chrome 会话收到请购 BPM 待办`,
-          passed: Boolean(task?.id) &&
-            String(task.processInstanceId || submitted.processInstanceId) ===
+          name: `${label}独立 Chrome 会话收到请购 BPM 待办并记录实际 assignee`,
+          passed: Boolean(processTask?.id) &&
+            String(processTask.processInstanceId || submitted.processInstanceId) ===
               String(submitted.processInstanceId),
-          details: `username=${username}, taskId=${task?.id || ''}, processInstanceId=${task?.processInstanceId || submitted.processInstanceId}`
+          details: `username=${identity.username}, ${formatProcurementTaskEvidence(
+            processTask,
+            identity.username
+          )}`
         })
+        assertProcurementTaskAssignee({
+          task: processTask,
+          identity,
+          label
+        })
+        const task = await waitForTodo(approverApi)
         if (!task?.id) {
-          throw new Error(`${label}未收到请购 BPM 待办：processInstanceId=${submitted.processInstanceId}`)
+          throw new Error(
+            `BLOCKED: PROC-018 ${label}未收到请购 BPM 待办：processInstanceId=${submitted.processInstanceId}`
+          )
         }
 
         await openRoute(
@@ -1301,24 +1642,68 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         return { browser: approverBrowser, api: approverApi, task }
       }
 
-      const purchaseApproval = await approveInBrowser({
+      const withdrawAfterMismatch = async (previousApproval, mismatchError) => {
+        if (!previousApproval?.task?.id) {
+          caseRecord.notes.push(
+            'BLOCKED: PROC-018 当前节点没有已完成的前序任务，无法调用 BPM 正式撤回；未继续审批或生成后续业务数据'
+          )
+          throw mismatchError
+        }
+        try {
+          await withdrawProcurementApproval({
+            api: previousApproval.api,
+            taskId: previousApproval.task.id,
+            processInstanceId: submitted.processInstanceId,
+            caseRecord
+          })
+        } catch (cleanupError) {
+          throw new Error(
+            `${mismatchError.message}；正式撤回清理失败：${String(cleanupError.message || cleanupError).slice(0, 300)}`
+          )
+        }
+        throw mismatchError
+      }
+
+      let purchaseApproval
+      try {
+        purchaseApproval = await approveInBrowser({
         label: '采购负责人',
-        username: config.purchaseApproverUsername,
-        password: config.purchaseApproverPassword,
+        session: approverSessions.purchase,
+        taskDefinitionKey: 'FirstApprove_purchase-request',
         opinionText: '采购请购 BPM 第一段审批通过'
-      })
-      const financeApproval = await approveInBrowser({
-        label: '财务复核',
-        username: config.financeApproverUsername,
-        password: config.financeApproverPassword,
-        opinionText: '采购请购 BPM 第二段财务复核通过'
-      })
-      const finalApproval = await approveInBrowser({
-        label: '负责人终审',
-        username: config.finalApproverUsername,
-        password: config.finalApproverPassword,
-        opinionText: '采购请购 BPM 第三段负责人终审通过'
-      })
+        })
+      } catch (error) {
+        if (String(error.message || error).startsWith('BLOCKED: PROC-018')) throw error
+        throw error
+      }
+      let financeApproval
+      try {
+        financeApproval = await approveInBrowser({
+          label: '财务复核',
+          session: approverSessions.finance,
+          taskDefinitionKey: 'SecondApprove_purchase-request',
+          opinionText: '采购请购 BPM 第二段财务复核通过'
+        })
+      } catch (error) {
+        if (String(error.message || error).startsWith('BLOCKED: PROC-018')) {
+          await withdrawAfterMismatch(purchaseApproval, error)
+        }
+        throw error
+      }
+      let finalApproval
+      try {
+        finalApproval = await approveInBrowser({
+          label: '负责人终审',
+          session: approverSessions.final,
+          taskDefinitionKey: 'FinalApprove_purchase-request',
+          opinionText: '采购请购 BPM 第三段负责人终审通过'
+        })
+      } catch (error) {
+        if (String(error.message || error).startsWith('BLOCKED: PROC-018')) {
+          await withdrawAfterMismatch(financeApproval, error)
+        }
+        throw error
+      }
 
       const approved = await waitForRequest(
         (request) => String(request.billStage) === '24' &&

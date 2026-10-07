@@ -38,6 +38,21 @@ export const isBusinessRejected = (response, code, message) =>
 
 export const hasProjectFixture = (response) => listOf(response).length > 0
 
+export const validTaskLibraryConfig = (config) => {
+  const tasks = config?.tasks ?? config?.items
+  const nonblank = (value) => typeof value === 'string' && value.trim().length > 0
+  if (!Array.isArray(tasks) || !tasks.length) return false
+  return tasks.every((task) =>
+    nonblank(task?.code || task?.taskCode) &&
+    nonblank(task?.name || task?.taskName) &&
+    Number(task?.standardHours) > 0 &&
+    nonblank(task?.deliverable || task?.requiredOutput) &&
+    nonblank(task?.acceptance || task?.acceptanceCriteria) &&
+    (task?.predecessorIds == null || Array.isArray(task.predecessorIds)) &&
+    (task?.predecessors == null || Array.isArray(task.predecessors))
+  )
+}
+
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
@@ -669,7 +684,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB124-001') {
     const ruleCode = unique('REMIND')
-    const reminderId = dataOf(await api.postBusiness('/after-sales/modeling/reminder-rule/create', {
+    const payload = {
       ruleCode,
       ruleName: 'E2E 提醒规则',
       reminderScene: 'SLA_DUE',
@@ -683,31 +698,67 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       idempotencyKeyTemplate: 'REMIND:{ruleCode}:{ticketId}',
       quietHoursStart: '22:00',
       quietHoursEnd: '08:00'
-    }))
-    let invalidQuietRejected = false
-    try {
-      await api.postBusiness('/after-sales/modeling/reminder-rule/create', {
-        ruleCode: unique('REMIND'),
-        ruleName: 'E2E 非法免打扰',
-        reminderScene: 'SLA_DUE',
-        applicableStatuses: ['PROCESSING'],
-        firstDelayMinutes: 30,
-        repeatEnabled: false,
-        channels: ['SYSTEM'],
-        receiverTypes: ['HANDLER'],
-        stopCondition: 'SLA_RESUMED',
-        messageTemplate: 'SLA即将到期',
-        quietHoursStart: '22:00'
-      })
-    } catch (error) {
-      invalidQuietRejected = true
     }
+    let reminderId
+    try {
+      reminderId = dataOf(await api.postBusiness('/after-sales/modeling/reminder-rule/create', payload))
+      const readRule = async () => listOf(await api.getBusiness(
+        '/after-sales/modeling/reminder-rule/list'
+      )).find((row) => String(row.id) === String(reminderId))
+      const created = await readRule()
+      caseRecord.checks.push({
+        name: '提醒规则回读保留幂等键和跨午夜免打扰时段',
+        passed: Boolean(created) && created.ruleCode === ruleCode &&
+          created.idempotencyKeyTemplate === payload.idempotencyKeyTemplate &&
+          created.quietHoursStart === payload.quietHoursStart &&
+          created.quietHoursEnd === payload.quietHoursEnd &&
+          created.repeatEnabled === false && created.repeatIntervalMinutes == null,
+        details: `reminderId=${reminderId}, status=${created?.status}`
+      })
+      const editedName = 'E2E 提醒规则已编辑'
+      await api.putBusiness(`/after-sales/modeling/reminder-rule/update?id=${reminderId}`, {
+        ...payload, ruleName: editedName
+      })
+      const edited = await readRule()
+      caseRecord.checks.push({
+        name: '非循环提醒无间隔可编辑并回读',
+        passed: edited?.ruleName === editedName && edited?.repeatIntervalMinutes == null,
+        details: `reminderId=${reminderId}`
+      })
+      const invalidQuiet = await api.post('/after-sales/modeling/reminder-rule/create', {
+        ...payload, ruleCode: unique('REMIND_INVALID'), quietHoursEnd: null
+      })
+      caseRecord.checks.push({
+        name: '不完整免打扰时段被业务拒绝',
+        passed: isBusinessRejected(invalidQuiet, 1020021, '免打扰'),
+        details: JSON.stringify(invalidQuiet)
+      })
+      if (invalidQuiet?.code === 0 && dataOf(invalidQuiet)) {
+        await api.postBusiness(`/after-sales/modeling/status?configType=REMINDER_RULE&id=${dataOf(invalidQuiet)}&enabled=false`)
+      }
+    } finally {
+      if (reminderId) {
+        await api.postBusiness(`/after-sales/modeling/status?configType=REMINDER_RULE&id=${reminderId}&enabled=false`)
+        const disabled = listOf(await api.getBusiness('/after-sales/modeling/reminder-rule/list'))
+          .find((row) => String(row.id) === String(reminderId))
+        caseRecord.checks.push({
+          name: '本轮提醒规则停用清理并回读',
+          passed: disabled?.status === 'DISABLED',
+          details: `reminderId=${reminderId}`
+        })
+      }
+    }
+    await openRoute(page, '/after-sales/settings')
+    await page.getByRole('tab', { name: /提醒规则/ }).click()
+    await page.locator('.reminder-table').waitFor({ state: 'visible' })
     caseRecord.checks.push({
-      name: '提醒规则支持幂等键与成对免打扰时段',
-      passed: Boolean(reminderId) && invalidQuietRejected,
-      details: `reminderId=${reminderId}`
+      name: '真实 Chrome 提醒规则页签和配置表渲染',
+      passed: await page.locator('.reminder-table').getByText('提醒场景', { exact: true }).isVisible(),
+      details: page.url()
     })
-    return { token, api }
+    await saveScreenshot(page, outputDir, 'pb124-reminder-settings', record)
+    caseRecord.notes.push('配置层创建、编辑、回读和停用已执行；运行时重复通知/升级幂等仍未验证。')
+    return { token, api, partial: true }
   }
 
   if (caseId === 'PB115-001') {
@@ -796,14 +847,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: listOf(taskLibrary).every((item) => {
         try {
           const config = JSON.parse(item.configJson || '{}')
-          const task = Array.isArray(config.tasks) ? config.tasks[0] : undefined
-          return (
-            !task ||
-            (Number(task.standardHours) > 0 &&
-              Boolean(task.deliverable) &&
-              Boolean(task.acceptanceCriteria) &&
-              Array.isArray(task.predecessorIds))
-          )
+          return item.status !== 'ENABLED' || validTaskLibraryConfig(config)
         } catch {
           return false
         }

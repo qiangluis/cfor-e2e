@@ -1,11 +1,44 @@
+import { randomBytes } from 'node:crypto'
 import { createApiClient } from '../lib/api.mjs'
-import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import {
+  login,
+  openRoute as defaultOpenRoute,
+  saveScreenshot as defaultSaveScreenshot,
+  waitForPageReady
+} from '../lib/browser.mjs'
 
 export const cases = ['IOT-004', 'IOT-005', 'IOT-006', 'MAINT-001', 'MAINT-002', 'MAINT-003', 'MAINT-004', 'MAINT-005', 'MAINT-006', 'MAINT-007', 'MAINT-008', 'MAINT-009', 'MAINT-010', 'MAINT-011', 'MAINT-012', 'MAINT-013', 'MAINT-014', 'MAINT-015']
 
 export const MAINT_011_DEVICE_STATUS_ROUTE = '/settings/iot/device-status'
+export const MAINT_010_LIFECYCLE_ROUTE = '/settings/iot/device-lifecycle'
+export const MAINT_010_COMPENSATION_ROUTE = '/settings/iot/device-compensation'
+export const MAINT_008_REPAIR_ORDER_ROUTE = '/iot/maintenance/repair-order'
+export const MAINT_009_INSPECTION_RECORD_ROUTE = '/iot/maintenance/inspection-record'
 
-export const dataOf = (response) => response?.data ?? response
+export const isE2eFixture = (item) =>
+  /(?:^|[^a-z0-9])E2E(?:[^a-z0-9]|$)/i.test(
+    [item?.materialCode, item?.materialName, item?.warehouseCode, item?.warehouseName, item?.code, item?.name]
+      .filter((value) => typeof value === 'string').join(' ')
+  )
+
+export const isExpectedRejection = (response, message) =>
+  response?.code === 400 && String(response?.msg || response?.message || '').includes(message)
+
+export const isWorkflowRejection = (response, message) =>
+  response?.code === 409 && String(response?.msg || response?.message || '').includes(message)
+
+export const dataOf = (response) => {
+  if (
+    response &&
+    typeof response === 'object' &&
+    Object.prototype.hasOwnProperty.call(response, 'data') &&
+    ('code' in response || 'msg' in response || 'success' in response)
+  ) {
+    return response.data
+  }
+  return response
+}
 
 export const hasFormalMetricEvidence = ({ statusEvents, drilldown } = {}) =>
   Array.isArray(statusEvents) &&
@@ -15,9 +48,226 @@ export const hasFormalMetricEvidence = ({ statusEvents, drilldown } = {}) =>
 
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
 
+export const fixtureId = (response, label) => {
+  const id = dataOf(response)
+  const valid =
+    (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) ||
+    (typeof id === 'string' && /^[1-9]\d{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n)
+  if (!valid) throw new Error(`${label} 返回无效 ID：${JSON.stringify(id)}`)
+  return id
+}
+
+const requireTrueResult = (response, label) => {
+  if (response && typeof response === 'object') assertBusinessSuccess(response, label)
+  if (dataOf(response) !== true) throw new Error(`${label} 未返回 true`)
+}
+
+export const requiredRows = (response, label) => {
+  const payload = dataOf(response)
+  const rows = Array.isArray(payload) ? payload : payload?.list ?? payload?.records
+  if (!Array.isArray(rows)) throw new Error(`${label} 未返回数组`)
+  return rows
+}
+
+const createMaintenanceDevice = async (api, fixtures, caseRecord) => {
+  const products = requiredRows(await api.getBusiness('/iot/product/simple-list'), 'IoT 产品')
+  const product = products.find((item) => item?.id != null && item.status === 0)
+  if (!product) {
+    caseRecord.notes.push('缺少启用的 IoT 产品，未创建设备夹具或执行方案分配。')
+    return null
+  }
+  const id = trackDeletable(fixtures, api, await api.postBusiness('/iot/device/create', {
+    productId: product.id,
+    deviceName: unique('E2E-MAINT')
+  }), '/iot/device', 'IoT 设备')
+  const device = dataOf(await api.getBusiness(`/iot/device/get?id=${id}`))
+  if (String(device?.id) !== String(id)) throw new Error('E2E 设备夹具回读不一致')
+  return device
+}
+
+const createPlanFixture = async (api, fixtures, caseRecord, domain, planName) => {
+  const nodes = requiredRows(await api.getBusiness('/mes/maintenance-item/tree'), '维保项目树')
+  const root = nodes.find((node) => node.categoryRoot === domain && node.systemRoot === true)
+  if (!root?.id) {
+    caseRecord.notes.push(`缺少 ${domain} 固定根分类，未创建方案。`)
+    return null
+  }
+  const itemBody = {
+    parentId: root.id, categoryRoot: domain, nodeType: 'ITEM',
+    itemCode: unique('E2E-MI'), itemName: `E2E ${domain} 项目`,
+    resultType: 'BOOLEAN', status: 0
+  }
+  let retainItem = false
+  const itemId = fixtures.track(
+    await api.postBusiness('/mes/maintenance-item/create', itemBody),
+    '维保项目',
+    async (id) => {
+      if (!retainItem) {
+        requireTrueResult(await api.deleteBusiness(`/mes/maintenance-item/delete?id=${id}`), '维保项目删除')
+        return
+      }
+      requireTrueResult(
+        await api.putBusiness('/mes/maintenance-item/update', { ...itemBody, id, status: 1 }),
+        '已引用 E2E 维保项目停用'
+      )
+      const item = dataOf(await api.getBusiness(`/mes/maintenance-item/get?id=${id}`))
+      if (item?.status !== 1) throw new Error(`E2E 维保项目未停用 id=${id}`)
+      return { retained: true }
+    }
+  )
+  const planId = fixtures.track(await api.postBusiness('/mes/maintenance-plan/create', {
+    planCode: unique('E2E-MP'), planName, coreDomain: domain,
+    items: [{ itemId, seq: 1, standard: 'E2E 目视无异常' }],
+    cycles: [{ cycleType: 'TIME', cycleValue: 1, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
+  }), '维保方案', async (id) => {
+    const plan = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${id}`))
+    if (plan?.status === 'DRAFT') {
+      requireTrueResult(await api.deleteBusiness(`/mes/maintenance-plan/delete?id=${id}`), '草稿方案删除')
+      return
+    }
+    retainItem = true
+    requireTrueResult(await api.putBusiness(`/mes/maintenance-plan/disable?id=${id}`), '已发布 E2E 方案停用')
+    const disabled = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${id}`))
+    if (disabled?.status !== 'DISABLED') throw new Error(`E2E 方案未停用 id=${id}`)
+    caseRecord.notes.push(`已发布 E2E 方案 ${id} 与项目 ${itemId} 已停用并保留版本证据。`)
+    return { retained: true }
+  })
+  const draft = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+  caseRecord.checks.push({
+    name: 'E2E 方案按指定核心域创建草稿与项目版本',
+    passed: draft?.status === 'DRAFT' && draft?.currentVersion === 1 &&
+      draft?.coreDomain === domain && draft?.items?.some((item) => String(item.itemId) === String(itemId)),
+    details: `planId=${planId}, itemId=${itemId}, domain=${domain}`
+  })
+  return { planId, itemId }
+}
+
+const endFixtureEvent = async (api, id, reason) => {
+  const event = dataOf(await api.getBusiness(`/mes/device-status-event/get?id=${encodeURIComponent(id)}`))
+  if (event?.endTime) return
+  const endTime = event?.startTime
+    ? formatLocalDateTime(new Date(new Date(event.startTime).getTime() + 60 * 1000))
+    : formatLocalDateTime(new Date(Date.now() + 60 * 1000))
+  requireTrueResult(
+    await api.putBusiness('/mes/device-status-event/end', { id, endTime, reason }),
+    `结束测试事件 id=${id}`
+  )
+}
+
+export const createFixtureCleanup = ({ caseId, caseRecord }) => {
+  const entries = []
+  return {
+    track (response, label, cleanup) {
+      const id = fixtureId(response, label)
+      entries.push({ id, label, cleanup })
+      return id
+    },
+    async cleanup (caseFailed) {
+      const errors = []
+      for (const { id, label, cleanup } of entries.reverse()) {
+        try {
+          const outcome = await cleanup(id)
+          caseRecord.checks.push({
+            name: outcome?.retained ? `${label}隔离夹具已保留` : `${label}测试数据已清理`,
+            passed: true,
+            details: `id=${id}`
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          caseRecord.checks.push({ name: `${label}测试数据已清理`, passed: false, details: `id=${id}: ${message}` })
+          caseRecord.notes.push(`${caseId} 清理失败 ${label} id=${id}: ${message}`)
+          errors.push(error)
+        }
+      }
+      // Keep the original failure while still reporting every cleanup failure.
+      if (errors.length && !caseFailed) throw new AggregateError(errors, `${caseId} 测试数据清理失败`)
+    }
+  }
+}
+
+export const trackDeletable = (fixtures, api, response, path, label) =>
+  fixtures.track(response, label, async (id) => {
+    requireTrueResult(
+      await api.deleteBusiness(`${path}/delete?id=${encodeURIComponent(id)}`),
+      `${label}清理 id=${id}`
+    )
+  })
+
+const trackRuleFixture = (fixtures, api, response, caseRecord) =>
+  fixtures.track(response, '维保类型规则', async (id) => {
+    requireTrueResult(
+      await api.deleteBusiness(`/mes/maintenance-type-rule/delete?id=${encodeURIComponent(id)}`),
+      `维保类型规则清理 id=${id}`
+    )
+    const tree = dataOf(await api.getBusiness('/mes/maintenance-type-rule/tree'))
+    const containsId = (nodes) =>
+      (nodes || []).some((node) => String(node?.id) === String(id) || containsId(node?.children))
+    const verified = !containsId(tree)
+    caseRecord.checks.push({
+      name: 'E2E 新增的子类型已清理',
+      passed: verified,
+      details: `ruleId=${id}`
+    })
+    if (!verified) throw new Error(`维保类型规则清理后仍可读取：id=${id}`)
+  })
+
+const trackInspectionRecord = (fixtures, api, response) =>
+  fixtures.track(response, '点检记录', async (id) => {
+    await api.deleteBusiness(`/mes/system/record/${encodeURIComponent(id)}`)
+  })
+
+const trackRepairOrder = (fixtures, api, response, caseRecord) =>
+  fixtures.track(response, '维修工单', async (id) => {
+    const detail = dataOf(await api.getBusiness(`/mes/system/order/${encodeURIComponent(id)}`))
+    if (detail?.orderStatus !== 'REPORTED') {
+      caseRecord.notes.push(
+        `维修工单 E2E 夹具 id=${id} 已进入 ${detail?.orderStatus || '终态'}，后端禁止删除；保留为隔离测试数据，不触碰用户工单。`
+      )
+      return { retained: true }
+    }
+    await api.deleteBusiness(`/mes/system/order/${encodeURIComponent(id)}`)
+  })
+
+export const trackEvent = (fixtures, api, response) =>
+  fixtures.track(response, '设备状态事件', (id) => endFixtureEvent(api, id, 'E2E fixture cleanup'))
+
+export const isolatedDeviceId = async (api, layers = ['RUNTIME']) => {
+  const id = 4_000_000_000_000_000 + randomBytes(6).readUIntBE(0, 6)
+  for (const layer of layers) {
+    const active = dataOf(await api.getBusiness(
+      `/mes/device-status-event/active?deviceId=${id}&coreLayer=${layer}`
+    ))
+    if (active !== null) throw new Error(`测试设备 ID 未隔离：deviceId=${id}, coreLayer=${layer}`)
+  }
+  return id
+}
+
 const formatLocalDateTime = (date) => {
   const pad = (value) => String(value).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+export const checkMaintenancePage = async (context, options, dependencies = {}) => {
+  const { page, record, caseRecord, outputDir } = context
+  const { route, labels, name, screenshot } = options
+  let error
+  try {
+    await (dependencies.openRoute || defaultOpenRoute)(page, route, {
+      readyText: labels[0],
+      readyTimeoutMs: options.readyTimeoutMs || 30000
+    })
+  } catch (cause) {
+    error = cause
+  }
+  const text = await page.locator('body').innerText()
+  caseRecord.checks.push({
+    name,
+    passed: !error && labels.every((label) => text.includes(label)),
+    details: error
+      ? `${route}: ${error.message}; body=${text.slice(-1000)}`
+      : route
+  })
+  await (dependencies.saveScreenshot || defaultSaveScreenshot)(page, outputDir, screenshot, record)
 }
 
 const findFirstItem = (nodes) => {
@@ -29,9 +279,27 @@ const findFirstItem = (nodes) => {
   return null
 }
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+export const runCase = async (context, dependencies = {}) => {
+  const token = await (dependencies.login || login)(context.page)
+  const api = (dependencies.createApiClient || createApiClient)({ token, record: context.record })
+  const fixtures = createFixtureCleanup(context)
+  let caseFailed = false
+  try {
+    return await runAuthenticatedCase({ ...context, token, api, fixtures }, dependencies)
+  } catch (error) {
+    caseFailed = true
+    throw error
+  } finally {
+    await fixtures.cleanup(caseFailed)
+  }
+}
+
+const runAuthenticatedCase = async (
+  { caseId, page, record, caseRecord, outputDir, token, api, fixtures },
+  dependencies = {}
+) => {
+  const openRoute = dependencies.openRoute || defaultOpenRoute
+  const saveScreenshot = dependencies.saveScreenshot || defaultSaveScreenshot
   caseRecord.checks.push({
     name: '真实登录成功',
     passed: Boolean(token),
@@ -108,13 +376,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'IOT-006') {
     const suffix = unique('DSM')
-    const created = await api.postBusiness('/mes/device-status-mapping/create', {
+    const created = trackDeletable(fixtures, api, await api.postBusiness('/mes/device-status-mapping/create', {
       coreLayer: 'RUNTIME',
       coreState: 'RUNNING',
       subStateCode: suffix,
       subStateName: '正常运行',
       status: 0
-    })
+    }), '/mes/device-status-mapping', '设备状态映射')
     caseRecord.checks.push({
       name: '运行状态子状态映射到固定核心状态 RUNNING',
       passed: Boolean(created),
@@ -139,41 +407,41 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: '字典页不能自定义核心运行状态'
     })
 
-    const layeredDeviceId = Number(String(Date.now()).slice(-9))
-    const runtimeEventId = await api.postBusiness('/mes/device-status-event/start', {
+    const layeredDeviceId = await isolatedDeviceId(api, ['RUNTIME', 'ASSET', 'CONNECTION'])
+    const runtimeEventId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId: layeredDeviceId,
       deviceName: 'E2E 三层状态设备',
       coreLayer: 'RUNTIME',
       statusCode: 'RUNNING',
       statusName: '运行',
       sourceType: 'MANUAL'
-    })
-    const assetEventId = await api.postBusiness('/mes/device-status-event/start', {
+    }))
+    const assetEventId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId: layeredDeviceId,
       deviceName: 'E2E 三层状态设备',
       coreLayer: 'ASSET',
       statusCode: 'ENABLED',
       statusName: '启用',
       sourceType: 'MANUAL'
-    })
-    const connectionEventId = await api.postBusiness('/mes/device-status-event/start', {
+    }))
+    const connectionEventId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId: layeredDeviceId,
       deviceName: 'E2E 三层状态设备',
       coreLayer: 'CONNECTION',
       statusCode: 'ONLINE',
       statusName: '在线',
       sourceType: 'IOT'
-    })
+    }))
     const [runtimeActive, assetActive, connectionActive] = await Promise.all([
       api.getBusiness(
         `/mes/device-status-event/active?deviceId=${layeredDeviceId}&coreLayer=RUNTIME`
-      ),
+      ).then(dataOf),
       api.getBusiness(
         `/mes/device-status-event/active?deviceId=${layeredDeviceId}&coreLayer=ASSET`
-      ),
+      ).then(dataOf),
       api.getBusiness(
         `/mes/device-status-event/active?deviceId=${layeredDeviceId}&coreLayer=CONNECTION`
-      )
+      ).then(dataOf)
     ])
     caseRecord.checks.push({
       name: '连接/资产/运行三层状态可并存且互不覆盖',
@@ -186,17 +454,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         connectionActive?.statusCode === 'ONLINE',
       details: `runtime=${runtimeActive?.id}, asset=${assetActive?.id}, connection=${connectionActive?.id}`
     })
-    await Promise.all(
-      [runtimeEventId, assetEventId, connectionEventId].map((eventId) =>
-        api.putBusiness('/mes/device-status-event/end', {
-          id: eventId,
-          reason: 'E2E 三层状态清理'
-        })
-      )
-    )
-
     await openRoute(page, '/settings/iot/device-maintenance')
-    await page.waitForTimeout(1200)
+    await waitForPageReady(page)
     const settingsText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '设备维保设置页真实渲染并承载状态映射/类型/项目/方案/分配页签',
@@ -206,20 +465,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: '设置 - 设备与 IoT 下的统一维保设置页'
     })
     await saveScreenshot(page, outputDir, 'iot-006-device-maintenance-settings', record)
-    await api.delete(`/mes/device-status-mapping/delete?id=${created}`)
     return { token, api }
   }
 
   if (caseId === 'MAINT-001') {
     const suffix = unique('MT')
-    const created = await api.postBusiness('/mes/maintenance-type-rule/create', {
+    const created = trackDeletable(fixtures, api, await api.postBusiness('/mes/maintenance-type-rule/create', {
       coreDomain: 'UPKEEP',
       subTypeCode: suffix,
       subTypeName: '日常保养',
       approvalRequired: true,
       slaHours: 24,
       status: 0
-    })
+    }), '/mes/maintenance-type-rule', '维保类型规则')
     caseRecord.checks.push({
       name: '保养子类型映射固定核心域 UPKEEP',
       passed: Boolean(created),
@@ -241,12 +499,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: invalidRejected,
       details: '核心域固定为维修/保养/巡检'
     })
-    await api.delete(`/mes/maintenance-type-rule/delete?id=${created}`)
     return { token, api }
   }
 
   if (caseId === 'MAINT-002') {
-    const tree = await api.getBusiness('/mes/maintenance-item/tree')
+    const tree = dataOf(await api.getBusiness('/mes/maintenance-item/tree'))
     const roots = (tree || []).map((node) => node.categoryRoot)
     caseRecord.checks.push({
       name: '三类固定根分类自动就绪',
@@ -255,7 +512,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     const rootId = (tree || []).find((node) => node.categoryRoot === 'INSPECT')?.id
     const suffix = unique('MI')
-    const created = await api.postBusiness('/mes/maintenance-item/create', {
+    const created = trackDeletable(fixtures, api, await api.postBusiness('/mes/maintenance-item/create', {
       parentId: rootId,
       categoryRoot: 'INSPECT',
       nodeType: 'ITEM',
@@ -263,206 +520,163 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       itemName: '巡检项目',
       resultType: 'BOOLEAN',
       status: 0
-    })
+    }), '/mes/maintenance-item', '维保项目')
     caseRecord.checks.push({
       name: '可在固定根分类下创建项目',
       passed: Boolean(created),
       details: `id=${created}`
     })
-    await api.delete(`/mes/maintenance-item/delete?id=${created}`)
     return { token, api }
   }
 
   if (caseId === 'MAINT-003') {
-    const tree = await api.getBusiness('/mes/maintenance-item/tree')
-    let item = findFirstItem(tree)
-    if (!item) {
-      const rootId = (tree || []).find((node) => node.categoryRoot === 'UPKEEP')?.id
-      const itemId = await api.postBusiness('/mes/maintenance-item/create', {
-        parentId: rootId,
-        categoryRoot: 'UPKEEP',
-        nodeType: 'ITEM',
-        itemCode: unique('MI'),
-        itemName: '临时保养项',
-        resultType: 'BOOLEAN',
-        status: 0
-      })
-      item = { id: itemId, version: 1, categoryRoot: 'UPKEEP' }
-    }
-    const suffix = unique('MP')
-    const planId = await api.postBusiness('/mes/maintenance-plan/create', {
-      planCode: suffix,
-      planName: 'E2E 维保方案',
-      coreDomain: item.categoryRoot || 'UPKEEP',
-      items: [{ itemId: item.id, seq: 1, standard: '目视无异常' }],
-      cycles: [{ cycleType: 'TIME', cycleValue: 7, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
-    })
-    await api.put(`/mes/maintenance-plan/publish?id=${planId}`)
-    const detail = await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`)
+    const fixture = await createPlanFixture(api, fixtures, caseRecord, 'UPKEEP', 'E2E 维保方案')
+    if (!fixture) return { token, api, partial: true, note: '缺少保养项目根分类前置' }
+    const { planId } = fixture
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const detail = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
     caseRecord.checks.push({
       name: '方案发布后记录已发布版本',
-      passed: detail.status === 'PUBLISHED' && detail.publishedVersion === detail.currentVersion,
+      passed: detail?.status === 'PUBLISHED' &&
+        String(detail.publishedVersion) === String(detail.currentVersion),
       details: `status=${detail.status}, version=${detail.publishedVersion}`
     })
-    let deleteRejected = false
-    try {
-      await api.delete(`/mes/maintenance-plan/delete?id=${planId}`)
-    } catch (error) {
-      deleteRejected = true
-    }
+    const deleteResult = await api.delete(`/mes/maintenance-plan/delete?id=${planId}`)
+    const deleteRejected = isExpectedRejection(deleteResult, '不能删除')
     caseRecord.checks.push({
       name: '已发布方案禁止删除',
       passed: deleteRejected,
       details: '发布版本只能停用，保留任务快照'
     })
-    await api.put(`/mes/maintenance-plan/disable?id=${planId}`)
+    await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
     return { token, api }
   }
 
   if (caseId === 'MAINT-004') {
-    const tree = await api.getBusiness('/mes/maintenance-item/tree')
-    let item = findFirstItem(tree)
-    if (!item) {
-      const rootId = (tree || []).find((node) => node.categoryRoot === 'REPAIR')?.id
-      const itemId = await api.postBusiness('/mes/maintenance-item/create', {
-        parentId: rootId,
-        categoryRoot: 'REPAIR',
-        nodeType: 'ITEM',
-        itemCode: unique('MI'),
-        itemName: '临时维修项',
-        resultType: 'BOOLEAN',
-        status: 0
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置' }
+    const fixture = await createPlanFixture(api, fixtures, caseRecord, 'REPAIR', 'E2E 分配方案')
+    if (!fixture) return { token, api, partial: true, note: '缺少维修项目根分类前置' }
+    const { planId } = fixture
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const trackAssignment = async (body, label) => {
+      const response = await api.postBusiness('/mes/maintenance-plan-assignment/create', body)
+      const id = fixtures.track(response, label, async (assignmentId) => {
+        requireTrueResult(
+          await api.deleteBusiness(`/mes/maintenance-plan-assignment/delete?id=${assignmentId}`),
+          `${label}清理`
+        )
       })
-      item = { id: itemId, version: 1, categoryRoot: 'REPAIR' }
+      return id
     }
-    const planId = await api.postBusiness('/mes/maintenance-plan/create', {
-      planCode: unique('MP'),
-      planName: 'E2E 分配方案',
-      coreDomain: item.categoryRoot || 'REPAIR',
-      items: [{ itemId: item.id, seq: 1 }],
-      cycles: [{ cycleType: 'TIME', cycleValue: 30, cycleUnit: 'DAY' }]
-    })
-    await api.put(`/mes/maintenance-plan/publish?id=${planId}`)
-    const deviceTypeKey = unique('DT')
-    const typeAssignment = await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+    const deviceTypeKey = unique('E2E-DT')
+    const typeAssignment = await trackAssignment({
       targetType: 'DEVICE_TYPE',
       targetKey: deviceTypeKey,
       planId,
       planVersion: 1,
       priority: 1,
       status: 0
-    })
-    const deviceAssignment = await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+    }, '设备类型方案分配')
+    const deviceAssignment = await trackAssignment({
       targetType: 'DEVICE',
-      targetId: 999999001,
+      targetId: device.id,
       planId,
       planVersion: 1,
       priority: 1,
       status: 0
-    })
-    const hit = await api.getBusiness(
-      `/mes/maintenance-plan-assignment/resolve?deviceId=999999001&deviceType=${deviceTypeKey}`
-    )
+    }, '单设备方案分配')
+    const hit = dataOf(await api.getBusiness(
+      `/mes/maintenance-plan-assignment/resolve?deviceId=${device.id}&productId=${device.productId}&deviceType=${deviceTypeKey}`
+    ))
     caseRecord.checks.push({
       name: '单设备分配优先于设备类型分配',
-      passed: hit?.id === deviceAssignment && deviceAssignment !== typeAssignment,
+      passed: String(hit?.id) === String(deviceAssignment) &&
+        String(deviceAssignment) !== String(typeAssignment),
       details: `hit=${hit?.id} device=${deviceAssignment} type=${typeAssignment}`
     })
-    await api.delete(`/mes/maintenance-plan-assignment/delete?id=${deviceAssignment}`)
-    await api.delete(`/mes/maintenance-plan-assignment/delete?id=${typeAssignment}`)
-    await api.put(`/mes/maintenance-plan/disable?id=${planId}`)
-    return { token, api }
+    caseRecord.notes.push('未向共享 IoT 产品或真实公共设备类型建立分配；产品型号中间层与类型回退仍需专属 E2E 产品前置。')
+    return { token, api, partial: true, note: '单设备优先于隔离类型分配已验证，三级回退缺少专属 E2E 产品前置' }
   }
 
   if (caseId === 'MAINT-005') {
-    const tree = await api.getBusiness('/mes/maintenance-item/tree')
-    let item = findFirstItem(tree)
-    if (!item) {
-      const rootId = (tree || []).find((node) => node.categoryRoot === 'INSPECT')?.id
-      const itemId = await api.postBusiness('/mes/maintenance-item/create', {
-        parentId: rootId,
-        categoryRoot: 'INSPECT',
-        nodeType: 'ITEM',
-        itemCode: unique('MI'),
-        itemName: '临时巡检项',
-        resultType: 'BOOLEAN',
-        status: 0
-      })
-      item = { id: itemId, version: 1, categoryRoot: 'INSPECT' }
-    }
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置' }
     const planName = `E2E 巡检运行计划-${Date.now().toString(36).toUpperCase()}`
-    const planId = await api.postBusiness('/mes/maintenance-plan/create', {
-      planCode: unique('MP'),
-      planName,
-      coreDomain: 'INSPECT',
-      items: [{ itemId: item.id, seq: 1, standard: '记录运行参数' }],
-      cycles: [{ cycleType: 'TIME', cycleValue: 1, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
-    })
+    const fixture = await createPlanFixture(api, fixtures, caseRecord, 'INSPECT', planName)
+    if (!fixture) return { token, api, partial: true, note: '缺少巡检项目根分类前置' }
+    const { planId } = fixture
     // 先建立设备范围分配，再发布方案，发布时才会生成运行计划
-    const assignmentId = await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+    const assignmentId = fixtures.track(await api.postBusiness('/mes/maintenance-plan-assignment/create', {
       targetType: 'DEVICE',
-      targetId: 999999001,
+      targetId: device.id,
       planId,
       planVersion: 1,
       priority: 1,
       status: 0
+    }), '巡检方案设备分配', async (id) => {
+      requireTrueResult(
+        await api.deleteBusiness(`/mes/maintenance-plan-assignment/delete?id=${id}`),
+        '巡检方案设备分配清理'
+      )
     })
-    await api.put(`/mes/maintenance-plan/publish?id=${planId}`)
-    const page = await api.getBusiness(
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const runtimePage = dataOf(await api.getBusiness(
       `/mes/system/plan/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(planName)}`
-    )
-    const runtimePlan = (page?.records || []).find((row) => row.sourcePlanId === planId)
+    ))
+    const runtimeRows = requiredRows(runtimePage, '巡检运行计划')
+    const runtimePlan = runtimeRows.find((row) => String(row.sourcePlanId) === String(planId))
     caseRecord.checks.push({
       name: '巡检方案发布后生成 inspection_plan 运行计划并保存分配与方案版本快照',
       passed:
         Boolean(runtimePlan) &&
-        runtimePlan.assignmentId === assignmentId &&
-        runtimePlan.sourcePlanVersion === 1 &&
+        String(runtimePlan.assignmentId) === String(assignmentId) &&
+        Number(runtimePlan.sourcePlanVersion) === 1 &&
         Boolean(runtimePlan.cycleRuleSnapshot),
       details: `runtimePlan=${runtimePlan?.id}, assignment=${assignmentId}, version=${runtimePlan?.sourcePlanVersion}`
     })
     if (runtimePlan?.id) {
-      await api.delete(`/mes/system/plan/${runtimePlan.id}`)
+      fixtures.track(runtimePlan.id, '巡检运行计划', async (id) => {
+        await api.deleteBusiness(`/mes/system/plan/${id}`)
+      })
     }
-    await api.delete(`/mes/maintenance-plan-assignment/delete?id=${assignmentId}`)
-    await api.put(`/mes/maintenance-plan/disable?id=${planId}`)
     return { token, api }
   }
 
   if (caseId === 'MAINT-006') {
     // PB-321 设备状态事件：单设备唯一有效状态、时长计算与状态编码校验
-    const deviceId = 999999321
-    const firstId = await api.postBusiness('/mes/device-status-event/start', {
+    const deviceId = await isolatedDeviceId(api)
+    const firstId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId,
       deviceName: 'E2E 状态设备',
       coreLayer: 'RUNTIME',
       statusCode: 'RUNNING',
       statusName: '运行',
       sourceType: 'MANUAL'
-    })
-    const activeRunning = await api.getBusiness(
+    }))
+    const activeRunning = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
-    )
+    ))
     caseRecord.checks.push({
       name: '开始状态后该设备仅有一个有效状态事件',
       passed: activeRunning?.id === firstId && activeRunning?.statusCode === 'RUNNING',
       details: `activeId=${activeRunning?.id}, firstId=${firstId}`
     })
 
-    const secondId = await api.postBusiness('/mes/device-status-event/start', {
+    const secondId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId,
       coreLayer: 'RUNTIME',
       statusCode: 'STOPPED',
       statusName: '停机',
       sourceType: 'REPAIR_ORDER',
       reason: 'E2E 切换'
-    })
-    const activeStopped = await api.getBusiness(
+    }))
+    const activeStopped = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
-    )
-    const eventPage = await api.getBusiness(
+    ))
+    const eventPage = dataOf(await api.getBusiness(
       `/mes/device-status-event/page?pageNo=1&pageSize=100&deviceId=${deviceId}`
-    )
+    ))
     const firstEvent = (eventPage?.list || []).find((row) => row.id === firstId)
     caseRecord.checks.push({
       name: '再次开始新状态自动结束上一有效状态并计算持续分钟',
@@ -481,32 +695,43 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     caseRecord.checks.push({
       name: '未知状态编码被拒（未映射平台固定核心状态）',
-      passed: invalid?.code !== 0,
+      passed: isExpectedRejection(invalid, 'NOT_A_STATE'),
       details: `code=${invalid?.code}, msg=${invalid?.msg || ''}`
     })
 
+    const secondEvent = dataOf(await api.getBusiness(`/mes/device-status-event/get?id=${secondId}`))
+    const secondEndTime = formatLocalDateTime(
+      new Date(new Date(secondEvent.startTime).getTime() + 60 * 1000)
+    )
     await api.putBusiness('/mes/device-status-event/end', {
       id: secondId,
+      endTime: secondEndTime,
       reason: 'E2E 结束'
     })
-    const endedAgain = await api.putBusiness('/mes/device-status-event/end', { id: secondId })
-    const activeAfterEnd = await api.getBusiness(
+    const endedAgain = dataOf(await api.putBusiness('/mes/device-status-event/end', { id: secondId }))
+    const activeAfterEnd = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
-    )
+    ))
     caseRecord.checks.push({
       name: '结束状态后无有效状态，重复结束幂等',
       passed: endedAgain === true && !activeAfterEnd,
       details: `activeAfterEnd=${activeAfterEnd === null ? 'null' : JSON.stringify(activeAfterEnd)}`
     })
 
-    await openRoute(page, '/iot/maintenance/device-status')
+    await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, { readyText: '统计周期' })
+    const pageText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '设备状态事件页展示状态层与是否有效',
+      passed: pageText.includes('状态层') && pageText.includes('是否有效'),
+      details: `真实打开 ${MAINT_011_DEVICE_STATUS_ROUTE}`
+    })
     await saveScreenshot(page, outputDir, 'maint-006-device-status', record)
     return { token, api }
   }
 
   if (caseId === 'MAINT-007') {
     // PB-326 设备状态时长统计：区间裁剪、开机率与前端统计面板
-    const deviceId = 999999326
+    const deviceId = await isolatedDeviceId(api)
     const rangeEnd = new Date()
     const switchTime = new Date(rangeEnd.getTime() - 30 * 60 * 1000)
     const rangeStart = new Date(rangeEnd.getTime() - 60 * 60 * 1000)
@@ -514,7 +739,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const stoppedTime = formatLocalDateTime(switchTime)
     const endTime = formatLocalDateTime(rangeEnd)
 
-    await api.postBusiness('/mes/device-status-event/start', {
+    trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId,
       deviceName: 'E2E 统计设备',
       coreLayer: 'RUNTIME',
@@ -522,8 +747,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       statusName: '运行',
       startTime,
       sourceType: 'MANUAL'
-    })
-    const stoppedEventId = await api.postBusiness('/mes/device-status-event/start', {
+    }))
+    const stoppedEventId = dataOf(await api.postBusiness('/mes/device-status-event/start', {
       deviceId,
       coreLayer: 'RUNTIME',
       statusCode: 'STOPPED',
@@ -531,16 +756,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       startTime: stoppedTime,
       sourceType: 'MANUAL',
       reason: 'E2E 停机统计'
-    })
-    const statistics = await api.getBusiness(
+    }))
+    fixtures.track(stoppedEventId, '设备状态事件', (id) => endFixtureEvent(api, id, 'E2E fixture cleanup'))
+    const statistics = dataOf(await api.getBusiness(
       `/mes/device-status-event/statistics?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
-    )
+    ))
     caseRecord.checks.push({
       name: '设备状态统计按区间交集计算运行、停机时长和开机率',
       passed:
-        statistics?.totalMinutes === 60 &&
-        statistics?.runningMinutes === 30 &&
-        statistics?.downtimeMinutes === 30 &&
+        Number(statistics?.totalMinutes) === 60 &&
+        Number(statistics?.runningMinutes) === 30 &&
+        Number(statistics?.downtimeMinutes) === 30 &&
         Number(statistics?.utilizationRate) === 50,
       details: JSON.stringify(statistics)
     })
@@ -549,21 +775,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       id: stoppedEventId,
       reason: 'E2E 统计结束'
     })
-    const activeAfterEnd = await api.getBusiness(
+    const activeAfterEnd = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
-    )
+    ))
     caseRecord.checks.push({
       name: '统计完成后可正常结束状态且不残留当前有效状态',
       passed: !activeAfterEnd,
       details: `active=${activeAfterEnd === null ? 'null' : JSON.stringify(activeAfterEnd)}`
     })
 
-    await openRoute(page, '/iot/maintenance/device-status')
+    await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, { readyText: '统计周期' })
     await page.waitForTimeout(1200)
     const pageText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '设备状态页真实渲染运行时长、停机时长和开机率统计面板',
-      passed: ['设备状态统计', '运行时长', '停机时长', '开机率'].every((label) =>
+      passed: ['统计周期', '运行时长', '停机时长', '开机率'].every((label) =>
         pageText.includes(label)
       ),
       details: '状态事件列表页内联统计查询'
@@ -574,7 +800,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'MAINT-008') {
     // PB-322 维修工单状态机：派工→接单→开工→备件领用→完工→验收关闭，以及非法流转与关闭后只读
-    const permission = await api.get('/system/auth/get-permission-info')
+    await checkMaintenancePage({ page, record, caseRecord, outputDir }, {
+      route: MAINT_008_REPAIR_ORDER_ROUTE,
+      labels: ['维修工单工作台', '待派工', '处理中', '已完成'],
+      name: '维修工单页真实渲染状态机动作入口',
+      screenshot: 'maint-008-repair-order-workflow'
+    }, dependencies)
+    const permission = dataOf(await api.get('/system/auth/get-permission-info'))
     const assigneeUserId = permission?.user?.id
     caseRecord.checks.push({
       name: '登录权限信息返回当前用户，可作为维修责任人',
@@ -582,17 +814,33 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `assigneeUserId=${assigneeUserId}`
     })
 
-    const deviceId = 999999322
-    const created = await api.postBusiness('/mes/system/order/add', {
-      orderNo: unique('WX'),
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品，未创建维修工单' }
+    const deviceId = device.id
+    fixtures.track(deviceId, '维修工单设备状态事件', async (fixtureDeviceId) => {
+      const active = dataOf(await api.getBusiness(
+        `/mes/device-status-event/active?deviceId=${fixtureDeviceId}&coreLayer=RUNTIME`
+      ))
+      if (active?.id) {
+        await endFixtureEvent(api, active.id, 'E2E 维修工单失败清理')
+      }
+    })
+    if (assigneeUserId == null) {
+      throw new Error('BLOCKED: 权限信息未返回当前用户 ID，未创建维修工单夹具')
+    }
+
+    const created = dataOf(await api.postBusiness('/mes/system/order/add', {
+      orderNo: unique('E2E-WX'),
       orderContent: 'E2E 维修工单：设备运行异响',
       projectName: 'E2E 设备项目',
       deviceId,
       priority: '中',
       faultLevel: '一般',
       faultCauseCategory: 'mechanical'
-    })
+    }))
     const orderId = created?.id
+    if (!orderId) throw new Error('维修工单夹具创建未返回 ID')
+    trackRepairOrder(fixtures, api, orderId, caseRecord)
     caseRecord.checks.push({
       name: '报修只落待派工状态并初始化状态机版本',
       passed: Boolean(orderId) && created?.orderStatus === 'REPORTED' && created?.workflowVersion === 0,
@@ -602,39 +850,39 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const illegalClose = await api.post(`/mes/system/order/${orderId}/close`, {})
     caseRecord.checks.push({
       name: '待派工工单不能直接跳步验收关闭',
-      passed: illegalClose?.code !== 0,
+      passed: isWorkflowRejection(illegalClose, '不允许执行验收关闭'),
       details: `code=${illegalClose?.code}, msg=${illegalClose?.msg || ''}`
     })
 
-    const dispatched = await api.postBusiness(`/mes/system/order/${orderId}/dispatch`, {
+    const dispatched = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/dispatch`, {
       assigneeUserId,
       assigneeName: permission?.user?.nickname || 'E2E 维修员',
       actionTime: formatLocalDateTime(new Date()),
       remark: 'E2E 派工'
-    })
+    }))
     caseRecord.checks.push({
       name: '派工后进入已派工并记录责任人',
       passed: dispatched?.orderStatus === 'DISPATCHED' && Number(dispatched?.userId) === Number(assigneeUserId),
       details: `status=${dispatched?.orderStatus}, userId=${dispatched?.userId}`
     })
 
-    const accepted = await api.postBusiness(`/mes/system/order/${orderId}/accept`, {
+    const accepted = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/accept`, {
       workflowVersion: dispatched?.workflowVersion,
       remark: 'E2E 接单'
-    })
+    }))
     caseRecord.checks.push({
       name: '责任人接单后进入已接单',
       passed: accepted?.orderStatus === 'ACCEPTED' && Boolean(accepted?.acceptTime),
       details: `status=${accepted?.orderStatus}, acceptTime=${accepted?.acceptTime}`
     })
 
-    const repairing = await api.postBusiness(`/mes/system/order/${orderId}/start-repair`, {
+    const repairing = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/start-repair`, {
       workflowVersion: accepted?.workflowVersion,
       remark: 'E2E 开工'
-    })
-    const activeRepairing = await api.getBusiness(
+    }))
+    const activeRepairing = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
-    )
+    ))
     caseRecord.checks.push({
       name: '开工驱动关联设备进入维修中状态事件',
       passed:
@@ -644,16 +892,41 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `status=${repairing?.orderStatus}, active=${activeRepairing?.statusCode}`
     })
 
-    const materialPage = await api.getBusiness('/mes/basMaterial/list?pageNo=1&pageSize=1')
-    const materialRows = materialPage?.records || materialPage?.list || []
-    const materialId = materialRows[0]?.id || materialRows[0]?.materialId || 'E2E-MAT-001'
-    const spareOutBillId = await api.postBusiness(`/mes/system/order/${orderId}/spare-out`, {
+    const materialPage = dataOf(await api.getBusiness('/mes/basMaterial/list?pageNo=1&pageSize=100'))
+    const materialRows = requiredRows(materialPage, '备件存货')
+    const material = materialRows.find((item) => isE2eFixture(item) && item.unitId)
+    const materialId = material?.id || material?.materialId
+    const warehouseTree = dataOf(await api.getBusiness('/mes/wmsWareHouse/allTree'))
+    const warehouseRows = Array.isArray(warehouseTree)
+      ? warehouseTree
+      : warehouseTree?.list || warehouseTree?.records || []
+    const findFixtureWarehouse = (nodes) => {
+      for (const node of nodes || []) {
+        if (node?.id != null && isE2eFixture(node)) return node
+        const child = findFixtureWarehouse(node?.children)
+        if (child) return child
+      }
+      return null
+    }
+    const warehouse = findFixtureWarehouse(warehouseRows)
+    if (!materialId || !warehouse?.id) {
+      caseRecord.notes.push(
+        `缺少明确 E2E 备件或仓库夹具：materialId=${materialId ?? 'none'}, warehouseId=${warehouse?.id ?? 'none'}；未执行备件出库/完工/关闭。`
+      )
+      return {
+        token,
+        api,
+        partial: true,
+        note: '维修工单已验证至开工，缺少明确 E2E 备件或仓库夹具，未生成关联共享主数据的出库草稿；备件/完工/关闭待复测'
+      }
+    }
+    const spareOutBillId = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/spare-out`, {
       workflowVersion: repairing?.workflowVersion,
-      warehouseId: 'WH-E2E-001',
+      warehouseId: warehouse.id,
       remark: 'E2E 备件领用',
-      spareParts: [{ materialId, qty: 2, unitId: materialRows[0]?.unitId, cost: 15.5 }]
-    })
-    const afterSpareOut = await api.getBusiness(`/mes/system/order/${orderId}`)
+      spareParts: [{ materialId, qty: 2, unitId: material.unitId, cost: 15.5 }]
+    }))
+    const afterSpareOut = dataOf(await api.getBusiness(`/mes/system/order/${orderId}`))
     caseRecord.checks.push({
       name: '备件领用生成 WMS 其他出库草稿单并回写费用',
       passed:
@@ -663,9 +936,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `billId=${spareOutBillId}, partsCost=${afterSpareOut?.partsCost}`
     })
 
-    const spareOutBill = await api.getBusiness(
+    const spareOutBill = dataOf(await api.getBusiness(
       `/mes/stkIo/queryById?id=${encodeURIComponent(spareOutBillId)}`
-    )
+    ))
     caseRecord.checks.push({
       name: '备件出库单类型为 299 其他出库且来源指向维修工单',
       passed:
@@ -677,13 +950,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       }/${spareOutBill?.srcBillId || spareOutBill?.sourceBillId}`
     })
 
-    const completed = await api.postBusiness(`/mes/system/order/${orderId}/complete-repair`, {
+    const completed = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/complete-repair`, {
       workflowVersion: afterSpareOut?.workflowVersion,
       repairResult: '紧固轴承并复测，运行正常',
       workHours: 2.5,
       laborCost: 120,
       remark: 'E2E 完工'
-    })
+    }))
     caseRecord.checks.push({
       name: '完工后进入待验收并汇总工时与总费用',
       passed:
@@ -693,14 +966,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `status=${completed?.orderStatus}, totalCost=${completed?.totalCost}`
     })
 
-    const closed = await api.postBusiness(`/mes/system/order/${orderId}/close`, {
+    const closed = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/close`, {
       workflowVersion: completed?.workflowVersion,
       finalStatusCode: 'RUNNING',
       remark: 'E2E 验收关闭'
-    })
-    const activeRunning = await api.getBusiness(
+    }))
+    const activeRunning = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
-    )
+    ))
     caseRecord.checks.push({
       name: '验收关闭后工单只读，并把设备驱动回运行终态',
       passed:
@@ -717,7 +990,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     caseRecord.checks.push({
       name: '关闭后基础信息不可再直接修改',
-      passed: editAfterClose?.code !== 0,
+      passed: isWorkflowRejection(editAfterClose, '基础信息只能通过状态机动作修改'),
       details: `code=${editAfterClose?.code}, msg=${editAfterClose?.msg || ''}`
     })
 
@@ -727,74 +1000,92 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     caseRecord.checks.push({
       name: '终态工单不接受过期状态机版本的派工',
-      passed: staleDispatch?.code !== 0,
+      passed: isWorkflowRejection(staleDispatch, '不允许执行'),
       details: `code=${staleDispatch?.code}, msg=${staleDispatch?.msg || ''}`
     })
 
-    await openRoute(page, '/iot/maintenance/repair-order')
-    await page.waitForTimeout(1200)
-    const pageText = await page.locator('body').innerText()
-    caseRecord.checks.push({
-      name: '维修工单页真实渲染状态机动作入口',
-      passed: ['维修工单工作台', '待派工', '处理中', '已完成'].every((label) =>
-        pageText.includes(label)
-      ),
-      details: '维修工单列表页状态与指标'
-    })
-    await saveScreenshot(page, outputDir, 'maint-008-repair-order-workflow', record)
-
     if (activeRunning?.id) {
-      await api.putBusiness('/mes/device-status-event/end', {
-        id: activeRunning.id,
-        reason: 'E2E 清理'
-      })
+      await endFixtureEvent(api, activeRunning.id, 'E2E 清理')
     }
     return { token, api }
   }
 
   if (caseId === 'MAINT-009') {
     // PB-324：异常项必须转维修或隐患整改，漏检/补检/代检必须保留原因与审批。
-    let missingActionRejected = false
-    try {
-      await api.postBusiness('/mes/system/record/add', {
-        inspectionMode: 'NORMAL',
-        abnormalFlag: '1',
-        inspectionRemark: '异常项未选择处置方式'
-      })
-    } catch (error) {
-      missingActionRejected = true
-    }
+    await checkMaintenancePage({ page, record, caseRecord, outputDir }, {
+      route: MAINT_009_INSPECTION_RECORD_ROUTE,
+      labels: ['点检方式', '审批状态'],
+      name: '点检记录页展示点检方式与审批状态',
+      screenshot: 'maint-009-inspection-exception'
+    }, dependencies)
+    const missingAction = await api.post('/mes/system/record/add', {
+      inspectionMode: 'NORMAL',
+      abnormalFlag: '1',
+      inspectionRemark: 'E2E 异常项未选择处置方式'
+    })
+    if (dataOf(missingAction)?.id) trackInspectionRecord(fixtures, api, dataOf(missingAction).id)
     caseRecord.checks.push({
       name: '异常点检项未选择处置方式被拒绝',
-      passed: missingActionRejected,
-      details: '异常项必须转维修或隐患整改'
+      passed: isExpectedRejection(missingAction, '异常点检项必须处置'),
+      details: JSON.stringify(missingAction)
     })
 
-    let missingReasonRejected = false
-    try {
-      await api.postBusiness('/mes/system/record/add', {
-        inspectionMode: 'MISSED',
-        abnormalFlag: '0',
-        inspectionRemark: '漏检未填原因'
-      })
-    } catch (error) {
-      missingReasonRejected = true
-    }
+    const missingReason = await api.post('/mes/system/record/add', {
+      inspectionMode: 'MISSED',
+      abnormalFlag: '0',
+      inspectionRemark: 'E2E 漏检未填原因'
+    })
+    if (dataOf(missingReason)?.id) trackInspectionRecord(fixtures, api, dataOf(missingReason).id)
     caseRecord.checks.push({
       name: '漏检未填写原因被拒绝',
-      passed: missingReasonRejected,
-      details: '漏检、补检、代检必须保留原因'
+      passed: isExpectedRejection(missingReason, '漏检、补检、代检必须填写原因'),
+      details: JSON.stringify(missingReason)
     })
 
-    const hazardRecord = await api.postBusiness('/mes/system/record/add', {
+    const taskPage = dataOf(await api.getBusiness('/mes/system/task/list?pageNo=1&pageSize=100'))
+    const taskRows = requiredRows(taskPage, '点检任务')
+    const task = taskRows.find((item) =>
+      item?.id != null && item.deviceId != null &&
+      isE2eFixture({ name: item.planName, code: item.projectName }) &&
+      item.inspectionRecordId == null
+    )
+    if (!task) {
+      caseRecord.notes.push('当前租户没有带设备的正式点检任务，未伪造任务 ID；隐患/补检正向写侧保留 PARTIAL。')
+      return {
+        token,
+        api,
+        partial: true,
+        note: '缺少带设备且未执行的正式 E2E 点检任务，未执行需要任务事实的正向异常处置与审批'
+      }
+    }
+    const taskDevice = dataOf(await api.getBusiness(`/iot/device/get?id=${task.deviceId}`))
+    if (!isE2eFixture({ name: taskDevice?.deviceName, code: taskDevice?.serialNumber })) {
+      return { token, api, partial: true, note: 'E2E 任务未绑定 E2E 专用设备，不改动共享设备或任务事实' }
+    }
+    const taskFields = {
+      taskId: task.id,
+      deviceId: task.deviceId,
+      deviceIds: task.deviceIds,
+      planId: task.planId,
+      inspectionPlanId: task.planId,
+      planName: task.planName,
+      planContent: task.planContent,
+      projectName: task.projectName
+    }
+    const hazardRecord = dataOf(await api.postBusiness('/mes/system/record/add', {
+      ...taskFields,
       inspectionMode: 'NORMAL',
       abnormalFlag: '1',
       exceptionAction: 'HAZARD',
-      inspectionRemark: '现场发现渗漏隐患',
-      hazardRemark: '安排停机前临时封堵',
+      inspectionRemark: 'E2E 现场发现渗漏隐患',
+      hazardRemark: 'E2E 安排停机前临时封堵',
       inspectionStatus: '2'
-    })
-    const hazardDetail = await api.getBusiness(`/mes/system/record/${hazardRecord?.id}`)
+    }))
+    if (!hazardRecord?.id) {
+      throw new Error('异常点检创建成功响应未返回记录 ID')
+    }
+    trackInspectionRecord(fixtures, api, hazardRecord.id)
+    const hazardDetail = dataOf(await api.getBusiness(`/mes/system/record/${hazardRecord.id}`))
     caseRecord.checks.push({
       name: '异常项转隐患整改登记待整改',
       passed:
@@ -804,14 +1095,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `id=${hazardRecord?.id}, hazardStatus=${hazardDetail?.hazardStatus}`
     })
 
-    const supplementRecord = await api.postBusiness('/mes/system/record/add', {
+    const supplementRecord = dataOf(await api.postBusiness('/mes/system/record/add', {
+      ...taskFields,
       inspectionMode: 'SUPPLEMENT',
-      inspectionReason: '漏检后按计划补充点检',
+      inspectionReason: 'E2E 漏检后按计划补充点检',
       abnormalFlag: '0',
-      inspectionRemark: '补检结果正常',
+      inspectionRemark: 'E2E 补检结果正常',
       inspectionStatus: '1'
-    })
-    const pendingDetail = await api.getBusiness(`/mes/system/record/${supplementRecord?.id}`)
+    }))
+    if (!supplementRecord?.id) {
+      throw new Error('补检创建成功响应未返回记录 ID')
+    }
+    trackInspectionRecord(fixtures, api, supplementRecord.id)
+    const pendingDetail = dataOf(await api.getBusiness(`/mes/system/record/${supplementRecord.id}`))
     caseRecord.checks.push({
       name: '补检记录自动进入审批中',
       passed: pendingDetail?.approvalStatus === 'PENDING',
@@ -821,7 +1117,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       approved: true,
       opinion: 'E2E 同意补检'
     })
-    const approvedDetail = await api.getBusiness(`/mes/system/record/${supplementRecord?.id}`)
+    const approvedDetail = dataOf(await api.getBusiness(`/mes/system/record/${supplementRecord.id}`))
     caseRecord.checks.push({
       name: '补检审批通过并写入审批人快照',
       passed:
@@ -831,38 +1127,44 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `status=${approvedDetail?.approvalStatus}, approver=${approvedDetail?.approverName}`
     })
 
-    await openRoute(page, '/iot/maintenance/inspection-record')
-    await page.waitForTimeout(1200)
-    const pageText = await page.locator('body').innerText()
-    caseRecord.checks.push({
-      name: '点检记录页展示点检方式与审批状态',
-      passed: pageText.includes('点检方式') && pageText.includes('审批状态'),
-      details: '点检记录列表页字段'
-    })
-    await saveScreenshot(page, outputDir, 'maint-009-inspection-exception', record)
-    return { token, api }
+    return {
+      token, api, partial: true,
+      note: '独立点检记录的隐患登记与补检审批已验证；缺少正式 E2E 点检任务，转维修及漏检/代检审批完整链路未验证'
+    }
   }
 
   if (caseId === 'MAINT-010') {
     // PB-325：设备履历不可删除时间线 + 回写失败待补偿任务。
-    const deviceId = 1
+    await checkMaintenancePage({ page, record, caseRecord, outputDir }, {
+      route: MAINT_010_LIFECYCLE_ROUTE,
+      labels: ['事件类型', '设备ID'],
+      name: '设备履历页展示时间线查询入口',
+      screenshot: 'maint-010-device-lifecycle'
+    })
+    await checkMaintenancePage({ page, record, caseRecord, outputDir }, {
+      route: MAINT_010_COMPENSATION_ROUTE,
+      labels: ['回写类型', '状态'],
+      name: '设备回写补偿页展示待补偿列表',
+      screenshot: 'maint-010-device-compensation'
+    })
+    const deviceId = await isolatedDeviceId(api, ['RUNTIME'])
     const marker = unique('LIFECYCLE')
-    const eventId = await api.postBusiness('/mes/device-lifecycle/event', {
+    const eventId = dataOf(await api.postBusiness('/mes/device-lifecycle/event', {
       deviceId,
       eventType: 'MANUAL',
       title: `E2E 履历事件 ${marker}`,
       content: 'E2E 校验履历时间线追加'
-    })
+    }))
     caseRecord.checks.push({
       name: '设备履历事件可追加且返回主键',
       passed: Boolean(eventId),
       details: `eventId=${eventId}`
     })
 
-    const timeline = await api.getBusiness(
+    const timeline = dataOf(await api.getBusiness(
       `/mes/device-lifecycle/timeline?deviceId=${deviceId}&pageNo=1&pageSize=50`
-    )
-    const timelineList = timeline?.list || []
+    ))
+    const timelineList = timeline?.list || timeline?.records || []
     caseRecord.checks.push({
       name: '履历时间线按设备返回且包含刚追加的事件',
       passed:
@@ -871,10 +1173,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `total=${timeline?.total ?? 'n/a'}`
     })
 
-    const hasDelete = await api
-      .delete(`/mes/device-lifecycle/${eventId}`)
-      .then(() => true)
-      .catch(() => false)
+    const deleteResult = await api.delete(`/mes/device-lifecycle/${eventId}`)
+    const hasDelete = deleteResult?.code === 0
     caseRecord.checks.push({
       name: '设备履历不提供删除入口（只追加不可删除）',
       passed: hasDelete === false,
@@ -882,37 +1182,37 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
 
     const bizId = `E2E-COMP-${marker}`
-    const taskId = await api.postBusiness('/mes/device-compensation/create', {
+    const taskId = dataOf(await api.postBusiness('/mes/device-compensation/create', {
       deviceId,
       bizType: 'STOCK',
       bizId,
       reason: 'E2E 模拟备件出库回写失败',
       lastError: '模拟 WMS 回写异常'
-    })
+    }))
     caseRecord.checks.push({
       name: '回写失败登记待补偿任务',
       passed: Boolean(taskId),
       details: `taskId=${taskId}`
     })
 
-    const duplicated = await api.postBusiness('/mes/device-compensation/create', {
+    const duplicated = dataOf(await api.postBusiness('/mes/device-compensation/create', {
       deviceId,
       bizType: 'STOCK',
       bizId,
       reason: 'E2E 重复登记'
-    })
+    }))
     caseRecord.checks.push({
       name: '相同业务待补偿任务幂等复用',
-      passed: Number(duplicated) === Number(taskId),
+      passed: String(duplicated) === String(taskId),
       details: `first=${taskId}, second=${duplicated}`
     })
 
-    const pendingPage = await api.getBusiness(
-      `/mes/device-compensation/page?status=PENDING&pageNo=1&pageSize=50`
-    )
+    const pendingPage = dataOf(await api.getBusiness(
+      `/mes/device-compensation/page?status=PENDING&deviceId=${deviceId}&pageNo=1&pageSize=50`
+    ))
     caseRecord.checks.push({
       name: '待补偿任务可查询',
-      passed: Array.isArray(pendingPage?.list),
+      passed: (pendingPage?.list || []).some((item) => String(item.id) === String(taskId)),
       details: `total=${pendingPage?.total ?? 'n/a'}`
     })
 
@@ -921,34 +1221,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       status: 'HANDLED',
       handleRemark: 'E2E 人工补偿完成'
     })
-    const handledPage = await api.getBusiness(
-      `/mes/device-compensation/page?status=HANDLED&pageNo=1&pageSize=50`
-    )
+    const handledPage = dataOf(await api.getBusiness(
+      `/mes/device-compensation/page?status=HANDLED&deviceId=${deviceId}&pageNo=1&pageSize=50`
+    ))
     caseRecord.checks.push({
       name: '补偿任务处理后进入已补偿',
-      passed: (handledPage?.list || []).some((item) => Number(item.id) === Number(taskId)),
+      passed: (handledPage?.list || []).some((item) => String(item.id) === String(taskId)),
       details: `total=${handledPage?.total ?? 'n/a'}`
     })
 
-    await openRoute(page, '/iot/maintenance/device-lifecycle')
-    await page.waitForTimeout(1200)
-    const lifecycleText = await page.locator('body').innerText()
-    caseRecord.checks.push({
-      name: '设备履历页展示时间线查询入口',
-      passed: lifecycleText.includes('设备ID') && lifecycleText.includes('事件类型'),
-      details: '设备履历时间线页'
-    })
-    await saveScreenshot(page, outputDir, 'maint-010-device-lifecycle', record)
-
-    await openRoute(page, '/iot/maintenance/device-compensation')
-    await page.waitForTimeout(1200)
-    const compensationText = await page.locator('body').innerText()
-    caseRecord.checks.push({
-      name: '设备回写补偿页展示待补偿列表',
-      passed: compensationText.includes('回写类型') && compensationText.includes('待补偿'),
-      details: '设备回写补偿列表页'
-    })
-    await saveScreenshot(page, outputDir, 'maint-010-device-compensation', record)
     return { token, api }
   }
 
@@ -1064,7 +1345,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const token = await login(page)
     const api = createApiClient({ token, record })
     // PB-101：旧设备引用对账，equipment_info/mes_wms_site_equipment -> iot_device
-    const summaryBefore = await api.getBusiness('/mes/device-legacy-mapping/summary')
+    const summaryBefore = dataOf(await api.getBusiness('/mes/device-legacy-mapping/summary'))
     caseRecord.checks.push({
       name: '对账汇总接口返回命中/多义/未命中口径',
       passed:
@@ -1075,19 +1356,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         'unmatched' in summaryBefore,
       details: `total=${summaryBefore?.total}, matched=${summaryBefore?.matched}, ambiguous=${summaryBefore?.ambiguous}, unmatched=${summaryBefore?.unmatched}`
     })
-
-    const reconciled = await api.postBusiness('/mes/device-legacy-mapping/reconcile')
     caseRecord.checks.push({
-      name: '重跑对账返回重建后的汇总',
+      name: '只读对账汇总口径守恒',
       passed:
-        reconciled != null &&
-        Number(reconciled.total) ===
-          Number(reconciled.matched) + Number(reconciled.ambiguous) + Number(reconciled.unmatched),
-      details: `total=${reconciled?.total}, matched=${reconciled?.matched}`
+        Number(summaryBefore?.total) ===
+        Number(summaryBefore?.matched) + Number(summaryBefore?.ambiguous) + Number(summaryBefore?.unmatched),
+      details: JSON.stringify(summaryBefore)
     })
 
-    const pageResp = await api.getBusiness('/mes/device-legacy-mapping/page?pageNo=1&pageSize=100')
-    const rows = Array.isArray(pageResp?.list) ? pageResp.list : []
+    const pageResp = dataOf(await api.getBusiness('/mes/device-legacy-mapping/page?pageNo=1&pageSize=100'))
+    const rows = Array.isArray(pageResp?.list) ? pageResp.list : pageResp?.records || []
     const validStatuses = ['MATCHED', 'AMBIGUOUS', 'UNMATCHED']
     caseRecord.checks.push({
       name: '对账清单每行都带对账状态',
@@ -1104,19 +1382,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `rows=${rows.length}`
     })
 
-    await openRoute(page, '/settings/iot/device-legacy-mapping')
-    await page.waitForTimeout(1200)
-    const pageText = await page.locator('body').innerText()
-    caseRecord.checks.push({
+    await checkMaintenancePage({ page, record, caseRecord, outputDir }, {
+      route: '/settings/iot/device-legacy-mapping',
+      labels: ['重跑对账', '对账'],
       name: '设备引用对账页真实渲染汇总与清单',
-      passed: pageText.includes('对账') && pageText.includes('重跑对账'),
-      details: page.url()
+      screenshot: 'maint-012-device-legacy-mapping'
     })
-    await saveScreenshot(page, outputDir, 'maint-012-device-legacy-mapping', record)
     caseRecord.evidence.push(
-      '真实登录重跑旧设备引用对账：校验汇总口径守恒、每行对账状态、命中行回填 iot_device.id，并打开对账页确认渲染'
+      '真实登录读取旧设备引用对账汇总与清单并打开对账页；本次不调用全租户 reconcile 写侧，避免改动共享主数据'
     )
-    return { token, api }
+    return {
+      token,
+      api,
+      partial: true,
+      note: '旧设备对账 reconcile 会重建共享租户映射，本次禁止写侧；需专属 E2E 对账夹具后复测'
+    }
   }
 
   if (caseId === 'MAINT-013') {
@@ -1172,9 +1452,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'MAINT-014') {
     // PB-323：保养（UPKEEP）方案发布生成运行计划，到期任务幂等落在 inspection_task；
     // 完成登记写 inspection_record 并追加设备履历，保养达成率从到期保养任务计算。
-    const upkeepTaskPage = await api.getBusiness(
+    const upkeepTaskPage = dataOf(await api.getBusiness(
       '/mes/system/task/list?maintenanceDomain=UPKEEP&pageNo=1&pageSize=100'
-    )
+    ))
     const taskRows = Array.isArray(upkeepTaskPage?.records)
       ? upkeepTaskPage.records
       : Array.isArray(upkeepTaskPage?.list)
@@ -1256,28 +1536,28 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const executeItemPayload = snapshotItem
       ? { itemId: snapshotItem.id, result: '正常' }
       : { itemName: pendingTask.projectName || '保养项目', result: '正常' }
-    const record = await api.postBusiness('/mes/system/record/complete-maintenance', {
+    const maintenanceRecord = dataOf(await api.postBusiness('/mes/system/record/complete-maintenance', {
       taskId: pendingTask.id,
       executeItems: JSON.stringify([executeItemPayload]),
       executeResult,
       consumables: JSON.stringify([{ materialName: '润滑油', quantity: 1, unit: 'L' }]),
       nextPlanDate: '2027-03-31',
       inspectionRemark: 'E2E 保养完成登记'
-    })
+    }))
     caseRecord.checks.push({
       name: '保养完成登记写 inspection_record 并保留项目/结果/耗材/下次日期',
       passed:
-        Boolean(record?.id) &&
-        record?.maintenanceDomain === 'UPKEEP' &&
-        Boolean(record?.completeTime) &&
-        Boolean(record?.executeItems) &&
-        record?.executeResult === executeResult &&
-        Boolean(record?.nextPlanDate),
-      details: `recordId=${record?.id}, domain=${record?.maintenanceDomain}, nextPlanDate=${record?.nextPlanDate}`
+        Boolean(maintenanceRecord?.id) &&
+        maintenanceRecord?.maintenanceDomain === 'UPKEEP' &&
+        Boolean(maintenanceRecord?.completeTime) &&
+        Boolean(maintenanceRecord?.executeItems) &&
+        maintenanceRecord?.executeResult === executeResult &&
+        Boolean(maintenanceRecord?.nextPlanDate),
+      details: `recordId=${maintenanceRecord?.id}, domain=${maintenanceRecord?.maintenanceDomain}, nextPlanDate=${maintenanceRecord?.nextPlanDate}`
     })
     let parsedExecuteItems = []
     try {
-      parsedExecuteItems = JSON.parse(record?.executeItems || '[]')
+      parsedExecuteItems = JSON.parse(maintenanceRecord?.executeItems || '[]')
     } catch (error) {
       parsedExecuteItems = []
     }
@@ -1296,19 +1576,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         : '当前租户无维保项目主档，仅校验执行项目快照非空'
     })
 
-    const taskAfter = await api.getBusiness(`/mes/system/task/${pendingTask.id}`)
+    const taskAfter = dataOf(await api.getBusiness(`/mes/system/task/${pendingTask.id}`))
     caseRecord.checks.push({
       name: '保养完成后回写任务状态与关联记录',
       passed:
         String(taskAfter?.inspectionStatus) === '1' &&
-        String(taskAfter?.inspectionRecordId) === String(record?.id),
+        String(taskAfter?.inspectionRecordId) === String(maintenanceRecord?.id),
       details: `status=${taskAfter?.inspectionStatus}, recordId=${taskAfter?.inspectionRecordId}`
     })
 
     if (hasDevice) {
-      const timelineAfter = await api.getBusiness(
+      const timelineAfter = dataOf(await api.getBusiness(
         `/mes/device-lifecycle/timeline?deviceId=${deviceId}&pageNo=1&pageSize=100`
-      )
+      ))
       const events = maintenanceEventsOf(timelineAfter)
       caseRecord.checks.push({
         name: '保养完成按设备追加不可删除履历事件',
@@ -1318,27 +1598,27 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `events=${events.length}, before=${beforeCount}`
       })
 
-      const repeated = await api.postBusiness('/mes/system/record/complete-maintenance', {
+      const repeated = dataOf(await api.postBusiness('/mes/system/record/complete-maintenance', {
         taskId: pendingTask.id,
         executeResult: 'E2E 重复完成登记',
         inspectionRemark: 'E2E 幂等校验'
-      })
-      const timelineRepeated = await api.getBusiness(
+      }))
+      const timelineRepeated = dataOf(await api.getBusiness(
         `/mes/device-lifecycle/timeline?deviceId=${deviceId}&pageNo=1&pageSize=100`
-      )
+      ))
       caseRecord.checks.push({
         name: '保养重复完成幂等：复用同一条记录且不重复写履历',
         passed:
-          String(repeated?.id) === String(record?.id) &&
+          String(repeated?.id) === String(maintenanceRecord?.id) &&
           maintenanceEventsOf(timelineRepeated).length === beforeCount + 1,
-        details: `first=${record?.id}, second=${repeated?.id}`
+        details: `first=${maintenanceRecord?.id}, second=${repeated?.id}`
       })
 
       const endTime = formatLocalDateTime(new Date())
       const startTime = formatLocalDateTime(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000))
-      const metrics = await api.getBusiness(
+      const metrics = dataOf(await api.getBusiness(
         `/mes/device-status-event/metrics?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
-      )
+      ))
       caseRecord.checks.push({
         name: '保养达成率从到期保养任务计算（无到期任务时为空）',
         passed:
@@ -1360,7 +1640,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'MAINT-015') {
     // PB-107：维保类型是树型结构（根=固定核心域，子=企业子类型），
     // 正式任务/工单保存企业子类型与维保类型规则版本快照。
-    const tree = await api.getBusiness('/mes/maintenance-type-rule/tree')
+    const tree = dataOf(await api.getBusiness('/mes/maintenance-type-rule/tree'))
     const roots = Array.isArray(tree) ? tree : []
     const rootDomains = roots.map((node) => node.coreDomain)
     caseRecord.checks.push({
@@ -1375,20 +1655,20 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
     const upkeepRoot = roots.find((node) => node.coreDomain === 'UPKEEP') || null
     const subTypeCode = unique('E2E-UPKEEP').slice(0, 64)
-    const createResult = await api.postBusiness('/mes/maintenance-type-rule/create', {
+    const createResult = trackRuleFixture(fixtures, api, await api.postBusiness('/mes/maintenance-type-rule/create', {
       coreDomain: 'UPKEEP',
       subTypeCode,
       subTypeName: `E2E 定期保养 ${subTypeCode}`,
       status: 0
-    })
-    const ruleId = typeof createResult === 'number' ? createResult : createResult?.id
+    }), caseRecord)
+    const ruleId = createResult
     caseRecord.checks.push({
       name: '可在核心域根节点下新增企业子类型',
       passed: ruleId != null,
       details: `ruleId=${ruleId}, subTypeCode=${subTypeCode}`
     })
 
-    const treeAfterCreate = await api.getBusiness('/mes/maintenance-type-rule/tree')
+    const treeAfterCreate = dataOf(await api.getBusiness('/mes/maintenance-type-rule/tree'))
     const findSubType = (nodes, code) => {
       for (const node of nodes || []) {
         if (node.subTypeCode === code) return node
@@ -1419,9 +1699,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         subTypeName: updatedName,
         status: 0
       })
-      const detail = await api.getBusiness(`/mes/maintenance-type-rule/get?id=${ruleId}`)
+      const detail = dataOf(await api.getBusiness(`/mes/maintenance-type-rule/get?id=${ruleId}`))
       caseRecord.checks.push({
-        name: '编辑子类型后规则版本递增，历史快照不被改写',
+        name: '编辑 E2E 子类型后规则版本递增',
         passed: detail?.version >= 2 && detail?.subTypeName === updatedName,
         details: `version=${detail?.version}, name=${detail?.subTypeName}`
       })
@@ -1431,8 +1711,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       caseRecord.evidence.push('核心域根节点当前无历史子类型，仅校验新增/编辑/树组装链路')
     }
 
-    await openRoute(page, '/settings/iot/device-maintenance')
-    await page.waitForTimeout(1200)
+    await openRoute(page, '/settings/iot/device-maintenance', { readyText: '维保类型' })
+    const typeTab = page.locator('.el-tabs__item').filter({ hasText: '维保类型' }).first()
+    await typeTab.waitFor({ state: 'visible' })
+    await typeTab.click()
+    await page.getByRole('button', { name: '新增子类型' }).waitFor({ state: 'visible' })
     const pageText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '设备维保设置页维保类型页签以树渲染',
@@ -1441,21 +1724,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     await saveScreenshot(page, outputDir, 'maint-015-type-tree', record)
 
-    if (ruleId != null) {
-      await api.delete(`/mes/maintenance-type-rule/delete?id=${ruleId}`)
-      const afterDelete = await api.getBusiness(`/mes/maintenance-type-rule/get?id=${ruleId}`)
-      caseRecord.checks.push({
-        name: 'E2E 新增的子类型已清理',
-        passed: !afterDelete || !afterDelete.id,
-        details: `ruleId=${ruleId}`
-      })
-    }
-
     caseRecord.evidence.push(
       '真实调用 /mes/maintenance-type-rule/tree 校验固定核心域根节点，新增/编辑企业子类型并断言版本递增，' +
-        '随后在设备维保设置页验证维保类型树渲染；正式任务/工单固化子类型与规则版本由后端单测覆盖'
+        '随后在设备维保设置页验证维保类型树渲染；本例未执行正式任务/工单历史快照的回读对比'
     )
-    return { token, api }
+    return {
+      token,
+      api,
+      partial: true,
+      note: '已验证 E2E 类型树和规则版本；正式任务/工单历史快照未验证，不能登记完整 PASS'
+    }
   }
 
   caseRecord.notes.push(`未识别的案例：${caseId}`)

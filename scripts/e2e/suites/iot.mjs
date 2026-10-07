@@ -1,5 +1,8 @@
 import { createApiClient } from '../lib/api.mjs'
+import { assertBusinessSuccess } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { runIotReadonlyCase } from './iot-readonly.mjs'
+import { runIotFoundationReadonlyCase } from './iot-foundation-readonly.mjs'
 
 export const cases = [
   'IOT-001',
@@ -17,7 +20,24 @@ export const cases = [
 export const IOT_011_ROUTE = '/iot/device/write-back-dead-letter'
 export const IOT_012_ROUTE = '/iot/device/device-change-audit'
 
-const dataOf = (response) => response?.data ?? response
+const dataOf = (response) => {
+  if (
+    response &&
+    typeof response === 'object' &&
+    Object.prototype.hasOwnProperty.call(response, 'data') &&
+    ('code' in response || 'msg' in response || 'success' in response)
+  ) {
+    return response.data
+  }
+  return response
+}
+
+export const containsE2eMarker = (value) => /(?:^|[^a-z0-9])E2E(?:[^a-z0-9]|$)/i.test(
+  [value?.idempotentKey, value?.messageId, value?.identifier]
+    .filter((item) => typeof item === 'string').join(' ')
+)
+
+export const nicknameBeforeChange = (device) => device?.nickname ?? null
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   caseRecord.notes.push('案例已锁定 iot_device 唯一设备档案事实源，旧 MES 设备档案只允许兼容读取。')
@@ -25,6 +45,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     '设备产能复用 APS 工艺路线工序设备产能并增加版本与发布状态，设备三层状态不得由字典页面直接改运行事实。'
   )
 
+  if (caseId === 'IOT-001') {
+    return await runIotFoundationReadonlyCase({ caseId, page, record, caseRecord, outputDir })
+  }
+  if (caseId === 'IOT-002' || caseId === 'IOT-003') {
+    return await runIotReadonlyCase({ caseId, page, record, caseRecord, outputDir })
+  }
   if (caseId === 'IOT-007') {
     return await runDeviceDeptCase({ page, record, caseRecord, outputDir })
   }
@@ -50,75 +76,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 }
 
 /** PB-103/PB-104/PB-105：设备资产状态三层解耦与产品模型/接入配置版本快照。 */
-const runDeviceAssetModelCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
-  caseRecord.checks.push({
-    name: '真实登录成功',
-    passed: Boolean(token),
-    details: '登录后使用真实令牌校验设备资产状态与产品模型快照'
-  })
-
-  const pageData = dataOf(await api.getBusiness('/iot/device/page?pageNo=1&pageSize=100'))
-  const device = (pageData?.list || []).find((item) => item?.id != null) || null
-
-  caseRecord.checks.push({
-    name: '设备台账返回资产状态（PB-103）',
-    passed: device ? typeof device.assetStatus === 'string' && device.assetStatus.length > 0 : true,
-    details: device
-      ? `deviceId=${device.id}, assetStatus=${device.assetStatus}`
-      : '当前租户无设备，仅校验接口可用'
-  })
-
-  if (device) {
-    const rawDevice = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
-    caseRecord.checks.push({
-      name: '正式设备保存产品模型与接入配置版本快照（PB-104/PB-105）',
-      passed: rawDevice?.accessConfigVersion != null || rawDevice?.productModelSnapshot != null,
-      details: `accessConfigVersion=${rawDevice?.accessConfigVersion}, snapshot=${rawDevice?.productModelSnapshot}`
-    })
-
-    const invalid = await api.put('/iot/device/asset-status', {
-      id: device.id,
-      assetStatus: 'NOT_A_STATUS',
-      reason: 'E2E 非法资产状态'
-    })
-    caseRecord.checks.push({
-      name: '非法资产状态被拒绝（PB-103）',
-      passed: invalid?.code !== 0,
-      details: `code=${invalid?.code} msg=${invalid?.msg || 'n/a'}`
-    })
-
-    const originalAssetStatus = rawDevice?.assetStatus || 'ENABLED'
-    await api.putBusiness('/iot/device/asset-status', {
-      id: device.id,
-      assetStatus: 'DISABLED',
-      reason: 'E2E 资产状态切换为停用'
-    })
-    const disabled = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
-    caseRecord.checks.push({
-      name: '资产状态可切换为停用且不影响连接状态字段（PB-103）',
-      passed: disabled?.assetStatus === 'DISABLED',
-      details: `assetStatus=${disabled?.assetStatus}, connectionState=${disabled?.state}`
-    })
-
-    await api.putBusiness('/iot/device/asset-status', {
-      id: device.id,
-      assetStatus: originalAssetStatus,
-      reason: 'E2E 资产状态恢复'
-    })
-    const restored = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
-    caseRecord.checks.push({
-      name: 'E2E 结束后恢复设备原始资产状态',
-      passed: restored?.assetStatus === originalAssetStatus,
-      details: `assetStatus=${restored?.assetStatus}`
-    })
-  }
-
-  await openRoute(page, '/iot/device')
-  await saveScreenshot(page, outputDir, 'iot-device-asset-model', record)
-  return { token, api }
-}
+const runDeviceAssetModelCase = async (context) =>
+  runIotReadonlyCase({ ...context, caseId: 'IOT-013' })
 
 /** PB-320：设备台账关键字段变更审计与审批。 */
 const runDeviceChangeAuditCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -137,64 +96,86 @@ const runDeviceChangeAuditCase = async ({ page, record, caseRecord, outputDir })
     details: `total=${auditPage?.total ?? 0}`
   })
 
-  const devicePage = dataOf(await api.getBusiness('/iot/device/page?pageNo=1&pageSize=10'))
-  const candidate = (devicePage?.list || [])[0]
-  if (!candidate?.id) {
+  const products = dataOf(await api.getBusiness('/iot/product/simple-list')) || []
+  const product = products.find((item) => item?.id != null)
+  if (!product) {
     caseRecord.notes.push(
-      '当前租户无 IoT 设备，关键字段变更审计断言将在存在设备时执行；不伪造设备数据入库。'
+      '当前租户无可用 IoT 产品，未创建 E2E 设备夹具；不修改用户设备。'
     )
   } else {
-    const device = dataOf(await api.getBusiness(`/iot/device/get?id=${candidate.id}`))
-    const originalNickname = device?.nickname || device?.deviceName
-    const tempNickname = `${originalNickname || 'device'}-e2e`
-    // 1) 要求审批：先登记待审批审计，设备主数据保持不变
-    await api.putBusiness('/iot/device/update', {
-      ...device,
-      nickname: tempNickname,
-      changeReason: 'E2E 关键字段变更',
-      changeApprovalRequired: true
-    })
-    const pendingPage = dataOf(
-      await api.getBusiness(
-        `/iot/device-change-audit/page?pageNo=1&pageSize=10&deviceId=${device.id}&approvalStatus=PENDING`
-      )
-    )
-    const pending = (pendingPage?.list || [])[0]
-    caseRecord.checks.push({
-      name: '关键字段变更生成待审批审计并保留前后值',
-      passed:
-        Boolean(pending) &&
-        (pending.fieldChanges || []).some((item) => item.field === 'nickname') &&
-        pending.reason === 'E2E 关键字段变更',
-      details: pending
-        ? `auditId=${pending.id}, fields=${(pending.fieldChanges || []).map((item) => item.field).join(',')}`
-        : '未生成待审批审计记录'
-    })
-    const afterSubmit = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
-    caseRecord.checks.push({
-      name: '要求审批时设备主数据保持不变',
-      passed: afterSubmit?.nickname === originalNickname,
-      details: `nickname=${afterSubmit?.nickname}`
-    })
-    if (pending?.id) {
-      await api.putBusiness('/iot/device-change-audit/approve', { id: pending.id, opinion: 'E2E 通过' })
-      const afterApprove = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
-      caseRecord.checks.push({
-        name: '审批通过后应用关键字段变更',
-        passed: afterApprove?.nickname === tempNickname,
-        details: `nickname=${afterApprove?.nickname}`
+    let deviceId
+    try {
+      const deviceName = `E2E-IOT-012-${Date.now().toString(36).toUpperCase()}`
+      deviceId = dataOf(await api.postBusiness('/iot/device/create', {
+        productId: product.id,
+        deviceName
+      }))
+      const device = dataOf(await api.getBusiness(`/iot/device/get?id=${deviceId}`))
+      const originalNickname = nicknameBeforeChange(device)
+      const tempNickname = `${originalNickname || deviceName}-e2e`
+      // Only mutate the device created by this case.
+      await api.putBusiness('/iot/device/update', {
+        ...device,
+        nickname: tempNickname,
+        changeReason: 'E2E 关键字段变更',
+        changeApprovalRequired: true
       })
+      const pendingPage = dataOf(
+        await api.getBusiness(
+          `/iot/device-change-audit/page?pageNo=1&pageSize=10&deviceId=${device.id}&approvalStatus=PENDING`
+        )
+      )
+      const pending = (pendingPage?.list || []).find(
+        (item) => String(item.deviceId) === String(deviceId) && item.reason === 'E2E 关键字段变更'
+      )
+      caseRecord.checks.push({
+        name: '关键字段变更生成待审批审计并保留前后值',
+        passed:
+          Boolean(pending) &&
+          (pending.fieldChanges || []).some((item) => item.field === 'nickname') &&
+          pending.reason === 'E2E 关键字段变更',
+        details: pending
+          ? `auditId=${pending.id}, fields=${(pending.fieldChanges || []).map((item) => item.field).join(',')}`
+          : '未生成 E2E 待审批审计记录'
+      })
+      const afterSubmit = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
+      caseRecord.checks.push({
+        name: '要求审批时设备主数据保持不变',
+        passed: afterSubmit?.nickname === originalNickname,
+        details: `nickname=${afterSubmit?.nickname}`
+      })
+      if (pending?.id) {
+        await api.putBusiness('/iot/device-change-audit/approve', { id: pending.id, opinion: 'E2E 通过' })
+        const afterApprove = dataOf(await api.getBusiness(`/iot/device/get?id=${device.id}`))
+        caseRecord.checks.push({
+          name: '审批通过后应用关键字段变更',
+          passed: afterApprove?.nickname === tempNickname,
+          details: `nickname=${afterApprove?.nickname}`
+        })
+      }
+    } finally {
+      if (deviceId) {
+        await api.deleteBusiness(`/iot/device/delete?id=${encodeURIComponent(deviceId)}`).then(async () => {
+          const remaining = await api.getBusiness(`/iot/device/get?id=${encodeURIComponent(deviceId)}`)
+          caseRecord.checks.push({
+            name: 'IOT-012 E2E 设备夹具已删除',
+            passed: remaining?.data === null,
+            details: `deviceId=${deviceId}`
+          })
+        }).catch((error) => {
+          caseRecord.checks.push({
+            name: 'IOT-012 E2E 设备夹具已删除',
+            passed: false,
+            details: `deviceId=${deviceId}: ${error.message}`
+          })
+          caseRecord.notes.push(`IOT-012 E2E 设备夹具清理失败 deviceId=${deviceId}: ${error.message}`)
+        })
+      }
     }
-    // 2) 还原设备原始关键字段，避免污染联调环境
-    await api.putBusiness('/iot/device/update', {
-      ...afterSubmit,
-      nickname: originalNickname,
-      changeReason: 'E2E 还原设备台账'
-    })
-    caseRecord.notes.push('案例结束后已还原设备备注名称，不新增伪造设备。')
+    caseRecord.notes.push('IOT-012 仅创建并清理本案例 E2E 设备夹具，不修改用户设备。')
   }
 
-  await openRoute(page, IOT_012_ROUTE)
+  await openRoute(page, IOT_012_ROUTE, { readyText: '变更字段' })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '设备变更审计页面渲染',
@@ -205,7 +186,11 @@ const runDeviceChangeAuditCase = async ({ page, record, caseRecord, outputDir })
   caseRecord.evidence.push(
     'PB-320：设备台账关键字段变更保留字段前后值与原因，可走审批后再生效；主数据仍以 iot_device 为唯一事实源。'
   )
-  return { token }
+  return {
+    token,
+    partial: !product,
+    note: product ? '' : '缺少产品，未验证 E2E 设备变更审批链，不能将页面与空集登记为完整 PASS'
+  }
 }
 
 /** PB-331：回写/采集失败进入重试死信队列，未知设备不静默丢弃。 */
@@ -227,7 +212,9 @@ const runWriteBackDeadLetterCase = async ({ page, record, caseRecord, outputDir 
     details: `total=${pageData?.total ?? 0}`
   })
 
-  const pending = (pageData?.list || []).find((item) => item.status !== 'HANDLED')
+  const pending = (pageData?.list || []).find(
+    (item) => item.status !== 'HANDLED' && containsE2eMarker(item)
+  )
   if (pending) {
     await api.putBusiness('/iot/write-back-dead-letter/handle', {
       id: pending.id,
@@ -240,10 +227,14 @@ const runWriteBackDeadLetterCase = async ({ page, record, caseRecord, outputDir 
       details: `id=${pending.id}, status=${afterHandle?.status}`
     })
   } else {
-    caseRecord.notes.push('当前租户暂无未处理回写死信，人工接管断言将在存在死信时执行；不伪造死信数据入库。')
+    caseRecord.notes.push(
+      pageData?.total
+        ? '当前租户存在非 E2E 未处理回写死信，本例不接管共享数据；需专属 E2E 死信夹具后复测人工接管。'
+        : '当前租户暂无回写死信；本例仅完成接口与页面复测，不将空集升级为完整 PASS。'
+    )
   }
 
-  await openRoute(page, IOT_011_ROUTE)
+  await openRoute(page, IOT_011_ROUTE, { readyText: '最近失败原因' })
   const bodyText = await page.locator('body').innerText()
   caseRecord.checks.push({
     name: '回写死信页面渲染',
@@ -254,113 +245,22 @@ const runWriteBackDeadLetterCase = async ({ page, record, caseRecord, outputDir 
   caseRecord.evidence.push(
     'PB-331：数据流转投递失败与未知设备上行消息统一进入 iot_write_back_dead_letter，按幂等键去重并支持人工接管。'
   )
-  return { token }
+  return {
+    token,
+    partial: !pending,
+    note: pending
+      ? ''
+      : '没有可安全接管的 E2E 回写死信夹具，页面/空集证据不构成完整 PASS'
+  }
 }
 
 /** PB-330：告警持续时间/抑制/升级配置与确认/转工单/解除/关闭闭环。 */
-const runAlertLifecycleCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
-  caseRecord.checks.push({
-    name: '真实登录成功',
-    passed: Boolean(token),
-    details: '登录后使用真实令牌校验告警配置与告警记录接口'
-  })
-
-  const configPage = dataOf(await api.getBusiness('/iot/alert-config/page?pageNo=1&pageSize=10'))
-  const config = (configPage?.list || [])[0]
-  caseRecord.checks.push({
-    name: '告警配置接口暴露持续时间/抑制/升级字段',
-    passed: config != null
-      ? 'durationSeconds' in config && 'suppressSeconds' in config && 'combineMode' in config
-      : true,
-    details: config != null
-      ? `configId=${config.id}, durationSeconds=${config.durationSeconds}, suppressSeconds=${config.suppressSeconds}`
-      : '当前租户暂无告警配置，跳过字段断言'
-  })
-
-  const recordPage = dataOf(await api.getBusiness('/iot/alert-record/page?pageNo=1&pageSize=10'))
-  const records = recordPage?.list || []
-  const withStatus = records.filter((item) => item.alertStatus != null)
-  caseRecord.checks.push({
-    name: '告警记录分页返回生命周期状态',
-    passed: records.length === 0 || withStatus.length === records.length,
-    details: `total=${recordPage?.total ?? 0}, 带状态=${withStatus.length}`
-  })
-
-  await openRoute(page, '/iot/alert/record', { readyText: '生命周期' })
-  const bodyText = await page.locator('body').innerText()
-  caseRecord.checks.push({
-    name: '告警记录页面渲染生命周期列与处置入口',
-    passed: bodyText.includes('生命周期'),
-    details: '真实打开 /iot/alert/record 并校验生命周期列'
-  })
-  await saveScreenshot(page, outputDir, 'pb330-iot-alert-lifecycle', record)
-  caseRecord.evidence.push(
-    'PB-330：同一告警键仅一条活动告警，状态机 ACTIVE->ACKNOWLEDGED->WORK_ORDER->RESOLVED->CLOSED，处置记录责任人/时间/说明。'
-  )
-  return { token }
-}
+const runAlertLifecycleCase = async (context) =>
+  runIotReadonlyCase({ ...context, caseId: 'IOT-010' })
 
 /** PB-329：采集重复/乱序/质量码异常进入数据异常队列，禁止静默丢弃。 */
-const runDataAnomalyCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
-  caseRecord.checks.push({
-    name: '真实登录成功',
-    passed: Boolean(token),
-    details: '登录后使用真实令牌校验数据异常队列分页与处理接口'
-  })
-
-  const pageData = dataOf(await api.getBusiness('/iot/data-anomaly/page?pageNo=1&pageSize=10'))
-  caseRecord.checks.push({
-    name: '数据异常队列分页接口可用',
-    passed: Array.isArray(pageData?.list),
-    details: `total=${pageData?.total ?? 0}`
-  })
-
-  const pending = (pageData?.list || []).find((item) => item.status === 0)
-  if (pending) {
-    const detail = dataOf(await api.getBusiness(`/iot/data-anomaly/get?id=${pending.id}`))
-    caseRecord.checks.push({
-      name: '数据异常详情包含幂等键与来源序列号字段',
-      passed: detail != null && 'idempotentKey' in detail && 'sequenceNo' in detail,
-      details: `id=${pending.id}, type=${detail?.type}`
-    })
-    await api.putBusiness('/iot/data-anomaly/handle', {
-      id: pending.id,
-      status: 1,
-      handleRemark: 'E2E 自动复核'
-    })
-    const afterHandle = dataOf(await api.getBusiness(`/iot/data-anomaly/get?id=${pending.id}`))
-    caseRecord.checks.push({
-      name: '待处理异常可处理为已处理',
-      passed: Number(afterHandle?.status) === 1,
-      details: `id=${pending.id}, status=${afterHandle?.status}`
-    })
-  } else {
-    caseRecord.notes.push(
-      '当前租户暂无待处理数据异常记录，处理链路断言将在存在异常数据时执行；不伪造异常数据入库。'
-    )
-  }
-
-  await openRoute(page, '/iot/device/data-anomaly', {
-    readyText: '异常类型',
-    readyTimeoutMs: 15000,
-    retries: 1
-  })
-  const bodyText = await page.locator('body').innerText()
-  caseRecord.checks.push({
-    name: '数据异常队列页面渲染',
-    passed: bodyText.includes('数据异常'),
-    details: '真实打开 /iot/device/data-anomaly 并校验页面标题'
-  })
-  await saveScreenshot(page, outputDir, 'pb329-iot-data-anomaly', record)
-  caseRecord.evidence.push(
-    'PB-329：重复/乱序/质量码异常统一进入 iot_data_anomaly_queue 人工复核；重复投递以 iot_device_message_idempotency 唯一键拦截，不再二次写入属性历史。'
-  )
-  return { token }
-}
+const runDataAnomalyCase = async (context) =>
+  runIotReadonlyCase({ ...context, caseId: 'IOT-009' })
 
 /** PB-327：设备按 system_dept 归属并支持部门数据范围过滤。 */
 const runDeviceDeptCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -374,11 +274,17 @@ const runDeviceDeptCase = async ({ page, record, caseRecord, outputDir }) => {
 
   const depts = dataOf(await api.getBusiness('/system/dept/simple-list')) || []
   const dept = depts.find((item) => item.id != null)
-  if (!dept) throw new Error('BLOCKED: 当前租户没有可用于设备归属的启用部门')
+  if (!dept) {
+    caseRecord.notes.push('当前租户没有可用于设备归属的启用部门，未创建设备夹具。')
+    return { token, api, partial: true, note: '缺少启用部门前置' }
+  }
 
   const products = dataOf(await api.getBusiness('/iot/product/simple-list')) || []
   const product = products.find((item) => item.id != null)
-  if (!product) throw new Error('BLOCKED: 当前租户没有可用于创建设备的 IoT 产品')
+  if (!product) {
+    caseRecord.notes.push('当前租户没有可用于创建设备的 IoT 产品，未创建设备夹具。')
+    return { token, api, partial: true, note: '缺少 IoT 产品前置' }
+  }
 
   let deviceId
   try {
@@ -410,7 +316,7 @@ const runDeviceDeptCase = async ({ page, record, caseRecord, outputDir }) => {
       details: `total=${pageData?.total}, returned=${filteredList.length}, deptId=${dept.id}`
     })
 
-    await openRoute(page, '/iot/device')
+    await openRoute(page, '/iot/device/device', { readyText: '所属部门' })
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '设备页面提供部门筛选和部门展示',
@@ -423,7 +329,8 @@ const runDeviceDeptCase = async ({ page, record, caseRecord, outputDir }) => {
     )
   } finally {
     if (deviceId) {
-      await api.delete(`/iot/device/delete?id=${deviceId}`).catch(() => {})
+      const deleted = await api.deleteBusiness(`/iot/device/delete?id=${deviceId}`)
+      assertBusinessSuccess(deleted, `清理 IOT-007 E2E 设备 id=${deviceId}`)
     }
   }
 

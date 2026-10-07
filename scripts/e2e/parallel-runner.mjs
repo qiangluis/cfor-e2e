@@ -310,6 +310,8 @@ export function runChild ({
     path.join(here, 'runner.mjs'),
     '--case',
     definition.id,
+    '--case-timeout-ms',
+    String(caseTimeoutMs),
     '--no-resume',
     '--no-reuse-session',
     ...(headless ? ['--headless'] : ['--headed'])
@@ -586,7 +588,7 @@ async function main () {
   )
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(`[parallel] fatal: ${error.stack || error.message || error}`)
     process.exit(2)

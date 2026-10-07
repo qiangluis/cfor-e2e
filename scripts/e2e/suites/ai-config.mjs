@@ -9,18 +9,62 @@ const hasRawSecret = (value) => {
   return /"apiKey"\s*:\s*"sk-|"apiSecret"\s*:\s*"sk-/.test(text)
 }
 
+const isSuccessfulPayload = (payload) =>
+  (payload?.code === 0 && payload.success !== false) ||
+  (payload?.code === 200 && payload.success === true)
+
+const listPayload = (payload) => {
+  const list = payload?.data?.list
+  return Array.isArray(list) ? list : null
+}
+
+const arrayPayload = (payload) => {
+  const data = payload?.data
+  return Array.isArray(data) ? data : null
+}
+
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   if (caseId !== 'PB012-001') return
 
   const token = await login(page)
   const api = createApiClient({ token, record })
 
-  const keyPage = await api.getBusiness('/ai/tenant-config/api-key/page?pageNo=1&pageSize=100')
-  const modelPage = await api.getBusiness('/ai/tenant-config/model/page?pageNo=1&pageSize=100')
-  const capabilityList = await api.getBusiness('/ai/tenant-config/capability/list')
-  const keys = keyPage?.list || []
-  const models = modelPage?.list || []
-  const capabilities = Array.isArray(capabilityList) ? capabilityList : []
+  const keyPage = await api.get('/ai/tenant-config/api-key/page?pageNo=1&pageSize=100')
+  const modelPage = await api.get('/ai/tenant-config/model/page?pageNo=1&pageSize=100')
+  const capabilityList = await api.get('/ai/tenant-config/capability/list')
+  const platformTenantBoundaryDenied =
+    keyPage?.code === 403 &&
+    modelPage?.code === 403 &&
+    capabilityList?.code === 403 &&
+    [keyPage, modelPage, capabilityList].some((payload) =>
+      String(payload?.msg || payload?.message || '').includes('当前租户不能维护企业 AI')
+    )
+
+  if (platformTenantBoundaryDenied) {
+    await openRoute(page, '/settings/business-settings/ai-model', {
+      readyText: '企业 AI 配置'
+    })
+    caseRecord.checks.push({
+      name: '平台租户按设计拒绝企业 AI 配置接口',
+      passed:
+        page.url().includes('/settings/business-settings/ai-model') &&
+        (await page.getByText('企业 AI 配置').first().count()) > 0,
+      details: '企业 Key、企业模型和能力接口均按租户边界返回 403'
+    })
+    caseRecord.evidence.push(
+      '平台租户真实浏览器打开企业 AI 配置入口；企业 BYOK 敏感接口按租户边界拒绝，企业租户写侧需使用 tenantId > 1 的真实测试租户'
+    )
+    return {
+      token,
+      api,
+      partial: true,
+      note: '当前为平台租户，企业 BYOK 接口按设计返回 403；企业租户写侧待 tenantId > 1 的真实租户复测'
+    }
+  }
+
+  const keys = listPayload(keyPage) || []
+  const models = listPayload(modelPage) || []
+  const capabilities = arrayPayload(capabilityList) || []
 
   await openRoute(page, '/ai/model/tenant')
   const pageHeading = page.getByText('企业 AI 配置').first()
@@ -33,7 +77,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       page.url().includes('/ai/model/tenant') &&
       (await pageHeading.count()) > 0 &&
       (await apiKeyTab.count()) > 0 &&
-      (await modelTab.count()) > 0,
+      (await modelTab.count()) > 0 &&
+      isSuccessfulPayload(keyPage) &&
+      isSuccessfulPayload(modelPage) &&
+      isSuccessfulPayload(capabilityList),
     details: `url=${page.url()} keys=${keys.length} models=${models.length}`
   })
 

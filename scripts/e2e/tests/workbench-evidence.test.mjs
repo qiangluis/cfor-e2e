@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   captureWorkbenchReports,
+  openWorkbenchAndWaitForTodo,
   runCase,
   summarizeWorkbenchReports,
   validateWorkbenchReportPage,
@@ -10,10 +11,15 @@ import {
 import { caseOutcome } from '../lib/report.mjs'
 
 function response (url, { ok = true, method = 'GET' } = {}) {
+  const request = {
+    url: () => url,
+    method: () => method,
+    isNavigationRequest: () => false
+  }
   return {
     url: () => url,
     ok: () => ok,
-    request: () => ({ method: () => method })
+    request: () => request
   }
 }
 
@@ -213,7 +219,10 @@ function browserFixture ({
   permissions = ['*:*:*'],
   batches,
   purchase = true,
-  todo = { list: [{ id: 'todo-1', title: '待处理采购' }], total: 1 }
+  todo = { list: [{ id: 'todo-1', title: '待处理采购' }], total: 1 },
+  staleTodo = false,
+  todoReadError = null,
+  navigationDelayMs = 0
 } = {}) {
   const events = []
   const listeners = []
@@ -221,11 +230,21 @@ function browserFixture ({
   const evaluations = []
   const caseRecord = { checks: [], notes: [], evidence: [] }
   let dialogVisible = false
-  const emit = (responses) => {
+  const emit = async (responses) => {
     for (const listener of listeners.splice(0)) {
-      const matched = responses.find(listener.predicate)
-      if (matched) listener.resolve(matched)
-      else listener.reject(new Error('unit-only missing response'))
+      try {
+        let matched
+        for (const candidate of responses) {
+          if (await listener.predicate(candidate)) {
+            matched = candidate
+            break
+          }
+        }
+        if (matched) listener.resolve(matched)
+        else listener.reject(new Error('unit-only missing response'))
+      } catch (error) {
+        listener.reject(error)
+      }
     }
   }
   const locator = (name) => ({
@@ -250,12 +269,12 @@ function browserFixture ({
       if (name === '统计') dialogVisible = true
       if (name === '关闭') dialogVisible = false
       if (['统计', '本季度', '本年度', '团队（按数据权限）', '本人'].includes(name)) {
-        emit(queue.shift() || reportBatch(name === '团队（按数据权限）' ? 'team' : 'self'))
+        await emit(queue.shift() || reportBatch(name === '团队（按数据权限）' ? 'team' : 'self'))
       }
-      if (name === '采购执行表') emit([
+      if (name === '采购执行表') await emit([
         browserResponse('/erp/purchase-order/page?pageNo=1&pageSize=10&status=20')
       ])
-      if (name === '.el-dialog__headerbtn') emit([
+      if (name === '.el-dialog__headerbtn') await emit([
         browserResponse('/workbench/todo/page?category=all&pageNo=1&pageSize=8', todo)
       ])
     }
@@ -269,6 +288,8 @@ function browserFixture ({
     post: async () => assert.fail('Unexpected POST'),
     delete: async () => assert.fail('Unexpected DELETE')
   }
+  const requestListeners = new Set()
+  const frame = {}
   const page = {
     url: () => 'http://127.0.0.1:9151/index',
     locator,
@@ -277,6 +298,9 @@ function browserFixture ({
       events.push('listen')
       listeners.push({ predicate, resolve, reject })
     }),
+    on: (event, handler) => { assert.equal(event, 'request'); requestListeners.add(handler) },
+    off: (event, handler) => { assert.equal(event, 'request'); requestListeners.delete(handler) },
+    mainFrame: () => frame,
     waitForFunction: async (_predicate, args) => { evaluations.push(args); events.push('rendered') },
     evaluate: async () => '2026-10-06'
   }
@@ -285,15 +309,36 @@ function browserFixture ({
     createApiClient: () => api,
     openRoute: async () => {
       events.push('navigate')
-      emit([
+      if (staleTodo) {
+        const stale = browserResponse('/workbench/todo/page?category=all&pageNo=1&pageSize=8')
+        stale.text = async () => assert.fail('Login-document response must not be read')
+        for (const listener of listeners) {
+          assert.equal(await listener.predicate(stale), false)
+        }
+        events.push('stale-ignored')
+      }
+      for (const handler of requestListeners) handler({
+        isNavigationRequest: () => true,
+        frame: () => frame
+      })
+      const freshTodo = browserResponse('/workbench/todo/page?category=all&pageNo=1&pageSize=8', todo)
+      if (todoReadError) freshTodo.text = async () => { throw todoReadError }
+      const responses = [
         ...reportBatch(),
-        browserResponse('/workbench/todo/page?category=all&pageNo=1&pageSize=8', todo),
+        freshTodo,
         browserResponse('/system/user-preference/get?key=workbench.quick-actions', '[]')
-      ])
+      ]
+      for (const response of responses) {
+        for (const handler of requestListeners) handler(response.request())
+      }
+      await emit(responses)
+      if (navigationDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, navigationDelayMs))
+      }
     },
     saveScreenshot: async () => { events.push('screenshot') }
   }
-  return { page, api, caseRecord, dependencies, events, evaluations, emit }
+  return { page, api, caseRecord, dependencies, events, evaluations, emit, requestListeners }
 }
 
 async function runFixture (caseId, options) {
@@ -309,6 +354,25 @@ test('WBF-002 waits for the real non-empty todo response before accepting a row'
   assert.equal(fixture.result.partial, undefined)
   assert.deepEqual(fixture.evaluations, [{ expectedRowCount: 1 }])
   assert.match(fixture.caseRecord.checks[1].details, /响应 rows=1，DOM rows=1/)
+})
+
+test('todo capture ignores login-document responses and cleans up its request listener', async () => {
+  const fixture = browserFixture({ staleTodo: true })
+  const captured = await openWorkbenchAndWaitForTodo(fixture.page, fixture.dependencies.openRoute)
+  assert.equal(captured.todoPage.list.length, 1)
+  assert.ok(fixture.events.includes('stale-ignored'))
+  assert.equal(fixture.requestListeners.size, 0)
+})
+
+test('todo body errors are caught immediately while navigation is pending, not unhandled rejections', async () => {
+  const error = new Error('Network.getResponseBody: lost resource')
+  const fixture = browserFixture({ todoReadError: error, navigationDelayMs: 30 })
+  await assert.rejects(
+    openWorkbenchAndWaitForTodo(fixture.page, fixture.dependencies.openRoute),
+    (actual) => actual === error
+  )
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(fixture.requestListeners.size, 0)
 })
 
 test('WBF-004 skips report reads when the exact CRM permission is absent without wildcard access', async () => {

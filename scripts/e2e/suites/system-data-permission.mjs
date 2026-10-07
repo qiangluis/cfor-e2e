@@ -21,7 +21,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
     const roleCode = `E2E_PB006_${Date.now()}`
     const roleId = dataOf(await api.postBusiness('/system/role/create', {
-      name: 'PB006 E2E 数据权限角色',
+      name: `PB006 E2E 数据权限角色 ${Date.now()}`,
       code: roleCode,
       sort: 99,
       status: 0,

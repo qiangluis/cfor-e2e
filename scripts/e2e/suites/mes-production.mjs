@@ -27,6 +27,27 @@ const BIZ_STATUSES = new Set([
 const RELEASE_GATE_CODES = new Set(['BOM', 'MATERIAL'])
 const CLOSE_CHECK_ITEMS = new Set(['PROCESS', 'MATERIAL', 'QUALITY', 'COST'])
 
+export const productionPageRows = (result, label) => {
+  const data = result?.data
+  const rows = Array.isArray(data) ? data : data?.records ?? data?.list
+  const total = data?.total == null ? rows?.length : Number(data.total)
+  if (
+    !isBusinessSuccess(result) ||
+    !Array.isArray(rows) ||
+    rows.length > 100 ||
+    !Number.isSafeInteger(total) ||
+    total < rows.length ||
+    (rows.length === 0 && total !== 0) ||
+    rows.some((row) => row?.id == null || String(row.id).trim() === '')
+  ) {
+    throw new Error(`${label} 分页响应无效，不能视为缺少正式单据`)
+  }
+  return rows
+}
+
+export const isMissingProductionWork = (result) =>
+  result?.code === 500 && (result?.msg ?? result?.message) === '工单不存在'
+
 const loadOrderRows = async (api) => {
   const pageResult = await api.getBusiness('/mes/prodOrder/list/dictText?pageNo=1&pageSize=100')
   const pageData = pageResult?.data ?? pageResult
@@ -47,68 +68,80 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   const api = createApiClient({ token, record })
 
   if (caseId === 'MES-PROD-001') {
-    const orders = await loadOrderRows(api)
-    const works = await api.getBusiness('/mes/prodWork/list/dictText?pageNo=1&pageSize=100')
-    const workData = works?.data || {}
-    const workRows = Array.isArray(workData?.records)
-      ? workData.records
-      : Array.isArray(workData?.list)
-        ? workData.list
-        : []
+    const orders = productionPageRows(
+      await api.getBusiness('/mes/prodOrder/list/dictText?pageNo=1&pageSize=100'),
+      '生产订单'
+    )
+    const workRows = productionPageRows(
+      await api.getBusiness('/mes/prodWork/list/dictText?pageNo=1&pageSize=100'),
+      '生产工单'
+    )
+    const taskRows = productionPageRows(
+      await api.getBusiness('/mes/prodWorkTask/list?pageNo=1&pageSize=100'),
+      '工单任务'
+    )
     caseRecord.checks.push({
       name: '生产订单、工单和工单任务真实分页接口可读取',
-      passed:
-        orders.length <= 100 &&
-        works?.code === 0 &&
-        workRows.length <= 100 &&
-        (orders.length === 0 || workRows.every((row) => row.id != null)),
-      details: `orders=${orders.length}, works=${workRows.length}`
+      passed: true,
+      details: `orders=${orders.length}, works=${workRows.length}, tasks=${taskRows.length}`
     })
+    // This POST only reads routes/tasks; it does not schedule or generate tasks.
     const missingRoute = await api.request('POST', '/mes/prodWork/routeproducetask', {
-      id: '__not_exists__'
+      prodWorkOrderId: '__not_exists__'
     })
     caseRecord.checks.push({
-      name: '不存在的工单排产请求被拒绝，不伪造任务',
-      passed: missingRoute?.code !== 0,
-      details: JSON.stringify({ code: missingRoute?.code, msg: missingRoute?.msg })
+      name: '不存在工单的工艺路线/任务只读查询明确返回工单不存在，而不是系统异常',
+      passed: isMissingProductionWork(missingRoute),
+      details: JSON.stringify({
+        code: missingRoute?.code,
+        msg: missingRoute?.msg ?? missingRoute?.message
+      })
     })
-    await openRoute(page, '/mes/produce/order')
+    await openRoute(page, '/mes/produce/order', {
+      readySelector: '.search-form input[placeholder="请输入计划单号"]'
+    })
     await saveScreenshot(page, outputDir, 'mes-prod-order-workflow', record)
-    caseRecord.evidence.push('真实登录后读取生产订单/工单分页并校验不存在工单排产负向契约')
-    return { api }
+    caseRecord.evidence.push('真实生产计划页面、订单/工单/任务分页和工艺路线只读负向查询；未执行拆单或排产')
+    const missing = [
+      ['生产订单', orders],
+      ['生产工单', workRows],
+      ['工单任务', taskRows]
+    ].filter(([, rows]) => rows.length === 0).map(([name]) => name)
+    return {
+      api,
+      partial: true,
+      note: `${missing.length ? `当前租户缺少正式${missing.join('、')}；` : ''}只读查询不等于生产订单拆单/生成任务闭环，未创建或修改共享业务数据`
+    }
   }
 
   if (caseId === 'MES-PROD-002') {
-    const workResult = await api.getBusiness('/mes/prodWork/list/dictText?pageNo=1&pageSize=100')
-    const stockResult = await api.request('GET', '/mes/stkIo/list?pageNo=1&pageSize=100')
-    const stockData = stockResult?.data || {}
-    const stockRows = Array.isArray(stockData?.records)
-      ? stockData.records
-      : Array.isArray(stockData?.list)
-        ? stockData.list
-        : []
+    const workRows = productionPageRows(
+      await api.getBusiness('/mes/prodWork/list/dictText?pageNo=1&pageSize=100'),
+      '生产工单'
+    )
+    const stockRows = productionPageRows(
+      await api.getBusiness('/mes/stkIo/list?pageNo=1&pageSize=100'),
+      'WMS 出入库单'
+    )
     caseRecord.checks.push({
       name: '领料工单与 WMS 出入库分页均可读取，库存写侧保持在 WMS',
-      passed:
-        workResult?.code === 0 &&
-        stockResult?.code === 0 &&
-        stockRows.length <= 100,
-      details: `stockRows=${stockRows.length}`
+      passed: true,
+      details: `works=${workRows.length}, stockRows=${stockRows.length}`
     })
-    const invalidIssue = await api.request('POST', '/mes/stkIo/add', {
-      stockIoType: 'MATERIAL_ISSUE',
-      srcBillId: '__not_exists__',
-      entries: []
+    // /mes/stkIo/add/{action} is a real write path, not a safe empty-entry probe.
+    caseRecord.notes.push(
+      '旧 /mes/stkIo/add 请求不存在，404 不能证明领料业务拒绝；真实 /add/{action} 会写单据，本次不调用。'
+    )
+    await openRoute(page, '/mes/produce/work-order', {
+      readySelector: '.search-form input[placeholder="请输入工单编号"]'
     })
-    caseRecord.checks.push({
-      name: '不存在来源工单或空明细的领料写入被拒绝',
-      passed: invalidIssue?.code !== 0,
-      details: JSON.stringify({ code: invalidIssue?.code, msg: invalidIssue?.msg })
-    })
-    await openRoute(page, '/mes/produce/work')
     await saveScreenshot(page, outputDir, 'mes-prod-material-issue', record)
-    caseRecord.evidence.push('真实登录后读取工单/WMS 出入库接口并验证非法领料写入被拒绝')
-    return { api }
+    caseRecord.evidence.push('真实生产工单页面与工单/WMS 出入库分页；未领料、开工或修改库存')
+    return {
+      api,
+      partial: true,
+      note: `${workRows.length === 0 || stockRows.length === 0 ? '当前租户缺少正式工单或 WMS 出入库单；' : ''}分页和页面只读验证不能证明物料领料配置、缺料禁止开工闭环，待隔离正式前置复测`
+    }
   }
 
   if (caseId === 'MES-PROD-003') {

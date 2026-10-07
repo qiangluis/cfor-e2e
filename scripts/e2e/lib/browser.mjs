@@ -70,6 +70,37 @@ async function findLoginButton (page, timeout = 30000) {
   throw new Error('找不到登录提交按钮')
 }
 
+async function waitForLoginSurface (page, timeout = config.browserTimeoutMs) {
+  await page.waitForFunction(
+    () => {
+      const isVisible = (element) => {
+        if (!(element instanceof HTMLElement)) return false
+        const style = window.getComputedStyle(element)
+        return style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          Number(style.opacity || 1) > 0 &&
+          element.getBoundingClientRect().width > 0 &&
+          element.getBoundingClientRect().height > 0
+      }
+      const selectors = [
+        'input[placeholder="请输入租户名称"]',
+        'input[placeholder*="租户"]',
+        'input[name="tenantName"]',
+        'input[placeholder="请输入用户名"]',
+        'input[placeholder*="用户名"]',
+        'input[name="username"]',
+        'input[placeholder="请输入密码"]',
+        'input[name="password"]',
+        'input[type="password"]'
+      ]
+      return selectors.some((selector) =>
+        [...document.querySelectorAll(selector)].some(isVisible)
+      )
+    },
+    { timeout }
+  )
+}
+
 export async function dumpLoginDom (page, directory, tag = 'login') {
   if (!directory) return null
   try {
@@ -239,16 +270,17 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
 
   if (!page.url().includes('/login')) {
     const { token } = await readToken(page)
-    if (!token) throw new Error('已登录但未找到 token')
-    check?.step('page', '已是登录态，复用当前会话', true, page.url())
-    const cached = loginContexts.get(page)
-    return returnContext
-      ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
-      : token
+    if (token) {
+      check?.step('page', '已登录但访问登录地址被重定向，复用当前会话', true, page.url())
+      const cached = loginContexts.get(page)
+      return returnContext
+        ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
+        : token
+    }
   }
 
   try {
-    await page.locator(SELECTORS.loginCard).first().waitFor({ state: 'visible', timeout: 60000 })
+    await waitForLoginSurface(page)
     const tab = page.locator(SELECTORS.accountTab).first()
     if (await tab.isVisible().catch(() => false)) await tab.click().catch(() => {})
 
@@ -343,45 +375,107 @@ export async function submitTenantRegistration (page) {
 export async function openRoute (page, pathname, options = {}) {
   const failures = watchApiFailures(page)
   const target = new URL(`${config.webBase}${pathname}`)
+  const index = new URL(`${config.webBase}/index`)
   // Backend menus are converted into dynamic Vue Router routes after login.
   // A real deep navigation lets the app rebuild that route scope deterministically.
   const readyTimeoutMs = options.readyTimeoutMs || config.browserTimeoutMs
   const retries = Number.isInteger(options.retries) ? options.retries : 0
   let lastError
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  let warmedDynamicRoutes = false
+
+  const waitUntilReady = async () => {
+    await page.waitForFunction(
+      (expectedPath) => window.location.pathname === expectedPath,
+      target.pathname,
+      { timeout: config.browserTimeoutMs }
+    )
+    if (options.readySelector) {
+      await page.locator(options.readySelector).first().waitFor({
+        state: 'visible',
+        timeout: readyTimeoutMs
+      })
+    } else {
+      await page.waitForFunction(
+        (readyText) => {
+          const text = document.body?.innerText || ''
+          return text.includes(readyText) && text.length > 100
+        },
+        options.readyText || '工作台',
+        { timeout: readyTimeoutMs }
+      )
+    }
+  }
+
+  const isNotFoundPage = async () =>
+    page
+      .locator('body')
+      .evaluate((body) => {
+        const text = body?.innerText || ''
+        return /页面不存在|Page Not Found|\b404\b/.test(text)
+      })
+
+  // Reserve one recovery attempt for warming the dynamic route registry from /index.
+  for (let attempt = 0; attempt <= retries + 1; attempt++) {
     try {
       await page.goto(target.toString(), {
         waitUntil: 'domcontentloaded',
         timeout: config.browserTimeoutMs
       })
-      await page.waitForFunction(
-        (expectedPath) => window.location.pathname === expectedPath,
-        target.pathname,
-        { timeout: config.browserTimeoutMs }
-      )
-      if (options.readySelector) {
-        await page.locator(options.readySelector).first().waitFor({
-          state: 'visible',
-          timeout: readyTimeoutMs
+      if (await isNotFoundPage()) {
+        throw new Error(`动态路由尚未注册：${pathname}`)
+      }
+      await waitUntilReady()
+      await waitForPageReady(page, readyTimeoutMs)
+      return { failures }
+    } catch (error) {
+      lastError = error
+      if (!warmedDynamicRoutes) {
+        warmedDynamicRoutes = true
+        await page.goto(index.toString(), {
+          waitUntil: 'domcontentloaded',
+          timeout: config.browserTimeoutMs
         })
-      } else {
         await page.waitForFunction(
           (readyText) => {
             const text = document.body?.innerText || ''
             return text.includes(readyText) && text.length > 100
           },
-          options.readyText || '工作台',
+          '工作台',
           { timeout: readyTimeoutMs }
         )
+        continue
       }
-      return { failures }
-    } catch (error) {
-      lastError = error
-      if (attempt === retries) throw error
+      if (attempt >= retries + 1) throw error
       await page.waitForTimeout(500)
     }
   }
   throw lastError
+}
+
+export async function waitForPageReady (page, timeout = config.browserTimeoutMs) {
+  await page.waitForFunction(
+    () => {
+      const isVisible = (element) => {
+        if (!(element instanceof HTMLElement)) return false
+        const style = window.getComputedStyle(element)
+        return style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          Number(style.opacity || 1) > 0 &&
+          element.getBoundingClientRect().width > 0 &&
+          element.getBoundingClientRect().height > 0
+      }
+      const loadingSelectors = [
+        '[aria-busy="true"]',
+        '.route-skeleton',
+        '.el-skeleton',
+        '.el-loading-mask'
+      ]
+      return loadingSelectors.every((selector) =>
+        ![...document.querySelectorAll(selector)].some(isVisible)
+      )
+    },
+    { timeout }
+  )
 }
 
 export async function tableRows (page) {

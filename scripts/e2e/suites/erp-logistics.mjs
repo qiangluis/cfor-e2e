@@ -19,17 +19,23 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
   await openRoute(page, '/erp/sale/delivery', { readyText: '新增' })
   await page.getByRole('button', { name: /新增/ }).first().click()
-  await page.getByText('承运商', { exact: true }).first().waitFor({
+  const dialog = page.locator('.el-dialog:visible').first()
+  await dialog.waitFor({ state: 'visible', timeout: 60000 })
+  const expandForm = dialog.locator('.check_btn').first()
+  if (await expandForm.count() && await expandForm.isVisible()) {
+    await expandForm.click()
+  }
+  await dialog.getByText('承运商', { exact: true }).first().waitFor({
     state: 'visible',
     timeout: 60000
   })
-  const bodyText = await page.locator('body').innerText()
-  const carrierField = page.getByText('承运商', { exact: true }).first()
-  const expressField = page.getByText('快递品牌', { exact: true }).first()
+  const bodyText = await dialog.innerText()
+  const carrierField = dialog.getByText('承运商', { exact: true }).first()
+  const expressField = dialog.getByText('快递品牌', { exact: true }).first()
   const visible = (await carrierField.count()) > 0 && (await expressField.count()) > 0
   caseRecord.checks.push({
     name: '发运页面提供统一客商承运商和快递品牌字段',
-    passed: page.url().includes('/erp/sale/delivery') &&
+    passed: new URL(page.url()).pathname === '/erp/sale/delivery' &&
       bodyText.includes('承运商') && bodyText.includes('快递品牌') && visible,
     details: page.url()
   })

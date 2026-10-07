@@ -2,7 +2,15 @@ import { createApiClient } from '../lib/api.mjs'
 import { runReadOnlySql } from '../lib/db.mjs'
 import { nonEmpty } from '../lib/assertions.mjs'
 import { config } from '../config/index.mjs'
-import { login, openRoute, saveScreenshot, tableRows } from '../lib/browser.mjs'
+import {
+  login,
+  openRoute,
+  saveScreenshot,
+  tableRows,
+  waitForPageReady
+} from '../lib/browser.mjs'
+import { randomBytes } from 'node:crypto'
+import { findMenuRouteByComponent } from './base-partner.mjs'
 
 export const cases = [
   'FMS-001',
@@ -15,6 +23,168 @@ export const cases = [
   'FIN-OPENING-001',
   'FIN-OPENING-002'
 ]
+
+export const openingDateMatches = (value, expected = '2026-10-06') => {
+  if (Array.isArray(value)) {
+    return value.length === 3 &&
+      String(value[0]) === expected.slice(0, 4) &&
+      String(value[1]).padStart(2, '0') === expected.slice(5, 7) &&
+      String(value[2]).padStart(2, '0') === expected.slice(8, 10)
+  }
+  return String(value ?? '').startsWith(expected)
+}
+
+const dataOf = (response) => response?.data ?? response
+const unique = (prefix) =>
+  `${prefix}-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString('hex').toUpperCase()}`
+
+async function waitForTableRows (page, expectedText = null) {
+  await page.waitForFunction(
+    (expected) =>
+      !document.querySelector('.el-loading-mask') &&
+      (expected
+        ? Array.from(document.querySelectorAll('.el-table__row'))
+          .some((row) => (row.textContent || '').includes(expected))
+        : document.querySelectorAll('.el-table__row').length > 0 ||
+          document.querySelector('.el-table__empty-text') !== null),
+    expectedText,
+    { timeout: 30000 }
+  )
+}
+
+async function createPartner (api, role, suffix = unique('FMS')) {
+  const name = `E2E期初${role === 'receivable' ? '客户' : '供应商'}${suffix}`
+  const partnerId = dataOf(await api.postBusiness('/base/partner/create', {
+    name,
+    shortName: name.slice(0, 12),
+    partnerKind: 'ORGANIZATION',
+    taxNo: `E2E${suffix}`.slice(0, 30),
+    status: 'ACTIVE',
+    customerEnabled: role === 'receivable',
+    supplierEnabled: role === 'payable',
+    carrierEnabled: false
+  }))
+  if (!/^\d+$/.test(String(partnerId))) {
+    throw new Error(`期初测试客商创建未返回稳定 ID：${JSON.stringify(partnerId)}`)
+  }
+  const detail = dataOf(await api.getBusiness(
+    `/base/partner/get?id=${encodeURIComponent(partnerId)}`
+  ))
+  return { id: String(partnerId), name: detail?.name || name }
+}
+
+async function buildOpeningWorkbook (api, role, partner, batchNo) {
+  const XLSX = await import('xlsx')
+  const template = await api.download('/finance/dealingsBeginning/get-import-template')
+  const workbook = XLSX.read(template.buffer, { type: 'buffer', cellDates: true })
+  const templateSheet = workbook.Sheets[workbook.SheetNames[0]]
+  const headers = XLSX.utils.sheet_to_json(templateSheet, { header: 1 })[0] || []
+  const requiredHeaders = ['往来标识', '上线基准日', '导入批次号', '客商ID', '期初金额']
+  if (!requiredHeaders.every((header) => headers.includes(header))) {
+    throw new Error(`往来期初模板缺少必填列：${headers.join(' | ')}`)
+  }
+  const baseDate = new Date('2026-10-06T00:00:00+08:00')
+  const row = {
+    往来标识: role,
+    单据日期: baseDate,
+    上线基准日: baseDate,
+    导入批次号: batchNo,
+    客商ID: partner.id,
+    '客商名称（校验用）': partner.name,
+    期初金额: 123.45,
+    发票号: `E2E-${batchNo}`,
+    发票类型: 'E2E',
+    开票日期: baseDate,
+    '应收/应付日期': baseDate,
+    明细描述: `E2E ${role} opening ${batchNo}`,
+    设备来源: 'E2E'
+  }
+  const output = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(
+    output,
+    XLSX.utils.aoa_to_sheet([headers, headers.map((header) => row[header] ?? '')]),
+    '往来期初列表'
+  )
+  return XLSX.write(output, {
+    type: 'buffer',
+    bookType: 'xlsx',
+    cellDates: true,
+    dateNF: 'yyyy-mm-dd'
+  })
+}
+
+async function importOpeningBatch (api, role, partner, caseRecord) {
+  const batchNo = unique(`E2E-${role === 'receivable' ? 'AR' : 'AP'}`)
+  caseRecord.fixtures = [...(caseRecord.fixtures || []), {
+    kind: 'opening-batch',
+    role,
+    batchNo,
+    partnerId: partner.id
+  }]
+  const buffer = await buildOpeningWorkbook(api, role, partner, batchNo)
+  const formData = new FormData()
+  formData.append(
+    'file',
+    new Blob([buffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    }),
+    `${batchNo}.xlsx`
+  )
+  formData.append('updateSupport', 'false')
+  const imported = dataOf(await api.uploadBusiness('/finance/dealingsBeginning/import', formData))
+  if (imported?.successCount !== 1 || imported?.failureCount !== 0) {
+    throw new Error(`期初导入未成功：${JSON.stringify(imported)}`)
+  }
+  const listResult = await api.getBusiness('/finance/dealingsBeginning/list?pageNo=1&pageSize=100')
+  const rows = listResult?.data?.records || listResult?.data?.list || []
+  const bill = rows.find(
+    (item) => item.importBatchNo === batchNo &&
+      String(item.dealingsLogotype).startsWith(role)
+  )
+  if (!bill?.id) throw new Error(`未回读到期初批次：${batchNo}`)
+  const entries = dataOf(await api.postBusiness('/finance/dealingsBeginning/selectByMainId', {
+    id: bill.id,
+    dealingsLogotype: role
+  }))
+  return { batchNo, bill, entries: Array.isArray(entries) ? entries : [] }
+}
+
+async function cleanOpeningBatch (api, { billId, batchNo, role, partnerId }) {
+  let resolvedBillId = billId
+  if (!resolvedBillId && batchNo) {
+    try {
+      const listResult = await api.getBusiness(
+        '/finance/dealingsBeginning/list?pageNo=1&pageSize=100'
+      )
+      const rows = listResult?.data?.records || listResult?.data?.list || []
+      const bill = rows.find(
+        (item) => item.importBatchNo === batchNo &&
+          (!role || String(item.dealingsLogotype).startsWith(role))
+      )
+      resolvedBillId = bill?.id
+    } catch {}
+  }
+  if (resolvedBillId) {
+    try {
+      await api.putBusiness('/finance/dealingsBeginning/void', { id: resolvedBillId })
+    } catch {}
+    try {
+      await api.deleteBusiness(
+        `/finance/dealingsBeginning/delete?id=${encodeURIComponent(resolvedBillId)}`
+      )
+    } catch {}
+  }
+  if (partnerId) {
+    try {
+      const detail = dataOf(await api.getBusiness(
+        `/base/partner/get?id=${encodeURIComponent(partnerId)}`
+      ))
+      if (detail?.id) {
+        await api.deleteBusiness(`/base/partner/delete?id=${encodeURIComponent(partnerId)}`)
+      }
+    } catch {}
+  }
+}
 
 async function runOpeningReadonlyChecks ({ api, page, record, caseRecord, outputDir, caseId }) {
   const XLSX = await import('xlsx')
@@ -119,7 +289,76 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   })
 
   if (caseId === 'FIN-OPENING-001' || caseId === 'FIN-OPENING-002') {
-    return runOpeningReadonlyChecks({ api, page, record, caseRecord, outputDir, caseId })
+    const role = caseId === 'FIN-OPENING-001' ? 'receivable' : 'payable'
+    const partner = await createPartner(api, role)
+    let billId
+    try {
+      const imported = await importOpeningBatch(api, role, partner, caseRecord)
+      billId = String(imported.bill.id)
+      caseRecord.checks.push({
+        name: `${role === 'receivable' ? '应收' : '应付'}期初 Excel 整批导入成功`,
+        passed: imported.entries.length === 1,
+        details: `batch=${imported.batchNo}, bill=${billId}, entries=${imported.entries.length}`
+      })
+      const entry = imported.entries[0]
+      caseRecord.checks.push({
+        name: '期初明细保留 OPENING 来源、基准日与批次号',
+        passed:
+          entry?.sourceType === 'OPENING' &&
+          entry?.isOpening === true &&
+          openingDateMatches(entry?.openingBaseDate) &&
+          entry?.importBatchNo === imported.batchNo,
+        details: JSON.stringify({
+          sourceType: entry?.sourceType,
+          isOpening: entry?.isOpening,
+          openingBaseDate: entry?.openingBaseDate,
+          importBatchNo: entry?.importBatchNo
+        })
+      })
+
+      const duplicateBuffer = await buildOpeningWorkbook(api, role, partner, imported.batchNo)
+      const duplicateForm = new FormData()
+      duplicateForm.append(
+        'file',
+        new Blob([duplicateBuffer], {
+          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        }),
+        `${imported.batchNo}-duplicate.xlsx`
+      )
+      duplicateForm.append('updateSupport', 'false')
+      const duplicate = dataOf(await api.uploadBusiness('/finance/dealingsBeginning/import', duplicateForm))
+      caseRecord.checks.push({
+        name: '重复批次整批拒绝且不新增主单',
+        passed: duplicate.successCount === 0 &&
+          duplicate.failureCount === 1 &&
+          duplicate.failures?.every((failure) => /已存在|重复/.test(failure.reason || '')),
+        details: JSON.stringify(duplicate)
+      })
+
+      await openRoute(page, '/finance/dealingsBeginning', {
+        readySelector: 'button:has-text("导入期初")',
+        readyTimeoutMs: 90000
+      })
+      await waitForTableRows(page, imported.batchNo)
+      const tableRowTexts = await page.locator('.el-table__row').allInnerTexts()
+      caseRecord.checks.push({
+        name: '往来期初页面显示刚导入批次',
+        passed: tableRowTexts.some((text) => text.includes(imported.batchNo)),
+        details: `batch=${imported.batchNo}, rows=${JSON.stringify(tableRowTexts)}`
+      })
+      await saveScreenshot(page, outputDir, `finance-opening-${caseId}`, record)
+      caseRecord.evidence.push(
+        '真实客商创建、Excel 模板生成、导入响应、主单/明细回读、重复批次拒绝和页面截图'
+      )
+      return { token, api }
+    } finally {
+      await cleanOpeningBatch(api, {
+        billId,
+        batchNo: caseRecord.fixtures?.at(-1)?.batchNo,
+        role,
+        partnerId: partner.id
+      })
+    }
   }
 
   if (!hasConfiguredAccountSet) {
@@ -151,7 +390,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ),
       details: `rows=${eventRows.length}`
     })
-    await openRoute(page, '/fms/event-inbox')
+    await openRoute(page, '/fms/event-inbox', {
+      readyText: '事件受理',
+      readyTimeoutMs: 90000
+    })
+    await waitForTableRows(page)
     caseRecord.checks.push({
       name: '事件受理页面显示真实行',
       passed: (await tableRows(page)).length > 0,
@@ -172,7 +415,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ),
       details: `rows=${voucherRows.length}`
     })
-    await openRoute(page, '/fms/voucher-draft')
+    await openRoute(page, '/fms/voucher-draft', {
+      readyText: '凭证草稿',
+      readyTimeoutMs: 90000
+    })
+    await waitForTableRows(page)
     caseRecord.checks.push({
       name: '凭证草稿页面显示真实行',
       passed: (await tableRows(page)).length > 0,
@@ -183,17 +430,27 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'FMS-005') {
     // PB-069/PB-070：往来期初批次汇总到 FMS 辅助核算期初并对账
-    const openingResult = await api.getBusiness('/finance/dealingsBeginning/list?pageNo=1&pageSize=20')
-    const openingRows = openingResult?.data?.records || openingResult?.data?.list || []
-    caseRecord.checks.push({
-      name: '往来期初批次列表接口可用',
-      passed: Array.isArray(openingRows),
-      details: `rows=${openingRows.length}`
-    })
-    const effective = openingRows.find((row) => String(row.isEffective) === '1')
-    if (effective) {
+    const partner = await createPartner(api, 'receivable')
+    let billId
+    try {
+      const imported = await importOpeningBatch(api, 'receivable', partner, caseRecord)
+      billId = String(imported.bill.id)
+      await api.putBusiness('/finance/dealingsBeginning/check', {
+        id: billId,
+        approvalResultType: '1',
+        approvalRemark: 'E2E FMS-005 tenant 1 acceptance'
+      })
+      const effective = dataOf(await api.getBusiness(
+        `/finance/dealingsBeginning/queryById?id=${encodeURIComponent(billId)}`
+      ))
+      caseRecord.checks.push({
+        name: '期初批次正式审核后生效',
+        passed: String(effective?.isEffective) === '1',
+        details: `bill=${billId}, isEffective=${effective?.isEffective}, billStage=${effective?.billStage}`
+      })
+      await api.postBusiness('/finance/dealingsBeginning/syncOpening', { id: billId })
       const reconcile = await api.postBusiness('/finance/dealingsBeginning/openingReconcile', {
-        id: effective.id
+        id: billId
       })
       const data = reconcile?.data || {}
       caseRecord.checks.push({
@@ -201,87 +458,143 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         passed: typeof data.reconciled === 'boolean' && Array.isArray(data.entries),
         details: `reconciled=${data.reconciled} entries=${(data.entries || []).length}`
       })
+      const repeated = await api.postBusiness('/finance/dealingsBeginning/openingReconcile', {
+        id: billId
+      })
+      const repeatedData = repeated?.data || {}
+      caseRecord.checks.push({
+        name: '重复汇总后对账结果保持一致（FMS 幂等）',
+        passed: JSON.stringify(repeatedData) === JSON.stringify(data),
+        details: `first=${data.reconciled}, repeated=${repeatedData.reconciled}`
+      })
       const initial = await api.getBusiness(
-        `/fms/config/initial-balance/list?accountSetId=${config.fmsAccountSetId}`
+        `/fms/config/initial-balance/list?accountSetId=${config.fmsAccountSetId}&subjectType=1`
       )
       const balances = Array.isArray(initial?.data) ? initial.data : []
       caseRecord.checks.push({
         name: 'FMS 科目期初支持辅助核算余额',
         passed: balances.some((row) => Array.isArray(row.assistBalances)),
-        details: `subjects=${balances.length}`
+        details: `subjects=${balances.length}, rowsWithAssist=${balances.filter((row) => Array.isArray(row.assistBalances)).length}`
       })
-      await openRoute(page, '/fms/config/initial-balance')
+      await openRoute(page, '/fms/config/initial-balance', {
+        readyText: '初始余额',
+        readyTimeoutMs: 90000
+      })
       await saveScreenshot(page, outputDir, 'fms-initial-balance', record)
-    } else {
-      caseRecord.checks.push({
-        name: '存在已生效往来期初批次用于对账',
-        passed: false,
-        details: '当前环境暂无已生效往来期初批次，需在统一回归中先造期初批次'
+      caseRecord.evidence.push(
+        '正式导入、审核生效、FMS 汇总、重复汇总对账、辅助核算余额 API 和页面截图'
+      )
+    } finally {
+      await cleanOpeningBatch(api, {
+        billId,
+        batchNo: caseRecord.fixtures?.at(-1)?.batchNo,
+        role: 'receivable',
+        partnerId: partner.id
       })
     }
-    caseRecord.evidence.push('往来期初批次 API、FMS 辅助核算期初与截图')
   }
 
   if (caseId === 'FMS-006') {
     // PB-068：事件映射分录规则、条件与规则版本
-    const mappingResult = await api.getBusiness(
-      `/fms/config/event-mapping/page?pageNo=1&pageSize=20&accountSetId=${config.fmsAccountSetId}`
-    )
-    const mappingRows = mappingResult?.data?.list || []
-    caseRecord.checks.push({
-      name: '事件映射分页返回真实规则',
-      passed:
-        mappingRows.length > 0 &&
-        mappingRows.every(
-          (row) =>
-            nonEmpty(row.sourceSystem) &&
-            nonEmpty(row.eventType) &&
-            nonEmpty(row.direction) &&
-            Array.isArray(row.entries) &&
-            row.entries.length >= 2
-        ),
-      details: `rows=${mappingRows.length}`
-    })
-    const firstMapping = mappingRows[0]
-    if (firstMapping?.id) {
-      const detailResult = await api.getBusiness(`/fms/config/event-mapping/get?id=${firstMapping.id}`)
+    const eventType = unique('E2E_FMS_MAPPING').replace(/[^A-Z0-9_]/g, '_')
+    const mapping = dataOf(await api.postBusiness('/fms/config/event-mapping/create', {
+      accountSetId: String(config.fmsAccountSetId),
+      sourceSystem: 'ERP',
+      eventType,
+      direction: 'FORWARD',
+      priority: 1,
+      enabled: true,
+      remark: 'E2E tenant 1 mapping acceptance',
+      entries: [
+        {
+          lineNo: 1,
+          direction: 'DEBIT',
+          accountCode: '1122',
+          auxiliarySource: 'CUSTOMER',
+          amountExpression: 'sum(amount)',
+          conditionJson: JSON.stringify({ sourceBillType: { eq: 'E2E_FMS_RECEIPT' } }),
+          sortNo: 1,
+          enabled: true
+        },
+        {
+          lineNo: 2,
+          direction: 'CREDIT',
+          accountCode: '5001',
+          amountExpression: 'sum(amount)',
+          conditionJson: JSON.stringify({ sourceBillType: { eq: 'E2E_FMS_RECEIPT' } }),
+          sortNo: 2,
+          enabled: true
+        }
+      ]
+    }))
+    try {
+      const mappingResult = await api.getBusiness(
+        `/fms/config/event-mapping/page?pageNo=1&pageSize=20&accountSetId=${config.fmsAccountSetId}`
+      )
+      const mappingRows = mappingResult?.data?.list || []
+      const firstMapping = mappingRows.find((row) => String(row.id) === String(mapping))
+      caseRecord.checks.push({
+        name: '事件映射分页返回账套专属真实规则',
+        passed: Boolean(firstMapping) &&
+          nonEmpty(firstMapping.sourceSystem) &&
+          nonEmpty(firstMapping.eventType) &&
+          nonEmpty(firstMapping.direction) &&
+          Array.isArray(firstMapping.entries) &&
+          firstMapping.entries.length >= 2,
+        details: `mappingId=${mapping}, rows=${mappingRows.length}`
+      })
+      const detailResult = await api.getBusiness(`/fms/config/event-mapping/get?id=${mapping}`)
       const detailEntries = detailResult?.data?.entries || []
       caseRecord.checks.push({
-        name: '事件映射详情包含借贷分录与条件字段',
+        name: '事件映射详情包含借贷分录、条件与规则版本',
         passed:
+          detailResult?.data?.accountSetId === String(config.fmsAccountSetId) &&
+          detailResult?.data?.ruleVersion === 1 &&
           detailEntries.some((entry) => entry.direction === 'DEBIT') &&
           detailEntries.some((entry) => entry.direction === 'CREDIT') &&
           detailEntries.every((entry) =>
             Object.prototype.hasOwnProperty.call(entry, 'conditionJson')
           ),
-        details: `entries=${detailEntries.length}`
+        details: `entries=${detailEntries.length}, version=${detailResult?.data?.ruleVersion}`
       })
-    } else {
+      const permission = dataOf(await api.getPermissionInfo())
+      const eventMappingRoute = findMenuRouteByComponent(
+        permission?.menus,
+        'fms/config/event-mapping/index'
+      )
+      if (!eventMappingRoute) {
+        throw new Error('BLOCKED: 权限菜单缺少 component=fms/config/event-mapping/index')
+      }
+      await openRoute(page, eventMappingRoute, {
+        readyText: eventType,
+        readyTimeoutMs: 90000
+      })
+      await waitForTableRows(page)
       caseRecord.checks.push({
-        name: '存在事件映射规则用于详情校验',
-        passed: false,
-        details: '当前账套暂无事件映射规则'
+        name: '事件映射设置页显示账套专属规则',
+        passed: (await page.locator('body').innerText()).includes(eventType),
+        details: `eventType=${eventType}`
       })
-    }
-    await openRoute(page, '/fms/config/event-mapping')
-    caseRecord.checks.push({
-      name: '事件映射设置页可打开',
-      passed: (await page.locator('.el-table').count()) > 0,
-      details: '真实 Chrome 事件映射设置页'
-    })
-    await saveScreenshot(page, outputDir, 'fms-event-mapping', record)
+      await saveScreenshot(page, outputDir, 'fms-event-mapping', record)
 
-    const voucherResult = await api.getBusiness('/fms/voucher-draft/page?pageNo=1&pageSize=20')
-    const voucherRows = voucherResult?.data?.list || []
-    caseRecord.checks.push({
-      name: '凭证草稿暴露命中映射与规则版本字段',
-      passed: voucherRows.some(
-        (row) => Object.prototype.hasOwnProperty.call(row, 'mappingId') &&
-          Object.prototype.hasOwnProperty.call(row, 'mappingRuleVersion')
-      ),
-      details: `rows=${voucherRows.length}`
-    })
-    caseRecord.evidence.push('事件映射维护页、分页/详情规则与凭证草稿命中版本字段')
+      const voucherResult = await api.getBusiness('/fms/voucher-draft/page?pageNo=1&pageSize=20')
+      const voucherRows = voucherResult?.data?.list || []
+      caseRecord.checks.push({
+        name: '凭证草稿暴露命中映射与规则版本字段',
+        passed: voucherRows.some(
+          (row) => Object.prototype.hasOwnProperty.call(row, 'mappingId') &&
+            Object.prototype.hasOwnProperty.call(row, 'mappingRuleVersion')
+        ),
+        details: `rows=${voucherRows.length}`
+      })
+      caseRecord.evidence.push(
+        '账套专属事件映射创建、分页/详情规则、页面和凭证草稿命中版本字段'
+      )
+    } finally {
+      await api.deleteBusiness(
+        `/fms/config/event-mapping/delete?id=${encodeURIComponent(mapping)}&accountSetId=${config.fmsAccountSetId}`
+      ).catch(() => {})
+    }
   }
 
   if (caseId === 'FMS-007') {
@@ -302,7 +615,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `rows=${openingRows.length}`
     })
     await openRoute(page, '/finance/dealingsBeginning')
-    await page.waitForTimeout(1000)
+    await waitForPageReady(page)
     const headers = await page.locator('.el-table th').allInnerTexts()
     caseRecord.checks.push({
       name: '往来期初页面展示上线基准日与导入批次号列',

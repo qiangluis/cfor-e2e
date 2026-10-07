@@ -1,5 +1,6 @@
 import { createApiClient } from '../lib/api.mjs'
-import { login, saveScreenshot } from '../lib/browser.mjs'
+import { isBusinessSuccess } from '../lib/assertions.mjs'
+import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { databaseConfigured, runReadOnlySql } from '../lib/db.mjs'
 
 export const cases = ['MES-TASK-REPORT-001', 'MES-TASK-REPORT-002']
@@ -15,11 +16,41 @@ const loadWorkTaskRows = async (api) => {
 
 const loadWorkRows = async (api) => {
   const pageResult = await api.getBusiness('/mes/prodWork/list/dictText?pageNo=1&pageSize=100')
-  const pageData = pageResult?.data ?? pageResult
-  if (Array.isArray(pageData?.records)) return pageData.records
-  if (Array.isArray(pageData?.list)) return pageData.list
-  if (Array.isArray(pageData)) return pageData
-  return []
+  return pauseWorkPageRows(pageResult)
+}
+
+export const pauseWorkPageRows = (result) => {
+  const data = result?.data
+  const rows = Array.isArray(data) ? data : data?.records ?? data?.list
+  const total = data?.total == null ? rows?.length : Number(data.total)
+  if (
+    !isBusinessSuccess(result) ||
+    !Array.isArray(rows) ||
+    rows.length > 100 ||
+    !Number.isSafeInteger(total) ||
+    total < rows.length ||
+    (rows.length === 0 && total !== 0) ||
+    rows.some((row) => row?.id == null || String(row.id).trim() === '')
+  ) {
+    throw new Error('生产工单分页响应无效，不能视为缺少正式单据')
+  }
+  return rows
+}
+
+export const isPauseValidationRejection = (result, message) =>
+  result?.code === 500 && (result?.msg ?? result?.message) === message
+
+export const pausedWorkRows = (works) =>
+  works.filter((work) => work?.status === 3 || work?.status === '3')
+
+export const hasPausedWorkReadback = (works) => {
+  const paused = pausedWorkRows(works)
+  return paused.length > 0 && paused.every((work) =>
+    typeof work.pauseReason === 'string' &&
+    work.pauseReason.trim().length > 0 &&
+    typeof work.expectResumeTime === 'string' &&
+    Number.isFinite(Date.parse(work.expectResumeTime))
+  )
 }
 
 /**
@@ -81,60 +112,63 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'MES-TASK-REPORT-002') {
     const works = await loadWorkRows(api)
-    if (works.length === 0) {
-      caseRecord.checks.push({
-        name: '暂停工单必须填写暂停原因与预计恢复时间',
-        passed: false,
-        details: '当前租户没有生产工单，无法验证暂停必填校验；需先构造一条生产工单'
-      })
-      return { api }
-    }
+    caseRecord.checks.push({
+      name: '生产工单真实分页可读取，空集不等于暂停业务闭环',
+      passed: true,
+      details: `works=${works.length}`
+    })
 
-    // 负向：不传暂停原因必须被拒绝，且校验发生在状态机变更之前，不会改动工单状态
+    // Mandatory-field checks precede lookup; never send a real work ID to this write API.
     const withoutReason = await api.request('POST', '/mes/prodWork/pause', {
-      id: works[0].id,
-      prodWorkOrderId: works[0].prodOrderId
+      id: '__not_exists__',
+      prodWorkOrderId: '__not_exists__'
     })
     caseRecord.checks.push({
       name: '不填写暂停原因时暂停被拒绝',
-      passed: withoutReason?.code !== 0 && String(withoutReason?.msg || '').includes('暂停原因'),
-      details: JSON.stringify({ code: withoutReason?.code, msg: withoutReason?.msg })
+      passed: isPauseValidationRejection(withoutReason, '暂停原因不能为空'),
+      details: JSON.stringify({
+        code: withoutReason?.code,
+        msg: withoutReason?.msg ?? withoutReason?.message
+      })
     })
 
-    // 负向：缺少预计恢复时间同样被拒绝
     const withoutResumeTime = await api.request('POST', '/mes/prodWork/pause', {
-      id: works[0].id,
-      prodWorkOrderId: works[0].prodOrderId,
+      id: '__not_exists__',
+      prodWorkOrderId: '__not_exists__',
       pauseReason: 'e2e 校验暂停原因必填'
     })
     caseRecord.checks.push({
       name: '不填写预计恢复时间时暂停被拒绝',
-      passed:
-        withoutResumeTime?.code !== 0 && String(withoutResumeTime?.msg || '').includes('预计恢复时间'),
-      details: JSON.stringify({ code: withoutResumeTime?.code, msg: withoutResumeTime?.msg })
+      passed: isPauseValidationRejection(withoutResumeTime, '预计恢复时间不能为空'),
+      details: JSON.stringify({
+        code: withoutResumeTime?.code,
+        msg: withoutResumeTime?.msg ?? withoutResumeTime?.message
+      })
     })
 
-    const pausedWorks = works.filter((work) => Number(work?.status) === 3)
+    const pausedWorks = pausedWorkRows(works)
     if (pausedWorks.length > 0) {
       caseRecord.checks.push({
         name: '暂停中的工单回读暂停原因与预计恢复时间',
-        passed:
-          typeof pausedWorks[0]?.pauseReason === 'string' &&
-          pausedWorks[0].pauseReason.length > 0 &&
-          Boolean(pausedWorks[0]?.expectResumeTime),
-        details: JSON.stringify({
-          id: pausedWorks[0]?.id,
-          pauseReason: pausedWorks[0]?.pauseReason,
-          expectResumeTime: pausedWorks[0]?.expectResumeTime
-        })
+        passed: hasPausedWorkReadback(works),
+        details: `pausedWorks=${pausedWorks.length}`
       })
     } else {
-      caseRecord.notes.push('当前租户没有暂停中的工单，跳过暂停原因回读断言。')
+      caseRecord.notes.push('当前租户没有正式暂停工单，必填负向验证不能替代暂停字段落库回读。')
     }
 
+    await openRoute(page, '/mes/produce/work-order', {
+      readySelector: '.search-form input[placeholder="请输入工单编号"]'
+    })
     await saveScreenshot(page, outputDir, 'mes-prod-work-pause', record)
-    caseRecord.evidence.push('真实登录后调用工单暂停接口做必填负向校验（未真正暂停工单）')
-    return { api }
+    caseRecord.evidence.push('真实生产工单页面、正式工单只读查询和不存在 ID 的暂停必填负向校验；未暂停正式工单')
+    return pausedWorks.length > 0
+      ? { api }
+      : {
+          api,
+          partial: true,
+          note: `${works.length === 0 ? '当前租户没有正式生产工单；' : ''}缺少正式暂停工单，原因/预计恢复时间落库回读未验证，不创建或暂停共享业务数据`
+        }
   }
 
   return { api }

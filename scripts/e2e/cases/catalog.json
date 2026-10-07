@@ -332,7 +332,7 @@
         {
           "id": "PB001-001",
           "title": "企业资料支持生产贸易混合型",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["可登录租户管理员", "企业组织资料菜单可见"],
           "routes": ["/system/enterprise-organization"],
           "assertions": ["真实浏览器打开企业资料页", "企业类型包含生产贸易混合型"],
@@ -352,7 +352,7 @@
         {
           "id": "PB002-001",
           "title": "初始化子系统目录、套餐边界与启用月份",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["INIT-002 PASS", "当前租户存在有效套餐"],
           "routes": ["/systemInit/index"],
           "assertions": [
@@ -374,7 +374,7 @@
         {
           "id": "PB029-001",
           "title": "旧 ERP 产品主数据退役状态只读契约",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "旧 ERP 产品表和 Base 主档可查询"],
           "routes": ["/erp/product-migration/audit"],
           "assertions": [
@@ -433,7 +433,7 @@
         {
           "id": "PB032-001",
           "title": "存货档案形态与业务场景门禁",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "Base 存货档案页面可访问"],
           "routes": ["/base/material"],
           "assertions": [
@@ -449,7 +449,7 @@
         {
           "id": "PB032-002",
           "title": "采购销售出入库复用存货场景门禁",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "ERP 采购/销售出入库页面可访问"],
           "routes": [
             "/erp/purchase/in",
@@ -477,7 +477,7 @@
         {
           "id": "PB032-003",
           "title": "MES BOM/工单/MRP 写侧档案形态门禁",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "生产 BOM 页面与统一存货列表可访问"],
           "routes": ["/mes/base/assemble"],
           "assertions": [
@@ -493,7 +493,7 @@
         {
           "id": "PB032-004",
           "title": "存货导入模板与统一校验",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "Base 存货档案页面可访问"],
           "routes": ["/base/material"],
           "assertions": [
@@ -508,7 +508,7 @@
         {
           "id": "PB032-005",
           "title": "初始化中心存货档案深度就绪",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "初始化中心可访问"],
           "routes": ["/systemInit"],
           "assertions": [
@@ -549,7 +549,7 @@
         {
           "id": "PB033-001",
           "title": "公共客商等级目录与适用角色列表",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已登录", "PB-033 Flyway 已执行"],
           "routes": ["/systemInit"],
           "assertions": [
@@ -612,7 +612,7 @@
         {
           "id": "PB003-001",
           "title": "组织编码、分支类型、管理边界与部门主管",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已完成系统初始化", "可访问系统设置/部门管理"],
           "routes": ["/system/dept", "/systemInit/index"],
           "assertions": [
@@ -655,7 +655,7 @@
         {
           "id": "PB005-001",
           "title": "权限授予边界、菜单父链与无效资源拒绝",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["存在租户管理员和测试角色", "可访问角色与权限管理"],
           "routes": ["/system/role"],
           "assertions": [
@@ -693,7 +693,7 @@
         {
           "id": "PB008-001",
           "title": "企业用户稳定账号与手机号换绑边界",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["存在租户管理员和用户管理权限", "可访问用户管理"],
           "routes": ["/system/user"],
           "assertions": [
@@ -729,7 +729,7 @@
         {
           "id": "PB009-001",
           "title": "业务单据审批策略租户隔离与流程版本",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已启用 BPM 或至少一个业务模块", "存在单据核批配置权限"],
           "routes": ["/mes/base/bill-options", "/bpm/model"],
           "assertions": [
@@ -749,7 +749,7 @@
         {
           "id": "PB010-001",
           "title": "打印模板租户隔离、版本发布和默认模板治理",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已启用打印模板入口", "存在模板查询权限"],
           "routes": ["/print/index"],
           "assertions": [
@@ -783,7 +783,7 @@
         {
           "id": "PB011-001",
           "title": "填值规则版本、发布态与租户流水隔离",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["当前租户已启用单据编号规则入口", "存在填值规则查询权限"],
           "routes": ["/mes/base/fillRule"],
           "assertions": [
@@ -1053,7 +1053,7 @@
         {
           "id": "PROC-001",
           "title": "MRP 按净需求和建议口径识别缺料",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["BOM、工艺、库存、已预留和在途数据已准备"],
           "routes": ["/mes/mrp", "/mes/produce/order"],
           "assertions": [
@@ -1068,7 +1068,7 @@
         {
           "id": "PROC-002",
           "title": "缺料自动转请购、审核生成采购订单",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["PROC-001 PASS", "BPM 缺料采购流程和角色已预置"],
           "routes": ["/erp/purchase/purchaseRequest", "/erp/purchase/order"],
           "assertions": [
@@ -1083,7 +1083,7 @@
         {
           "id": "PROC-003",
           "title": "采购审核与发票复核应付来源、到货、入库和入库检",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["供应商、结算账户、质检存货配置"],
           "routes": ["/erp/purchase/order", "/erp/purchase/invoice", "/mes/wms/arrival-notice", "/mes/wms/inbound"],
           "assertions": [
@@ -1107,7 +1107,7 @@
         {
           "id": "PROC-004",
           "title": "请购与对账开关阻断绕过来源的正式单据",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "采购申请、销售对账或采购对账开关在业务配置中启用",
             "存在可用于测试的未确认应收/应付和已确认应收/应付记录"
@@ -1148,7 +1148,7 @@
         {
           "id": "PROC-005",
           "title": "销售/采购订单结算方式与规则版本快照",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "字典 x_settle_method 已启用，存在启用的结算方式规则",
             "具备采购订单与销售订单维护权限"
@@ -1172,7 +1172,7 @@
         {
           "id": "PROC-006",
           "title": "ERP 结算方式规则设置页",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "系统初始化完成，具备 ERP 业务设置查看权限",
             "字典 x_settle_method 已启用"
@@ -1230,7 +1230,7 @@
         {
           "id": "PROC-008",
           "title": "ERP 采购类型规则设置页与单据类型引用保护",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "系统初始化完成，具备 ERP 业务设置查看权限",
             "system_document_type 已预置 PURCHASE_ 前缀的采购订单根节点与普通/紧急采购子类型"
@@ -1695,7 +1695,7 @@
         {
           "id": "CRM-BASE-001",
           "title": "销售基础字典与商机执行状态口径",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["系统初始化完成", "可访问设置主菜单和 CRM 业务设置"],
           "routes": ["/system/dict", "/crm/business"],
           "assertions": [
@@ -1717,7 +1717,7 @@
         {
           "id": "CRM-BASE-002",
           "title": "意向级别规则、客户意向字段与跟进周期",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["CRM-BASE-001 PASS", "平台模板已预置 A/B/C 意向级别规则"],
           "routes": ["/crm/customer", "/settings/crm"],
           "assertions": [
@@ -1748,7 +1748,7 @@
         {
           "id": "CRM-BASE-003",
           "title": "客户标签定义、关系和变更审计",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["CRM-BASE-001 PASS", "存在测试客户"],
           "routes": ["/crm/customer", "/settings/crm"],
           "assertions": [
@@ -1781,7 +1781,7 @@
         {
           "id": "CRM-BASE-004",
           "title": "公海回收幂等、规则版本与工作日",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["CRM-BASE-002 PASS", "客户公海自动入池已启用"],
           "routes": ["/crm/customer", "/settings/crm"],
           "assertions": [
@@ -1803,7 +1803,7 @@
         {
           "id": "CRM-BASE-005",
           "title": "商机阶段进入条件与必填字段由后端强制校验",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["CRM-BASE-001 PASS", "存在可推进的商机阶段组和阶段"],
           "routes": ["/crm/business", "/settings/crm"],
           "assertions": [
@@ -1835,7 +1835,7 @@
         {
           "id": "CRM-BASE-006",
           "title": "商机执行状态受控变更与变更明细审计",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "字典 crm_business_execution_status 已启用",
             "存在非终态商机，具备 crm:business:update 权限",
@@ -2105,7 +2105,7 @@
         {
           "id": "MES-BASE-001",
           "title": "企业生产类型映射系统生产场景与规则版本",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["生产订单根节点和正常/紧急生产模板已预置"],
           "routes": ["/mes/produce/order", "/system/settings/production"],
           "assertions": [
@@ -2120,7 +2120,7 @@
         {
           "id": "MES-BASE-002",
           "title": "委外业务类型映射 PROCESS / WORK 核心类型",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["工序委外/工单委外模板已预置"],
           "routes": ["/mes/produce/outsource", "/system/settings/production"],
           "assertions": [
@@ -2135,7 +2135,7 @@
         {
           "id": "MES-BASE-003",
           "title": "条码业务对象与载体目录，RFID 明确禁用",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["条码业务对象类型与载体目录已预置"],
           "routes": ["/erp/barcode/rules", "/system/settings/erp"],
           "assertions": [
@@ -2150,7 +2150,7 @@
         {
           "id": "MES-BASE-004",
           "title": "生产日历版本发布与排产快照",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["APS 工作日历已配置工作日与工作模式"],
           "routes": ["/mes/aps/calendar", "/mes/aps/scheduling"],
           "assertions": [
@@ -2164,7 +2164,7 @@
         {
           "id": "MES-BASE-005",
           "title": "班组交接双方确认门禁",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["班组主档与成员已维护"],
           "routes": ["/mes/prod/team-handover"],
           "assertions": [
@@ -2179,7 +2179,7 @@
         {
           "id": "MES-BASE-006",
           "title": "工艺路线发布版本与工单快照",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["工艺路线与工序节点已维护"],
           "routes": ["/mes/base/tech-route"],
           "assertions": [
@@ -3046,7 +3046,7 @@
         {
           "id": "WMS-QC-002",
           "title": "库存 ATP、预留、拣货、出库检和发货",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["销售订单已审核", "WMS 有可用和预留数据"],
           "routes": ["/mes/wms/inventory", "/mes/wms/shipment-notice", "/mes/wms/outbound"],
           "assertions": [
@@ -3067,7 +3067,7 @@
         {
           "id": "WMS-QC-003",
           "title": "跨租户、无权限、重复执行和事务回滚",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["WMS-QC-001 或 WMS-QC-002 已产生测试数据"],
           "routes": ["/mes/wms/inventory"],
           "assertions": [
@@ -3083,7 +3083,7 @@
         {
           "id": "WMS-QC-004",
           "title": "库区库位归属、唯一与删除保护",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["仓库已启用库区和库位", "存在用于测试的库区、库位和库存或未完成单据"],
           "routes": ["/base/warehouseConfig/archives", "/mes/wms/inventory", "/mes/wms/inbound"],
           "assertions": [
@@ -3149,7 +3149,7 @@
         {
           "id": "WMS-QC-006",
           "title": "业务出入库类型映射只能指向固定核心类型",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "字典 wms_business_io_type 已存在平台默认业务类型",
             "已存在用于测试的 wms_business_io_type_rule"
@@ -3199,7 +3199,7 @@
         {
           "id": "WMS-QC-007",
           "title": "运输车辆司机、承运商与车牌唯一校验",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": [
             "存在有效 HRM 员工",
             "存在启用承运商角色的统一客商 base_partner",
@@ -3230,7 +3230,7 @@
         {
           "id": "WMS-QC-008",
           "title": "仓库库区与库位启用开关约束",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["存在可编辑的测试仓库"],
           "routes": ["/base/warehouseConfig/archives"],
           "assertions": [
@@ -4340,7 +4340,7 @@
         {
           "id": "PLM-001",
           "title": "项目、产品、零件、BOM 和工艺建模",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["PMS 项目建模和 PLM 基础预置完成"],
           "routes": ["/plm/project", "/plm/product", "/plm/bom"],
           "assertions": [
@@ -4355,7 +4355,7 @@
         {
           "id": "PLM-002",
           "title": "正式发布链路供 ERP/MES 消费",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["PLM-001 PASS"],
           "routes": ["/plm/product", "/plm/release"],
           "assertions": [
@@ -4502,7 +4502,7 @@
         {
           "id": "IOT-001",
           "title": "产品、物模型、设备分组和设备档案",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["IoT 设备档案为唯一事实源", "旧 MES 设备档案只读兼容"],
           "routes": ["/iot/product", "/iot/thing-model", "/iot/device-group", "/iot/device"],
           "assertions": [
@@ -4517,7 +4517,7 @@
         {
           "id": "IOT-002",
           "title": "设备遥测、告警和重复消息幂等",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["IOT-001 PASS", "真实设备或受控消息源"],
           "routes": ["/iot/monitor", "/iot/alarm"],
           "assertions": [
@@ -4532,7 +4532,7 @@
         {
           "id": "IOT-003",
           "title": "设备业务类型、产能版本与三层状态",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["IOT-001 PASS", "工艺路线与工序已维护"],
           "routes": ["/mes/aps/capacity", "/iot/device"],
           "assertions": [

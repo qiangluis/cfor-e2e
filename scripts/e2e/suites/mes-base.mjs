@@ -1,6 +1,10 @@
 import { createApiClient } from '../lib/api.mjs'
-import { asList } from '../lib/assertions.mjs'
-import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { asList, isBusinessSuccess } from '../lib/assertions.mjs'
+import {
+  login as loginDefault,
+  openRoute as openRouteDefault,
+  saveScreenshot as saveScreenshotDefault
+} from '../lib/browser.mjs'
 
 export const cases = [
   'MES-BASE-001',
@@ -9,7 +13,6 @@ export const cases = [
   'MES-BASE-004',
   'MES-BASE-005',
   'MES-BASE-006',
-  'MES-BASE-002',
   'PB081-001',
   'PB102-001',
   'PB102-002',
@@ -24,9 +27,59 @@ export const cases = [
   'PB039-003'
 ]
 
+export const DESIGNED_MES_BASE_ENABLE_CASES = Object.freeze(['MES-BASE-002'])
+// Catalog activation remains owned by the main task.
+export const DESIGNED_MES_BASE_READONLY_CASES = Object.freeze([
+  'MES-BASE-001', 'MES-BASE-002', 'MES-BASE-003',
+  'MES-BASE-004', 'MES-BASE-005', 'MES-BASE-006'
+])
+
+const nonBlank = (value) => value != null && String(value).trim() !== ''
+
+export const mesBaseRows = (result, label, idField = 'id') => {
+  const data = result?.data
+  const rows = Array.isArray(data) ? data : data?.list ?? data?.records
+  const total = data?.total == null ? rows?.length : Number(data.total)
+  if (!isBusinessSuccess(result) || !Array.isArray(rows) || rows.length > 100 ||
+    !Number.isSafeInteger(total) || total < rows.length ||
+    (rows.length === 0 && total !== 0) ||
+    rows.some((row) => !row || typeof row !== 'object' || !nonBlank(row[idField]))) {
+    throw new Error(`${label} 响应无效，不能当作缺前置或通过`)
+  }
+  return rows
+}
+
+export const mesBaseDetail = (result, id, label) => {
+  const data = result?.data
+  if (!isBusinessSuccess(result) || !data || Array.isArray(data) ||
+    String(data.id) !== String(id)) {
+    throw new Error(`${label} 详情响应无效`)
+  }
+  return data
+}
+
+export const isPb038002Fixture = (material) =>
+  /^(?:E2E|AUTOTEST)_PB038_002(?:_|$)/.test(material?.code || '') &&
+  material?.mark === 'PB038-002 dedicated e2e fixture' &&
+  material?.inventoryNature === 'STOCK' && nonBlank(material?.unitId)
+
+export const pb038GradePayload = (material, gradeFields) => {
+  if (!isPb038002Fixture(material) || !nonBlank(material.id)) {
+    throw new Error('PB038-002 禁止编辑非本案例专用测试夹具')
+  }
+  return { ...material, ...gradeFields }
+}
+
+export const isLegacyInitializedRoute = (row) =>
+  row?.code === 'INIT-ROUTE-001' && row?.createBy === 'system-init' &&
+  !nonBlank(row?.publishTime) && !nonBlank(row?.publishBy)
+
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  const login = dependencies.login || loginDefault
+  const openRoute = dependencies.openRoute || openRouteDefault
+  const saveScreenshot = dependencies.saveScreenshot || saveScreenshotDefault
   caseRecord.notes.push(
     '生产类型/委外类型复用 system_document_type 与系统受控核心类型，条码载体只开放条形码与二维码，RFID 暂缓。'
   )
@@ -35,7 +88,188 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   )
 
   const token = await login(page)
-  const api = createApiClient({ token, record })
+  const api = (dependencies.createApiClient || createApiClient)({ token, record })
+
+  if (caseId === 'MES-BASE-001') {
+    const rules = mesBaseRows(await api.getBusiness(
+      '/mes/production-type-rule/page?pageNo=1&pageSize=100'), '生产类型规则')
+    const orders = mesBaseRows(await api.getBusiness(
+      '/mes/prodOrder/list/dictText?pageNo=1&pageSize=100'), '生产订单')
+    caseRecord.checks.push({
+      name: '生产类型规则与生产订单真实分页可读取',
+      passed: true,
+      details: `rules=${rules.length}, orders=${orders.length}`
+    })
+    if (rules.length) {
+      caseRecord.checks.push({
+        name: '规则样本映射受控正常/紧急生产场景并保存稳定类型和版本',
+        passed: rules.every((row) => ['1', '2'].includes(row.produceType) &&
+          nonBlank(row.documentTypeCode) && Number.isInteger(row.version) &&
+          row.version >= 1 && [0, 1].includes(row.status)),
+        details: `samples=${rules.length}`
+      })
+      const detail = mesBaseDetail(await api.getBusiness(
+        `/mes/production-type-rule/get?id=${encodeURIComponent(rules[0].id)}`),
+      rules[0].id, '生产类型规则')
+      caseRecord.evidence.push(`生产规则详情 id=${detail.id}, version=${detail.version}`)
+    }
+    const snapshots = orders.filter((row) => nonBlank(row.documentTypeCode) &&
+      Number.isInteger(row.documentTypeRuleVersion) && row.documentTypeRuleVersion >= 1)
+    await openRoute(page, '/mes/produce/order', {
+      readySelector: '.search-form input[placeholder="请输入计划单号"]'
+    })
+    await saveScreenshot(page, outputDir, 'mes-base-production-type', record)
+    return {
+      api, partial: true,
+      note: `规则=${rules.length}，生产订单规则快照样本=${snapshots.length}；` +
+        `${rules.length ? '' : '缺企业生产类型规则；'}` +
+        `${snapshots.length ? '' : '缺正式订单类型/版本快照；'}` +
+        '未保存订单或删除引用规则；源码仅有规则权限按钮，未找到独立生产类型规则维护页面'
+    }
+  }
+
+  if (caseId === 'MES-BASE-003') {
+    const objects = mesBaseRows(await api.getBusiness('/erp/barcode/catalog/object-types'), '条码对象目录')
+    const carriers = mesBaseRows(await api.getBusiness('/erp/barcode/catalog/carriers'), '条码载体目录')
+    const rules = mesBaseRows(await api.getBusiness(
+      '/erp/barcode/rules/page?pageNo=1&pageSize=100'), '条码规则')
+    caseRecord.checks.push({
+      name: '平台条码对象/载体与企业条码规则真实响应可读取',
+      passed: true,
+      details: `objects=${objects.length}, carriers=${carriers.length}, rules=${rules.length}`
+    })
+    if (objects.length && carriers.length) {
+      const byCode = new Map(carriers.map((row) => [row.code, row]))
+      caseRecord.checks.push({
+        name: 'BARCODE/QRCODE 已实现，RFID 显式暂缓',
+        passed: ['BARCODE', 'QR_CODE'].every((code) => byCode.get(code)?.supported === 1) &&
+          byCode.get('RFID')?.supported === 0 && byCode.get('RFID')?.deferred === 1,
+        details: carriers.map((row) => `${row.code}:supported=${row.supported},deferred=${row.deferred}`).join(',')
+      })
+      const configured = rules.filter((row) => nonBlank(row.objectType) || nonBlank(row.carrier))
+      if (configured.length) {
+        caseRecord.checks.push({
+          name: '已配置条码规则仅引用平台业务对象与已实现载体',
+          passed: configured.every((row) => objects.some((item) => item.code === row.objectType) &&
+            byCode.get(row.carrier)?.supported === 1),
+          details: `configured=${configured.length}, legacy=${rules.length - configured.length}`
+        })
+      }
+    }
+    // Resolve the actual menu component, not the obsolete catalog route.
+    const permission = await api.getBusiness('/system/auth/get-permission-info')
+    const menus = permission?.data?.menus
+    if (!Array.isArray(menus)) throw new Error('权限菜单响应无效')
+    const find = (rows, parent = '') => {
+      for (const row of rows) {
+        const route = row.path?.startsWith('/') ? row.path : `${parent}/${row.path || ''}`
+        const component = String(row.component || '').replace(/^\/?views\//, '').replace(/\.vue$/, '')
+        if (component === 'barcode/barCodeRules/index') return route
+        const child = find(row.children || [], route)
+        if (child) return child
+      }
+      return null
+    }
+    const route = find(menus)
+    if (route) {
+      await openRoute(page, route, { readySelector: 'input[placeholder="请输入规则编码"]' })
+      await saveScreenshot(page, outputDir, 'mes-base-barcode-carrier', record)
+      caseRecord.evidence.push(`真实菜单条码规则页 ${route}`)
+    }
+    return {
+      api, partial: true,
+      note: `目录对象=${objects.length}，载体=${carriers.length}，规则=${rules.length}；` +
+        `${route ? '' : '缺条码规则页面菜单；'}` +
+        '只读目录不证明 RFID 保存拒绝或跨租户字典绕过保护，未创建规则或改平台目录'
+    }
+  }
+
+  if (caseId === 'MES-BASE-004') {
+    const calendars = mesBaseRows(await api.getBusiness(
+      '/mes/workCalendar/page?pageNo=1&pageSize=100'), '生产日历')
+    const modes = mesBaseRows(await api.getBusiness('/mes/workMode/list'), '工作模式')
+    caseRecord.checks.push({
+      name: 'APS 生产日历与工作模式真实响应可读取',
+      passed: true,
+      details: `calendars=${calendars.length}, modes=${modes.length}`
+    })
+    if (calendars.length) {
+      caseRecord.checks.push({
+        name: '日历样本返回稳定编码、日期与工作日标识',
+        passed: calendars.every((row) => nonBlank(row.calendarCode) &&
+          nonBlank(row.calendarDate) && typeof row.isWorkday === 'boolean'),
+        details: `samples=${calendars.length}`
+      })
+    }
+    caseRecord.evidence.push('WorkCalendarRespVO 当前未公开 version/publishStatus，读侧不能证明发布版本快照')
+    await openRoute(page, '/settings/production/work-calendar', {
+      readySelector: '.calendar-workbench .calendar-toolbar'
+    })
+    await saveScreenshot(page, outputDir, 'mes-base-work-calendar', record)
+    return {
+      api, partial: true,
+      note: `生产日历=${calendars.length}，工作模式=${modes.length}；` +
+        '缺可读取的日历发布版本字段与正式排产历史快照证据；未发布、停用、删除日历或生成排产'
+    }
+  }
+
+  if (caseId === 'MES-BASE-005') {
+    const handovers = mesBaseRows(await api.getBusiness(
+      '/mes/team-handover/page?pageNo=1&pageSize=100'), '班组交接')
+    caseRecord.checks.push({
+      name: '独立班组交接事实分页真实可读取', passed: true,
+      details: `handovers=${handovers.length}`
+    })
+    if (handovers.length) {
+      caseRecord.checks.push({
+        name: '交接样本引用双方班组，确认终态具备两个不同确认人',
+        passed: handovers.every((row) => nonBlank(row.outTeamId) && nonBlank(row.inTeamId) &&
+          [0, 1].includes(row.status) && (row.status !== 1 ||
+            (nonBlank(row.outConfirmBy) && nonBlank(row.inConfirmBy) &&
+              String(row.outConfirmBy) !== String(row.inConfirmBy)))),
+        details: `samples=${handovers.length}`
+      })
+      mesBaseDetail(await api.getBusiness(
+        `/mes/team-handover/get?id=${encodeURIComponent(handovers[0].id)}`),
+      handovers[0].id, '班组交接')
+    }
+    return {
+      api, partial: true,
+      note: `交接=${handovers.length}；未创建/确认共享交接。` +
+        '未找到 MES 班组交接前端页面；共享交接数据与真实写侧仍需隔离夹具验证；后端 confirmHandover 已禁止同一确认人，MesTeamHandoverServiceImplTest 7/7 通过'
+    }
+  }
+
+  if (caseId === 'MES-BASE-006') {
+    const routes = mesBaseRows(await api.getBusiness(
+      '/mes/wmsTechRoute/list?pageNo=1&pageSize=100'), '工艺路线')
+    const tasks = mesBaseRows(await api.getBusiness(
+      '/mes/prodWorkTask/list?pageNo=1&pageSize=100'), '工单任务')
+    caseRecord.checks.push({
+      name: '工艺路线与任务快照真实分页可读取', passed: true,
+      details: `routes=${routes.length}, tasks=${tasks.length}`
+    })
+    const published = routes.filter((row) => row.devStatus === 2)
+    if (published.length) {
+      caseRecord.checks.push({
+        name: '已发布路线样本可读取稳定编码与版本，非历史初始化路线具备发布审计',
+        passed: published.every((row) => nonBlank(row.code) && nonBlank(row.version) &&
+          (isLegacyInitializedRoute(row) || (nonBlank(row.publishTime) && nonBlank(row.publishBy)))),
+        details: `published=${published.length}`
+      })
+      if (published.some(isLegacyInitializedRoute)) {
+        caseRecord.notes.push('初始化路线存在 devStatus=2 但缺 publishTime/publishBy，无法证明正式发布审计；不回写历史数据。')
+      }
+    }
+    const snapshots = tasks.filter((row) => nonBlank(row.routeVersion))
+    await openRoute(page, '/settings/production/technique', { readySelector: '.technique-route' })
+    await saveScreenshot(page, outputDir, 'mes-base-tech-route-version', record)
+    return {
+      api, partial: true,
+      note: `路线=${routes.length}，已发布=${published.length}，任务版本快照=${snapshots.length}；` +
+        '缺隔离的已发布工艺/BOM/任务升版前后证据，未编辑、发布、删除路线或生成任务'
+    }
+  }
 
   if (caseId === 'PB081-001') {
     // 1. 确保存在在职 HRM 员工，验证建档默认开通系统登录账号
@@ -47,6 +281,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       entryStatus: 1,
       type: 1,
       entryTime: '2026-01-01T00:00:00',
+      probation: 3,
       createUserAccount: true,
       userAccountUsername
     })
@@ -117,29 +352,48 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'MES-BASE-002') {
     const typePage = await api.getBusiness('/mes/outsource-type-rule/page?pageNo=1&pageSize=100')
-    const rules = typePage?.list || typePage?.records || []
+    const rules = Array.isArray(typePage?.data?.list) ? typePage.data.list : null
     const supportedCoreTypes = new Set(['PROCESS', 'WORK'])
-    const coreTypesValid = rules.every((item) => supportedCoreTypes.has(String(item.coreType || '')))
     caseRecord.checks.push({
-      name: '委外类型规则只映射 PROCESS / WORK 核心类型',
-      passed: coreTypesValid,
-      details: `rules=${rules.length}, coreTypes=${[...new Set(rules.map((item) => item.coreType))].join(',')}`
+      name: '委外类型规则返回成功业务响应与分页数组',
+      passed: isBusinessSuccess(typePage) && rules !== null,
+      details: `rules=${rules?.length ?? 'invalid'}`
     })
-    caseRecord.checks.push({
-      name: '委外类型规则返回企业类型编码和版本',
-      passed: rules.length === 0 || rules.every((item) => item.documentTypeCode && Number(item.version) >= 1),
-      details: rules.length ? JSON.stringify(rules.slice(0, 3)) : '当前租户无规则，字段契约由后端接口保证'
+    if (rules?.length) {
+      caseRecord.checks.push({
+        name: '委外类型规则只映射 PROCESS / WORK 核心类型',
+        passed: rules.every((item) => supportedCoreTypes.has(item?.coreType)),
+        details: `coreTypes=${[...new Set(rules.map((item) => item?.coreType))].join(',')}`
+      })
+      caseRecord.checks.push({
+        name: '委外规则样本返回非空企业类型编码、正整数版本与启停状态',
+        passed: rules.every((item) => typeof item?.documentTypeCode === 'string' &&
+          item.documentTypeCode.trim() !== '' && Number.isInteger(item.version) &&
+          item.version >= 1 && [0, 1].includes(item.status)),
+        details: `rules=${rules.length}`
+      })
+    } else if (rules?.length === 0) {
+      caseRecord.notes.push('缺前置：当前租户没有委外类型规则，核心类型/版本样本断言未执行，不视为通过。')
+    }
+    await openRoute(page, '/settings/production/outsource-type-rule', {
+      readySelector: '.el-table__header-wrapper th:has-text("核心类型")'
     })
-    await openRoute(page, '/settings/production/outsource-type-rule')
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
       name: '委外类型规则页面挂在生产设置且可真实渲染',
-      passed: bodyText.includes('委外类型规则') && bodyText.includes('核心类型'),
-      details: bodyText.includes('委外类型规则') ? '页面已渲染' : '页面未渲染或菜单未迁移'
+      passed: bodyText.includes('委外业务类型') && bodyText.includes('核心类型'),
+      details: page.url()
     })
     await saveScreenshot(page, outputDir, 'mes-base-outsource-type-rule', record)
     caseRecord.evidence.push('委外类型规则 API、PROCESS/WORK 核心类型约束和生产设置页面截图')
-    return { token, api }
+    return {
+      token,
+      api,
+      partial: true,
+      note: rules?.length > 0
+        ? '已验证规则读侧和设置页面；委外单保存规则版本快照、引用后禁止删除等写侧未执行'
+        : '当前租户无委外类型规则前置；页面/API 读侧已执行，规则版本快照与引用保护未执行'
+    }
   }
 
   if (caseId === 'PB102-001') {
@@ -377,134 +631,72 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB038-002') {
-    const ensureGrade = async (code, name) => {
-      const simpleResponse = await api.getBusiness('/base/material-grade/simple-list')
-      const simple = asList(simpleResponse?.data ?? simpleResponse)
-      let grade = simple.find((item) => item.code === code)
-      if (!grade) {
-        const createResponse = await api.postBusiness('/base/material-grade/create', {
-          code,
-          name,
-          sort: 90,
-          status: 1
-        })
-        const id = createResponse?.data?.id ?? createResponse?.data ?? createResponse?.id ?? createResponse
-        grade = { id, code, name }
-      }
-      return grade
-    }
-    const gA = await ensureGrade('A', 'A级')
-    const gB = await ensureGrade('B', 'B级')
-    await ensureGrade('C', 'C级')
-
-    const listRes = await api.getBusiness('/mes/basMaterial/list?pageNo=1&pageSize=100')
-    const materials = asList(listRes?.data ?? listRes)
-    const inventoryCandidates = []
-    for (const candidate of materials) {
-      const inventoryRows = asList(
-        await api.getBusiness(
-          `/mes/stkIo/queryStockQty?pageNo=1&pageSize=100&materialId=${encodeURIComponent(candidate.id)}`
-        )
-      )
-      if (
-        String(candidate.inventoryNature || '').toUpperCase() === 'STOCK' &&
-        candidate.unitId != null &&
-        String(candidate.unitId).trim() !== '' &&
-        inventoryRows.length === 0
-      ) {
-        inventoryCandidates.push(candidate)
-      }
-    }
-    const material = inventoryCandidates[0] || null
-    if (!material) {
-      caseRecord.checks.push({
-        name: '存货品级配置契约',
-        passed: true,
-        details: '当前租户没有同时满足实物存货、主单位非空且无库存的测试存货，无法安全执行写侧'
-      })
-      caseRecord.evidence.push(
-        '存货品级开关/默认品级/允许范围校验已落地；真实写侧缺少合法无库存存货前置'
-      )
-      return {
-        token,
-        api,
-        partial: true,
-        note: '缺少合法无库存实物存货前置，PB-038-002 写侧暂记 PARTIAL'
-      }
-    }
-
-    const original = await api.getBusiness(
-      `/mes/basMaterial/queryById?id=${encodeURIComponent(material.id)}`
-    )
-    const materialId = material.id
-    const inventoryRows = await api.getBusiness(
-      `/mes/stkIo/queryStockQty?pageNo=1&pageSize=1&materialId=${encodeURIComponent(materialId)}`
-    )
-    const hasInventory = ((inventoryRows?.list || inventoryRows?.records || []).length || 0) > 0
-    if (hasInventory) {
-      caseRecord.checks.push({
-        name: '存货品级配置写侧契约',
-        passed: true,
-        details: `选中存货 ${materialId} 已有库存，关闭品级管理会被门禁拦截，改用契约验证避免污染数据`
-      })
-      caseRecord.evidence.push(
-        '存货品级开关/默认品级/允许范围校验已落地，真实写侧回归需选择无库存存货'
-      )
-      return { token, api }
-    }
-    const originalAllowed = original?.allowedGradeIds || []
-    await api.putBusiness('/mes/basMaterial/edit', {
-      ...original,
-      id: materialId,
-      gradeManaged: 'Y',
-      defaultGradeId: gB.id,
-      allowedGradeIds: [gA.id, gB.id]
-    })
-    const managed = await api.getBusiness(
-      `/mes/basMaterial/queryById?id=${encodeURIComponent(materialId)}`
-    )
-    const allowed = managed?.allowedGradeIds || []
+    const grades = mesBaseRows(await api.getBusiness('/base/material-grade/simple-list'), '启用品级')
+    const materials = mesBaseRows(await api.getBusiness(
+      '/mes/basMaterial/list?pageNo=1&pageSize=100'), '存货')
     caseRecord.checks.push({
-      name: '存货开启品级管理并回读允许范围',
-      passed:
-        managed?.gradeManaged === 'Y' &&
-        String(managed?.defaultGradeId) === String(gB.id) &&
-        allowed.length === 2,
-      details: `gradeManaged=${managed?.gradeManaged}, default=${managed?.defaultGradeId}, allowedSize=${allowed.length}`
+      name: '存货与启用品级真实响应正确解包',
+      passed: true, details: `materials=${materials.length}, grades=${grades.length}`
     })
-
-    // 越界用例：默认品级不在允许范围内必须被拒绝
-    const gC = await ensureGrade('C', 'C级')
-    let outOfScopeRejected = false
+    const candidate = materials.find(isPb038002Fixture)
+    const [gA, gB, gC] = ['A', 'B', 'C'].map((code) => grades.find((row) => row.code === code))
+    const partial = (note) => ({ api, partial: true, note })
+    if (!candidate || !gA || !gB || !gC) {
+      return partial('缺 PB038-002 专用无库存实物存货夹具或已有启用 A/B/C 品级；' +
+        '不改其他 E2E/正式物料，不创建共享品级，配置及入库准入写侧未执行')
+    }
+    const materialId = candidate.id
+    const original = mesBaseDetail(await api.getBusiness(
+      `/mes/basMaterial/queryById?id=${encodeURIComponent(materialId)}`), materialId, '存货')
+    if (!isPb038002Fixture(original) || !Array.isArray(original.allowedGradeIds)) {
+      return partial('专用物料详情缺明确所有权标记或完整允许品级配置，不能安全修改/还原')
+    }
+    const stockResult = await api.getBusiness(
+      `/mes/stkIo/queryStockQty?pageNo=1&pageSize=100&materialId=${encodeURIComponent(materialId)}`)
+    const stock = mesBaseRows(stockResult, '专用物料库存', 'materialId')
+    if (stock.length) return partial('本案例专用物料已有库存，不修改品级配置；需要隔离无库存夹具')
+    const target = { gradeManaged: 'Y', defaultGradeId: gB.id, allowedGradeIds: [gA.id, gB.id] }
+    // Restore even if the write succeeds but readback or a negative probe fails.
     try {
-      await api.putBusiness('/mes/basMaterial/edit', {
-        ...original,
-        id: materialId,
-        gradeManaged: 'Y',
-        defaultGradeId: gC.id,
-        allowedGradeIds: [gA.id, gB.id]
+      await api.putBusiness('/mes/basMaterial/edit', pb038GradePayload(original, target))
+      const managed = mesBaseDetail(await api.getBusiness(
+        `/mes/basMaterial/queryById?id=${encodeURIComponent(materialId)}`), materialId, '存货')
+      caseRecord.checks.push({
+        name: '专用存货开启品级并回读默认品级与精确允许范围',
+        passed: managed.gradeManaged === 'Y' && String(managed.defaultGradeId) === String(gB.id) &&
+          Array.isArray(managed.allowedGradeIds) && managed.allowedGradeIds.length === 2 &&
+          [gA.id, gB.id].every((id) => managed.allowedGradeIds.map(String).includes(String(id))),
+        details: `materialId=${materialId}, unitId=${managed.unitId}`
       })
-    } catch (e) {
-      outOfScopeRejected = true
+      const rejection = await api.request('PUT', '/mes/basMaterial/edit',
+        pb038GradePayload(original, { ...target, defaultGradeId: gC.id }))
+      caseRecord.checks.push({
+        name: '默认品级越界返回准确业务校验而不是任意异常',
+        passed: rejection?.code === 500 &&
+          (rejection.msg ?? rejection.message) === '默认品级必须在允许品级范围内',
+        details: JSON.stringify(rejection)
+      })
+    } finally {
+      await api.putBusiness('/mes/basMaterial/edit', pb038GradePayload(original, {
+        gradeManaged: original.gradeManaged,
+        defaultGradeId: original.defaultGradeId,
+        allowedGradeIds: original.allowedGradeIds
+      }))
+      const restored = mesBaseDetail(await api.getBusiness(
+        `/mes/basMaterial/queryById?id=${encodeURIComponent(materialId)}`), materialId, '还原存货')
+      caseRecord.checks.push({
+        name: '专用存货品级配置已还原且主单位未丢失',
+        passed: restored.gradeManaged === original.gradeManaged &&
+          String(restored.defaultGradeId) === String(original.defaultGradeId) &&
+          String(restored.unitId) === String(original.unitId) &&
+          Array.isArray(restored.allowedGradeIds) &&
+          JSON.stringify(restored.allowedGradeIds.map(String).sort()) ===
+            JSON.stringify(original.allowedGradeIds.map(String).sort()),
+        details: `materialId=${materialId}`
+      })
     }
-    caseRecord.checks.push({
-      name: '默认品级必须属于允许范围',
-      passed: outOfScopeRejected,
-      details: outOfScopeRejected ? '越界默认品级被拒绝' : '越界默认品级未被拒绝'
-    })
-
-    // 还原原配置，避免污染租户数据
-    await api.putBusiness('/mes/basMaterial/edit', {
-      ...original,
-      id: materialId,
-      gradeManaged: original?.gradeManaged || 'N',
-      defaultGradeId: original?.defaultGradeId || null,
-      allowedGradeIds: originalAllowed
-    })
-    caseRecord.evidence.push(
-      '存货品级配置在 Base 校验开关、默认品级与允许范围；单据写侧由 validateStockEntryGrade 强制准入'
-    )
-    return { token, api }
+    return partial('已验证本案例专用夹具的配置、越界拒绝和 finally 还原；' +
+      '缺隔离库存单据前置，入库错品级/停用品级/未启用品级准入尚未执行')
   }
 
   if (caseId === 'PB038-003') {

@@ -86,29 +86,46 @@ async function readTodoResponse (response) {
   return validateWorkbenchTodoPage(response, await readBrowserResponsePayload(response))
 }
 
-async function waitForTodoResponse (page) {
-  const response = await page.waitForResponse(
-    (candidate) =>
-      candidate.url().includes('/workbench/todo/page') &&
-      candidate.request().method() === 'GET',
-    { timeout: 60000 }
-  )
-  return { response, todoPage: await readTodoResponse(response) }
+const isTodoRequest = (request) =>
+  new URL(request.url()).pathname.endsWith('/workbench/todo/page') &&
+  request.method() === 'GET'
+
+async function waitForTodoResponse (page, acceptsRequest = () => true) {
+  let todoPage
+  const response = await page.waitForResponse(async (candidate) => {
+    if (!isTodoRequest(candidate.request()) || !acceptsRequest(candidate.request())) return false
+    todoPage = await readTodoResponse(candidate)
+    return true
+  }, { timeout: 60000 })
+  return { response, todoPage }
 }
 
 export async function openWorkbenchAndWaitForTodo (page, navigate = openRoute) {
-  // Register before navigation so the assertion cannot race the initial Vue render.
-  const todoResponse = page.waitForResponse(
-    response =>
-      response.url().includes('/workbench/todo/page') &&
-      response.request().method() === 'GET',
-    { timeout: 60000 }
-  ).then(async (response) => ({
-    response,
-    todoPage: await readTodoResponse(response)
-  }))
-  await navigate(page, WORKBENCH_PATH)
-  const { todoPage } = await todoResponse
+  // Ignore late responses from the login document. Only capture requests made
+  // after the new workbench document starts loading.
+  let documentStarted = false
+  const requests = new Set()
+  const onRequest = (request) => {
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+      documentStarted = true
+      requests.clear()
+    } else if (documentStarted && isTodoRequest(request)) {
+      requests.add(request)
+    }
+  }
+  page.on('request', onRequest)
+  let todoPage
+  try {
+    // Attach both rejection handlers immediately, including while navigation
+    // is pending, so a lost body produces a case report instead of crashing Node.
+    const captured = await Promise.all([
+      waitForTodoResponse(page, (request) => requests.has(request)),
+      navigate(page, WORKBENCH_PATH)
+    ])
+    todoPage = captured[0].todoPage
+  } finally {
+    page.off('request', onRequest)
+  }
   const todoPanel = page.locator('.todo-panel').first()
   await todoPanel.waitFor({ state: 'visible' })
   await waitForTodoContent(page, todoPanel, todoPage.list.length)
@@ -334,10 +351,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const dialog = page.locator('.todo-detail-dialog').first()
     await dialog.waitFor({ state: 'visible' })
     await waitForProcessDetail(dialog)
-    const refresh = waitForTodoResponse(page)
-    await dialog.locator('.el-dialog__headerbtn').first().click()
-    await dialog.waitFor({ state: 'hidden' })
-    const refreshed = await refresh
+    const [refreshed] = await Promise.all([
+      waitForTodoResponse(page),
+      (async () => {
+        await dialog.locator('.el-dialog__headerbtn').first().click()
+        await dialog.waitFor({ state: 'hidden' })
+      })()
+    ])
     await waitForTodoContent(page, todoPanel, refreshed.todoPage.list.length)
     const refreshedRows = await todoPanel.locator('.todo-body .work-list-row').count()
     const pathAfterClose = new URL(page.url()).pathname

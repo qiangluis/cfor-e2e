@@ -3,8 +3,15 @@ import assert from 'node:assert/strict'
 import {
   dataOf,
   hasFormalMetricEvidence,
+  MAINT_008_REPAIR_ORDER_ROUTE,
+  MAINT_009_INSPECTION_RECORD_ROUTE,
   MAINT_011_DEVICE_STATUS_ROUTE
 } from '../suites/iot-maintenance.mjs'
+
+test('MAINT-008 and MAINT-009 preserve the menu-derived maintenance routes', () => {
+  assert.equal(MAINT_008_REPAIR_ORDER_ROUTE, '/iot/maintenance/repair-order')
+  assert.equal(MAINT_009_INSPECTION_RECORD_ROUTE, '/iot/maintenance/inspection-record')
+})
 
 test('MAINT-011 unwraps CommonResult data before reading business payloads', () => {
   const payload = { list: [{ id: 'device-1' }], total: 1 }

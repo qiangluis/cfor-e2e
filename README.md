@@ -67,7 +67,8 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
   Chrome 上下文和证据目录，失败不会停止其他案例。输出批次下的
   `parallel-result.json` 和 `parallel-summary.md` 是统一重启/复测清单。涉及单据、审批、
   库存、初始化、Job 或账号权限写入的案例保留到串行阶段。
-- 并行批次完成后统一重启前后端，再使用 `--case` 重跑失败、部分通过和超时案例；
+- 并行批次完成后集中修复；应用代码需要重新加载时统一构建、重启，再使用 `--case`
+  重跑失败、部分通过和超时案例。仅改脚本、断言或路由定位时无需重启。
   不要为每个案例单独重启。`runner.mjs` 的多个 `--case` 参数可放在同一条串行命令中；
   `parallel-runner.mjs` 的 `--case` 过滤并行安全白名单，二者不是同一执行模式。
 - 控制台、页面、业务 API 和浏览器失败请求均参与失败判定；连接错误不能只记录而仍显示通过。
@@ -80,8 +81,18 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 - `PROC-014` 创建单据前必须确认迁移失败数、开启 Job 数与活动 Quartz 触发器数均为 0；`JobStatusEnum.NORMAL=1`、`STOP=2`，不能用 `status=0` 错算开启数。
 - `PROC-015/016/017` 保持 PARTIAL：无供应商详情和入口、空数据防重复扫描、来源标签都不等于真实变更、发票复核或来源生成完成。
 - `PROC-018` 使用 admin 与三段关联审批账号的独立 Chrome，验证自动转单、逐行来源、无供应商详情、未收货不能关闭及重复审批阻断。
-- `PB150-OUTSOURCE-PORTAL-001` 暂时返回 `BLOCKED`：旧门户 smoke 使用模拟响应及 9152，不能从真实业务 runner 调用。需要补齐 9151 上的真实登录、供应商映射与业务前置后再验收。
-- `WMS-OP-001` 暂时返回 `BLOCKED`：模拟的入库单 ID 不是实际 101 草稿或库存证据。历史组件脚本隔离到 `scripts/e2e/legacy/`，不从真实 runner 调用。
+- `PB150-OUTSOURCE-PORTAL-001` 已有真实鉴权和只读前置步骤：无供应商 token 与管理端 token
+  必须被供应商 API 拒绝；独立登录只使用显式供应商账号，不继承 admin 密码。9151 必须挂载
+  `#supplier-app`，管理端 SPA 回退不是门户证据；账号、客商映射或委外来源缺失时保留 PARTIAL。
+  不创建账号、不接受邀请、不提交进度/异常，旧模拟 smoke 不进入业务验收。
+- `WMS-OP-001` 默认只读真实 ASN、采购订单明细及已存在的 101 草稿，空集和页面打开不算 PASS。
+  写侧必须显式 `CFOR_WMS_OP_WRITE_FIXTURE=1`，且逐一提供本案例专属 ASN、订单、仓库、物料
+  及精确归属证据；仅生成/回读/幂等重试/清理本轮未审核草稿，不审核、不改库存。
+  历史组件脚本仍隔离到 `scripts/e2e/legacy/`。
+- `CRM-BASE-001` 至 `006`、`PROC-006/008` 已有真实只读契约和菜单页面步骤，正常结果仍为
+  PARTIAL；配置写入、正式状态转移、历史快照消费及权限反例没有执行时不得登记完整 PASS。
+- `COST-030/031/032` 的配置写入绑定同一 caseId/runId/tenant/org/month 及精确登记的字符串 ID；
+  名称前缀或共享列表首行不能授权写入，缺少登记时零写入并保留 PARTIAL。
 
 ### runner 与 parallel-runner
 
@@ -124,7 +135,13 @@ API 摘要脱敏；Chrome trace 可能包含真实请求与登录凭据，只保
 npm run test:e2e:unit
 npm run test:e2e:vite-lint
 node scripts/e2e/tests/login-layout.mjs
+node scripts/e2e/coverage-report.mjs --out /tmp/cfor-e2e/coverage-latest
 ```
+
+覆盖报告同时输出 `.json` 和 `.md`，`--out` 是文件前缀。按案例选择最新非 SKIPPED
+结果，保留来源与证据路径；DESIGNED/BLOCKED 的跳过记录不算已执行。可用 `--root`
+限定证据目录、`--since` 限定观察时间。268 个自动化案例不等于 PB-001 至 PB-443
+的每一条需求均已验收；PARTIAL、未执行、前置不足和范围外项必须分别报告。
 
 Vite 专项需要前端依赖已安装；使用隔离缓存与自动清理的测试文件，不启动额外端口。
 覆盖内容缓存、异步格式化器诊断、源码变化重新报错、修正恢复、生成子模块跳过重复检查与生产构建范围。

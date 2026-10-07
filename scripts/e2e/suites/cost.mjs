@@ -1,5 +1,5 @@
 import { createApiClient } from '../lib/api.mjs'
-import { nonEmpty } from '../lib/assertions.mjs'
+import { isBusinessSuccess, nonEmpty } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
 export const cases = ['COST-001', 'COST-002', 'COST-003', 'COST-004', 'COST-005', 'COST-006', 'COST-007', 'COST-008', 'COST-009', 'COST-010', 'COST-011', 'COST-012', 'COST-013', 'COST-014', 'COST-015', 'COST-016', 'COST-017', 'COST-018', 'COST-019', 'COST-020', 'COST-021', 'COST-022', 'COST-023', 'COST-024', 'COST-025', 'COST-026', 'COST-027', 'COST-028', 'COST-029', 'COST-030', 'COST-031', 'COST-032', 'COST-033', 'COST-034']
@@ -20,11 +20,206 @@ const responseData = (payload) => payload?.data ?? payload
 
 export const hasDeadLetterSamples = (rows) => Array.isArray(rows) && rows.length > 0
 
+export const costArrayData = (payload, label) => {
+  if (!isBusinessSuccess(payload) || !Array.isArray(payload.data)) {
+    throw new Error(`${label} 未返回有效业务数组，不能视为缺少依赖`)
+  }
+  return payload.data
+}
+
+export const costPageRows = (payload, label) => {
+  const data = payload?.data
+  if (
+    !isBusinessSuccess(payload) ||
+    !Array.isArray(data?.list) ||
+    !Number.isSafeInteger(data.total) ||
+    data.total < data.list.length ||
+    (data.list.length === 0 && data.total !== 0)
+  ) {
+    throw new Error(`${label} 未返回有效分页列表，不能视为缺少依赖`)
+  }
+  return data.list
+}
+
+export const hasEditableCostModel = (rows) =>
+  rows.some((row) => row.status === 'DRAFT' && nonEmpty(row.id))
+
+const saveCostPrerequisiteEvidence = async ({ caseId, page, record, caseRecord, outputDir, note }) => {
+  await openRoute(page, '/cost-management/workbench', { readySelector: '.title-line h1' })
+  caseRecord.checks.push({
+    name: '依赖缺失时仍完成真实成本工作台只读前置验证',
+    passed: await page.getByRole('heading', { name: '成本工作台', exact: true }).isVisible(),
+    details: page.url()
+  })
+  caseRecord.notes.push(note)
+  await saveScreenshot(page, outputDir, `${caseId}-prerequisite`, record)
+  caseRecord.evidence.push('仅验证正式查询与真实工作台前置，未执行缺少依赖的业务闭环')
+}
+
+export const nextCostCenterStartDate = ({ centers, departmentId, today }) => {
+  const latestDisabledAt = centers
+    .filter((row) =>
+      (row.departmentIds || []).some((id) => String(id) === String(departmentId))
+    )
+    .map((row) => row.disabledAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1)
+  if (!latestDisabledAt || latestDisabledAt < today) return today
+  const date = new Date(`${latestDisabledAt}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() + 1)
+  return date.toISOString().slice(0, 10)
+}
+
+const PERIOD_DEPENDENT_CASES = new Set([
+  'COST-002', 'COST-003', 'COST-005', 'COST-006', 'COST-008', 'COST-009',
+  'COST-010', 'COST-011', 'COST-012', 'COST-013', 'COST-014', 'COST-015',
+  'COST-016', 'COST-017', 'COST-018', 'COST-019', 'COST-020', 'COST-021',
+  'COST-022', 'COST-023', 'COST-024', 'COST-025', 'COST-026', 'COST-027',
+  'COST-028', 'COST-033', 'COST-034'
+])
+const MODEL_DEPENDENT_CASES = new Set(['COST-030', 'COST-031', 'COST-032'])
+export const COST_CASE_EFFECTIVE_MONTH = '2099-12'
+
+const isCostFixtureId = (value) =>
+  typeof value === 'string' &&
+  /^[1-9]\d*$/.test(value) &&
+  BigInt(value) <= 9223372036854775807n
+
+const costScopeId = (value) =>
+  isCostFixtureId(value) ? value : Number.isSafeInteger(value) && value > 0 ? String(value) : null
+
+// A local case/run registration and persisted remarks must agree; names never grant ownership.
+export const costFixtureRemark = (fixture) =>
+  `CFOR-E2E:${fixture.caseId}:${fixture.runId}:${fixture.fixtureId}:tenant=${fixture.tenantId}:org=${fixture.accountingOrgId}:month=${fixture.effectiveMonth}:exclusive`
+
+const registeredCostFixture = ({ caseId, record, caseRecord } = {}) => {
+  const fixture = caseRecord?.fixtures?.cost
+  const runId = record?.runId
+  if (
+    !MODEL_DEPENDENT_CASES.has(caseId) ||
+    caseRecord?.id !== caseId ||
+    caseRecord?.caseId !== caseId ||
+    typeof runId !== 'string' ||
+    !/^[A-Za-z0-9_-]+$/.test(runId) ||
+    !fixture ||
+    fixture.exclusive !== true ||
+    fixture.caseId !== caseId ||
+    fixture.runId !== runId ||
+    typeof fixture.fixtureId !== 'string' ||
+    !fixture.fixtureId.startsWith(`E2E-${caseId}-${runId}-`) ||
+    !/^[A-Za-z0-9_-]+$/.test(fixture.fixtureId) ||
+    fixture.fixtureId.length <= `E2E-${caseId}-${runId}-`.length ||
+    !costScopeId(record?.environment?.tenantId) ||
+    costScopeId(fixture.tenantId) !== costScopeId(record.environment.tenantId) ||
+    costScopeId(fixture.accountingOrgId) !== String(accountingOrgId) ||
+    fixture.effectiveMonth !== COST_CASE_EFFECTIVE_MONTH ||
+    ![fixture.modelVersionId, fixture.costCenterId, fixture.componentItemId].every(isCostFixtureId)
+  ) return null
+  return fixture
+}
+
+export const isOwnedCostModelFixture = (model, context) => {
+  const fixture = registeredCostFixture(context)
+  return Boolean(
+    fixture &&
+    isCostFixtureId(model?.id) &&
+    model.id === fixture.modelVersionId &&
+    model.status === 'DRAFT' &&
+    model.lockedAt == null &&
+    model.lockedBy == null &&
+    costScopeId(model.accountingOrgId) === String(accountingOrgId) &&
+    model.effectiveMonth === fixture.effectiveMonth &&
+    model.remark === costFixtureRemark(fixture)
+  )
+}
+
+const costFixtureObjectData = (payload, label) => {
+  if (
+    !isBusinessSuccess(payload) ||
+    (payload.data !== null &&
+      (typeof payload.data !== 'object' || Array.isArray(payload.data)))
+  ) throw new Error(`${label} 未返回有效业务对象，不能视为缺少归属证据`)
+  return payload.data
+}
+
+export const loadOwnedCostFixture = async ({ api, modelVersions, ...context }) => {
+  const missing = (note) => ({ fixture: null, note })
+  const registration = registeredCostFixture(context)
+  if (!registration) return missing('缺少本案、本轮、当前租户的专属 E2E 夹具精确 ID 登记')
+  const matches = modelVersions.filter((row) => row.id === registration.modelVersionId)
+  if (matches.length !== 1 || !isOwnedCostModelFixture(matches[0], context)) {
+    return missing('登记模型不唯一或缺少严格归属证据；版本名称中的 E2E 标记不能授权写侧')
+  }
+  const model = costFixtureObjectData(
+    await api.getBusiness(`/cost/model-versions/${registration.modelVersionId}`),
+    '专属成本模型详情'
+  )
+  if (!isOwnedCostModelFixture(model, context)) {
+    return missing('登记模型详情与本轮夹具 ID、备注、组织、草稿状态或远期月份不符')
+  }
+  const center = costFixtureObjectData(
+    await api.getBusiness(`/cost/centers/${registration.costCenterId}`),
+    '专属成本中心详情'
+  )
+  const remark = costFixtureRemark(registration)
+  if (
+    !center ||
+    !isCostFixtureId(center.id) ||
+    center.id !== registration.costCenterId ||
+    costScopeId(center.accountingOrgId) !== String(accountingOrgId) ||
+    center.status !== 'ENABLED' ||
+    center.enabledAt !== `${registration.effectiveMonth}-01` ||
+    center.disabledAt != null ||
+    center.referenceCount !== 0 ||
+    center.remark !== remark
+  ) return missing('登记成本中心不属于同一本轮远期 E2E 夹具，或已存在共享业务引用')
+
+  const config = costFixtureObjectData(
+    await api.getBusiness(`/cost/model-versions/${registration.modelVersionId}/components`),
+    '专属成本构成配置'
+  )
+  if (!config) return missing('登记模型缺少构成配置归属证据')
+  if (![config.categories, config.items, config.sourceRules].every(Array.isArray)) {
+    throw new Error('专属成本构成配置未返回分类/构成项/来源规则数组，不能视为缺少归属证据')
+  }
+  const categoryIds = new Set(config.categories.map((row) => row.id))
+  const itemIds = new Set(config.items.map((row) => row.id))
+  const componentMatches = config.items.filter((row) => row.id === registration.componentItemId)
+  if (
+    config.modelVersionId !== model.id ||
+    config.categories.length === 0 ||
+    categoryIds.size !== config.categories.length ||
+    itemIds.size !== config.items.length ||
+    componentMatches.length !== 1 ||
+    !config.categories.every((row) =>
+      isCostFixtureId(row.id) &&
+      (!row.parentId || categoryIds.has(row.parentId))
+    ) ||
+    !config.items.every((row) =>
+      isCostFixtureId(row.id) &&
+      categoryIds.has(row.categoryId) &&
+      row.remark === remark &&
+      row.systemItem === false &&
+      row.status === 'ENABLED'
+    ) ||
+    !config.sourceRules.every((row) =>
+      isCostFixtureId(row.id) && itemIds.has(row.componentItemId)
+    )
+  ) return missing('构成配置模型关联或精确构成项 ID 不符，或混入非本轮专属构成项/来源规则')
+
+  const rules = costArrayData(await api.getBusiness(
+    `/cost/allocation-rules?modelVersionId=${model.id}&effectiveMonth=${registration.effectiveMonth}`
+  ), '专属成本模型远期分摊规则')
+  if (rules.length > 0) return missing('专属模型远期月份已有分摊规则，未覆盖任何既有规则或其构成项')
+  return { fixture: { model, center, componentItem: componentMatches[0], config }, note: '' }
+}
+
 const loadFormalModelPage = async (api) => {
   const result = await api.getBusiness(
     `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
   )
-  const list = result?.data?.list || []
+  const list = costPageRows(result, '成本模型版本')
   return { list, model: list.find((item) => item.status === 'LOCKED') || list[0] || null }
 }
 
@@ -36,9 +231,10 @@ const trackedTraceShape = (rows) =>
       Array.isArray(row.payableSettlementTraces)
   )
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  const token = await (dependencies.login || login)(page)
+  const api = (dependencies.createApiClient || createApiClient)({ token, record })
+  const savePrerequisiteEvidence = dependencies.saveCostPrerequisiteEvidence || saveCostPrerequisiteEvidence
   const { list: modelVersions, model } = await loadFormalModelPage(api)
   caseRecord.checks.push({
     name: '成本模型版本 API 可用',
@@ -47,6 +243,53 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       ? `${model.id}:${model.versionNo}:${model.status}`
       : '当前租户暂无成本模型，已验证空列表契约'
   })
+
+  if (PERIOD_DEPENDENT_CASES.has(caseId)) {
+    const periodsResult = await api.getBusiness(
+      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
+    )
+    const periods = costPageRows(periodsResult, '成本期间')
+    if (periods.length === 0) {
+      caseRecord.checks.push({
+        name: '成本期间正式 API 返回有效空列表（后续保留 PARTIAL）',
+        passed: true,
+        details: '当前核算组织暂无成本期间，未伪造期间、账套或经营事实'
+      })
+      await saveCostPrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '当前核算组织暂无成本期间；正式业务闭环待用户确认会计期间后复测。'
+      })
+      return {
+        token,
+        api,
+        partial: true,
+        note: '缺少成本期间前置，未执行写侧和正式报表断言'
+      }
+    }
+  }
+
+  let ownedCostFixture
+  if (MODEL_DEPENDENT_CASES.has(caseId)) {
+    const prerequisite = await loadOwnedCostFixture({ api, modelVersions, caseId, record, caseRecord })
+    ownedCostFixture = prerequisite.fixture
+    if (!ownedCostFixture) {
+      caseRecord.checks.push({
+        name: '专属夹具安全门禁阻断写侧（保留 PARTIAL）',
+        passed: true,
+        details: prerequisite.note
+      })
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: `${prerequisite.note}；未修改历史/共享模型、中心、构成项或分摊规则，未自动创建夹具。`
+      })
+      return { token, api, partial: true, note: prerequisite.note }
+    }
+    caseRecord.checks.push({
+      name: '模型/中心/构成项精确 ID 与本案本轮 E2E 归属及远期月份一致',
+      passed: true,
+      details: `model=${ownedCostFixture.model.id} center=${ownedCostFixture.center.id} item=${ownedCostFixture.componentItem.id}`
+    })
+  }
 
   if (caseId === 'COST-001') {
     // PB-074：分摊规则按模型版本、成本中心和生效月份读写正式库。
@@ -102,9 +345,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     })
     await saveScreenshot(page, outputDir, 'cost-allocation-rule', record)
     caseRecord.evidence.push('成本分摊规则正式 API、成本中心主档与页面截图')
-    return model ? { token, api } : {
+    return model ? {
       token,
       api,
+      allowRuntimeErrors: {
+        console: (message) => message.includes('ws://localhost:17521/socket.io')
+      }
+    } : {
+      token,
+      api,
+      allowRuntimeErrors: {
+        console: (message) => message.includes('ws://localhost:17521/socket.io')
+      },
       partial: true,
       note: '当前租户暂无成本模型，成本分摊规则完整业务闭环待初始化模型后复测'
     }
@@ -210,7 +462,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'COST-004') {
     // 成本可靠事件以独立 Outbox 记录重试、死信与人工接管状态。
     const deadLetterResult = await api.getBusiness('/cost/outbox/dead-letters?limit=100')
-    const deadLetters = deadLetterResult?.data || []
+    const deadLetters = costArrayData(deadLetterResult, '成本死信查询')
     caseRecord.checks.push({
       name: '成本死信查询接口返回可靠事件列表',
       passed: Array.isArray(deadLetters),
@@ -239,7 +491,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ? `validated=${deadLetters.length}`
         : '当前没有死信，已验证接口为空列表契约'
     })
-    await openRoute(page, '/cost-management')
+    await openRoute(page, '/cost-management/workbench', { readySelector: '.title-line h1' })
     caseRecord.checks.push({
       name: '成本工作台可打开并承载可靠事件状态',
       passed: (await page.getByText('成本', { exact: false }).count()) > 0,
@@ -1619,27 +1871,33 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase()
     const firstCode = `E2E-CC-${suffix}`
     const secondCode = `E2E-CC2-${suffix}`
-    const firstDate = offsetDate(0)
-    const secondDate = offsetDate(1)
     const centersResult = await api.getBusiness(`/cost/centers?accountingOrgId=${accountingOrgId}`)
     const departmentsResult = await api.getBusiness('/cost/centers/departments')
-    const centers = centersResult?.data || []
-    const departments = flattenDepartments(departmentsResult?.data || [])
+    const centers = costArrayData(centersResult, '成本中心')
+    const departments = flattenDepartments(costArrayData(departmentsResult, '成本中心部门'))
     const occupiedDepartmentIds = new Set(
       centers
-        .filter((row) => row.status === 'ENABLED')
+        .filter((row) => row.status !== 'DISABLED' || !row.disabledAt)
         .flatMap((row) => row.departmentIds || [])
         .map(String)
     )
     const availableDepartment = departments.find(
-      (row) => !occupiedDepartmentIds.has(String(row.id))
+      (row) => row.status === 0 && !occupiedDepartmentIds.has(String(row.id))
     )
     let firstCenterId
     let firstCenterActive = false
     let secondCenterId
     let secondCenterActive = false
+    let missingAvailableDepartment = false
 
     if (availableDepartment) {
+      const firstDate = nextCostCenterStartDate({
+        centers, departmentId: availableDepartment.id, today: offsetDate(0)
+      })
+      const secondDateValue = new Date(`${firstDate}T00:00:00Z`)
+      secondDateValue.setUTCDate(secondDateValue.getUTCDate() + 1)
+      const secondDate = secondDateValue.toISOString().slice(0, 10)
+      caseRecord.notes.push(`临时成本中心仅使用历史停用日之后的区间：${firstDate} / ${secondDate}`)
       const firstPayload = {
         accountingOrgId,
         code: firstCode,
@@ -1656,6 +1914,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           name: '成本中心可引用真实部门并按启用日期创建',
           passed: firstCenterActive,
           details: `centerId=${firstCenterId || 'missing'}, deptId=${availableDepartment.id}`
+        })
+        if (!firstCenterActive) {
+          throw new Error(`成本中心首次创建失败，停止后续写侧：${firstCreate?.msg || firstCreate?.code}`)
+        }
+        caseRecord.checks.push({
+          name: '成本中心回读保留原始部门 ID，未发生 Snowflake 精度丢失',
+          passed: responseData(firstCreate)?.departmentIds?.includes(availableDepartment.id) === true,
+          details: `deptId=${availableDepartment.id}`
         })
 
         const overlapCreate = await api.post('/cost/centers', {
@@ -1694,6 +1960,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           passed: firstDeactivate?.code === 0,
           details: `code=${firstDeactivate?.code}`
         })
+        if (firstCenterActive) throw new Error('首次停用失败，停止后续部门重用')
 
         const secondCreate = await api.post('/cost/centers', {
           ...firstPayload,
@@ -1708,71 +1975,111 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           passed: secondCenterActive,
           details: `centerId=${secondCenterId || 'missing'}`
         })
+        if (!secondCenterActive) throw new Error('后续成本中心创建失败，停止页面数据断言')
+
+        await openRoute(page, '/cost-management/modeling/profile', {
+          readySelector: '.page-head h1',
+          readyTimeoutMs: 30000
+        })
+        const manageEntry = page.getByRole('button', { name: '管理成本中心' }).first()
+        if ((await manageEntry.count()) > 0) {
+          await manageEntry.click()
+          await page
+            .getByText('成本中心与部门归属', { exact: false })
+            .first()
+            .waitFor({ state: 'visible', timeout: 30000 })
+        }
+        const activeCenterNode = page.getByText(`E2E后续成本中心${suffix}`, { exact: true }).first()
+        await activeCenterNode.waitFor({ state: 'visible', timeout: 30000 })
+        await activeCenterNode.click()
+        await page
+          .getByRole('button', { name: '停用' })
+          .first()
+          .waitFor({ state: 'visible', timeout: 30000 })
+        caseRecord.checks.push({
+          name: '成本中心维护页按权限提供新增、编辑和停用入口',
+          passed:
+            (await page.getByText('成本中心与部门归属', { exact: false }).count()) > 0 &&
+            (await page.getByRole('button', { name: '新增' }).count()) > 0 &&
+            (await page.getByRole('button', { name: '编辑成本中心' }).count()) > 0 &&
+            (await page.getByRole('button', { name: '停用' }).count()) > 0,
+          details: page.url()
+        })
+        await saveScreenshot(page, outputDir, 'cost-center-period-permission', record)
       } finally {
         if (firstCenterId && firstCenterActive) {
-          await api
-            .post(`/cost/centers/${firstCenterId}/deactivate`, {
+          try {
+            const cleanup = await api.post(`/cost/centers/${firstCenterId}/deactivate`, {
               disabledAt: firstDate,
               reason: 'PB-071 E2E cleanup'
             })
-            .catch(() => undefined)
+            caseRecord.checks.push({
+              name: '本轮首次成本中心失败后清理停用成功',
+              passed: cleanup?.code === 0 && responseData(cleanup)?.status === 'DISABLED',
+              details: `centerId=${firstCenterId}, code=${cleanup?.code}`
+            })
+          } catch (error) {
+            caseRecord.checks.push({
+              name: '本轮首次成本中心失败后清理停用成功',
+              passed: false,
+              details: error.message
+            })
+          }
         }
         if (secondCenterId && secondCenterActive) {
-          await api
-            .post(`/cost/centers/${secondCenterId}/deactivate`, {
+          try {
+            const cleanup = await api.post(`/cost/centers/${secondCenterId}/deactivate`, {
               disabledAt: secondDate,
               reason: 'PB-071 E2E cleanup'
             })
-            .catch(() => undefined)
+            caseRecord.checks.push({
+              name: '本轮后续成本中心清理停用成功',
+              passed: cleanup?.code === 0 && responseData(cleanup)?.status === 'DISABLED',
+              details: `centerId=${secondCenterId}, code=${cleanup?.code}`
+            })
+          } catch (error) {
+            caseRecord.checks.push({
+              name: '本轮后续成本中心清理停用成功',
+              passed: false,
+              details: error.message
+            })
+          }
         }
       }
     } else {
+      missingAvailableDepartment = true
       caseRecord.checks.push({
-        name: '存在可用于跨期归属校验的空闲部门',
-        passed: false,
-        details: '全部部门均已被启用成本中心占用，无法安全创建临时成本中心'
+        name: '真实部门占用前置已查询（无可用区间，保留 PARTIAL）',
+        passed: true,
+        details: '当前没有启用且不存在开放归属关系的部门，未创建临时成本中心'
       })
     }
 
-    await openRoute(page, '/cost-management/modeling/profile')
-    const manageEntry = page.getByRole('button', { name: '管理成本中心' }).first()
-    if ((await manageEntry.count()) > 0) {
-      await manageEntry.click()
+    if (missingAvailableDepartment) {
+      await saveCostPrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '部门依赖缺失，仅完成正式部门查询与工作台前置，未执行成本中心创建/停用'
+      })
+      return {
+        token,
+        api,
+        partial: true,
+        note: '当前没有未占用部门，成本中心写侧未伪造数据'
+      }
     }
-    caseRecord.checks.push({
-      name: '成本中心维护页按权限提供新增、编辑和停用入口',
-      passed:
-        (await page.getByText('成本中心与部门归属', { exact: false }).count()) > 0 &&
-        (await page.getByRole('button', { name: '新增' }).count()) > 0 &&
-        (await page.getByRole('button', { name: '编辑成本中心' }).count()) > 0 &&
-        (await page.getByRole('button', { name: '停用' }).count()) > 0,
-      details: page.url()
-    })
-  await saveScreenshot(page, outputDir, 'cost-center-period-permission', record)
     caseRecord.evidence.push(
       '成本中心正式创建、编码不可变、部门跨期冲突、停用释放与页面权限入口'
     )
+    return { token, api }
   }
 
   if (caseId === 'COST-030') {
     // PB-072/073：成本构成项与来源规则按模型版本走正式 API，方向/口径字段往返不丢失。
     const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase()
-    const modelResult = await api.getBusiness(
-      `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const draftModel = (modelResult?.data?.list || []).find((item) => item.status === 'DRAFT')
-    if (!draftModel) {
-      caseRecord.checks.push({
-        name: '存在可编辑（草稿）成本模型以承载构成项配置',
-        passed: false,
-        details: '当前租户没有 DRAFT 成本模型，无法在不影响已锁定模型的前提下写入构成项'
-      })
-    } else {
+    const draftModel = ownedCostFixture.model
+    if (draftModel) {
       const modelVersionId = String(draftModel.id)
-      const originalResult = await api.getBusiness(
-        `/cost/model-versions/${modelVersionId}/components`
-      )
-      const original = originalResult?.data || { categories: [], items: [], sourceRules: [] }
+      const original = ownedCostFixture.config
       caseRecord.checks.push({
         name: '成本构成项正式接口返回分类/构成项/来源规则三段结构',
         passed:
@@ -1883,22 +2190,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   if (caseId === 'COST-031') {
     // PB-076：经营收支项目落正式 cost_component_item，固定收入/支出根分类，取数范围走 scope_json。
     const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase()
-    const modelResult = await api.getBusiness(
-      `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const draftModel = (modelResult?.data?.list || []).find((item) => item.status === 'DRAFT')
-    if (!draftModel) {
-      caseRecord.checks.push({
-        name: '存在可编辑（草稿）成本模型以承载经营收支配置',
-        passed: false,
-        details: '当前租户没有 DRAFT 成本模型，无法在不影响已锁定模型的前提下写入经营收支配置'
-      })
-    } else {
+    const draftModel = ownedCostFixture.model
+    if (draftModel) {
       const modelVersionId = String(draftModel.id)
-      const originalResult = await api.getBusiness(
-        `/cost/model-versions/${modelVersionId}/components`
-      )
-      const original = originalResult?.data || { categories: [], items: [], sourceRules: [] }
+      const original = ownedCostFixture.config
       const nonOperatingCategories = (original.categories || []).filter(
         (row) => row.code !== 'OP-INC-ROOT' && row.code !== 'OP-EXP-ROOT'
       )
@@ -1950,7 +2245,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         payload
       )
       caseRecord.checks.push({
-        name: '经营收支项目可写入共享成本构成模型',
+        name: '经营收支项目可写入本案专属 E2E 成本构成模型',
         passed: replaced?.code === 0,
         details: `code=${replaced?.code} msg=${replaced?.msg || replaced?.message || ''}`
       })
@@ -2009,29 +2304,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'COST-032') {
     // PB-074：工时/机器时/面积/产量等受控分摊因子，因子必须来自正式快照或人工确认。
-    const modelResult = await api.getBusiness(
-      `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const draftModel = (modelResult?.data?.list || []).find((item) => item.status === 'DRAFT')
-    const centersResult = await api.getBusiness(`/cost/centers?accountingOrgId=${accountingOrgId}`)
-    const center = (centersResult?.data || []).find((row) => row.status === 'ENABLED')
-    let componentItemId
-    if (draftModel?.id) {
-      const config = await api.getBusiness(`/cost/model-versions/${draftModel.id}/components`)
-      componentItemId = config?.data?.items?.[0]?.id
-    }
+    const draftModel = ownedCostFixture.model
+    const center = ownedCostFixture.center
+    const componentItemId = ownedCostFixture.componentItem.id
     if (draftModel?.id && center && componentItemId) {
       const basePayload = {
-        modelVersionId: Number(draftModel.id),
-        costCenterId: Number(center.id),
-        effectiveMonth: '2099-12',
+        modelVersionId: String(draftModel.id),
+        costCenterId: String(center.id),
+        effectiveMonth: COST_CASE_EFFECTIVE_MONTH,
         status: 'DRAFT'
       }
       const missingSource = await api.put('/cost/allocation-rules', {
         ...basePayload,
         lines: [
           {
-            componentItemId: Number(componentItemId),
+            componentItemId: String(componentItemId),
             finishedRatio: 100,
             wipRatio: 0,
             allocationMode: 'LABOR_HOUR'
@@ -2051,7 +2338,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ...basePayload,
         lines: [
           {
-            componentItemId: Number(componentItemId),
+            componentItemId: String(componentItemId),
             finishedRatio: 100,
             wipRatio: 0,
             allocationMode: 'UNKNOWN_FACTOR'
@@ -2072,7 +2359,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         ...basePayload,
         lines: [
           {
-            componentItemId: Number(componentItemId),
+            componentItemId: String(componentItemId),
             finishedRatio: 100,
             wipRatio: 0,
             allocationMode: 'QUANTITY'
@@ -2091,13 +2378,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `model=${draftModel?.id || '-'} center=${center?.id || '-'} item=${componentItemId || '-'}`
       })
     }
-    await openRoute(page, '/cost-management')
+    await (dependencies.openRoute || openRoute)(page, '/cost-management')
     caseRecord.checks.push({
       name: '分摊规则页面路由可进入',
       passed: page.url().includes('/cost-management'),
       details: page.url()
     })
-    await saveScreenshot(page, outputDir, 'cost-allocation-factor', record)
+    await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'cost-allocation-factor', record)
     caseRecord.evidence.push('受控分摊因子校验、未知模式拒绝与原有模式回归')
   }
 

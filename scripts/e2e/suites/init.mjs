@@ -236,7 +236,10 @@ export const runCase = async ({ caseId, page, caseRecord, record }, dependencies
           currentUrl.searchParams.get('mode') !== 'collaboration',
         details: authPage.url()
       })
-      await openRoute(authPage, '/systemInit')
+      await openRoute(authPage, '/systemInit', {
+        readySelector: '.system-init',
+        readyTimeoutMs: 90000
+      })
     } finally {
       await authPage.close().catch(() => {})
     }
