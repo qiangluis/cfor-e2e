@@ -2,7 +2,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { config } from './config/index.mjs'
 import { launchBrowser, saveScreenshot } from './lib/browser.mjs'
 import { checklist } from './lib/assert.mjs'
@@ -211,17 +211,43 @@ async function closeBrowserHandle (handle, tracePath, label = 'browser') {
   )
 }
 
-async function runCaseWithTimeout (operation, timeoutMs, caseId) {
+export function finalizeCaseRecord (caseRecord) {
+  const snapshot = structuredClone(caseRecord)
+  const freeze = (value) => {
+    if (!value || typeof value !== 'object') return value
+    Object.values(value).forEach(freeze)
+    return Object.freeze(value)
+  }
+  return freeze(snapshot)
+}
+
+export async function runCaseWithTimeout (operation, timeoutMs, caseId, onTimeout) {
   let timer
+  let timedOut = false
+  const settled = Promise.resolve(operation).then(() => {}, () => {})
   try {
     return await Promise.race([
       operation,
       new Promise((resolve, reject) => {
         timer = setTimeout(() => {
+          timedOut = true
           reject(new Error(`案例 ${caseId} 超过 ${timeoutMs}ms 未完成，已终止等待`))
         }, timeoutMs)
       })
     ])
+  } catch (error) {
+    if (timedOut) {
+      // Closing the browser interrupts UI waits; it does not cancel API fixtures.
+      // Never start another case while the original operation is still running.
+      try {
+        await onTimeout?.()
+      } catch (cleanupError) {
+        error.cause = cleanupError
+      } finally {
+        await settled
+      }
+    }
+    throw error
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -276,12 +302,14 @@ async function main () {
       for (const definition of suite.cases) {
         if (!selectedCases.has(definition.id)) continue
         const caseDefinition = { ...definition, suite: suite.id }
-        const caseRecord = createCaseRecord(caseDefinition)
+        let caseRecord = createCaseRecord(caseDefinition)
+        const caseRecordIndex = record.cases.length
         record.cases.push(caseRecord)
         const declaredStatus = definition.status || 'READY'
 
         if (completed.has(definition.id)) {
           finishCase(caseRecord, 'SKIPPED', '断点续跑：此前已通过')
+          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
           continue
         }
         if (declaredStatus === 'DESIGNED' || declaredStatus === 'BLOCKED') {
@@ -290,10 +318,12 @@ async function main () {
             'SKIPPED',
             `${declaredStatus}：当前没有完整可执行步骤，未伪造通过`
           )
+          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
           continue
         }
         if (!runnableCases.has(definition.id)) {
           finishCase(caseRecord, 'PARTIAL', '目录中有用例，但套件未实现对应步骤')
+          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
           continue
         }
 
@@ -336,7 +366,21 @@ async function main () {
               }
             }),
             args.caseTimeoutMs,
-            definition.id
+            definition.id,
+            async () => {
+              const handle = browserHandle
+              browserHandle = undefined
+              // Interrupt pending Playwright actions before response/trace cleanup.
+              await closeWithTimeout(
+                handle.context.close().catch(() => {}),
+                `${definition.id} timeout context`
+              )
+              await closeBrowserHandle(
+                handle,
+                path.join(config.outputRoot, record.runId, 'trace', `${definition.id}-FAIL.zip`),
+                `${definition.id} timeout`
+              )
+            }
           )
           await closeWithTimeout(
             browserHandle.flushResponses(),
@@ -368,11 +412,13 @@ async function main () {
           caseRecord.durationMs = Date.now() - startedAt
           console.log(`[${caseRecord.status}] ${definition.id}`)
         } catch (error) {
-          await closeWithTimeout(
-            browserHandle.flushResponses().catch(() => {}),
-            'response flush after failure',
-            5000
-          )
+          if (browserHandle) {
+            await closeWithTimeout(
+              browserHandle.flushResponses().catch(() => {}),
+              'response flush after failure',
+              5000
+            )
+          }
           caseRecord.runtimeErrors = {
             console: record.consoleErrors.slice(errorsBefore.console),
             page: record.pageErrors.slice(errorsBefore.page),
@@ -386,14 +432,18 @@ async function main () {
           })
           caseRecord.checks.push(...check.steps.filter((step) => !caseRecord.checks.includes(step)))
           caseRecord.durationMs = Date.now() - startedAt
+          if (browserHandle) {
+            await saveScreenshot(browserHandle.page, outputDir, `${definition.id}-FAIL`, record).catch(() => {})
+          }
           finishCase(
             caseRecord,
             caseErrorStatus(error, caseRecord.checks),
             String(error.message || error).slice(0, 1000)
           )
-          await saveScreenshot(browserHandle.page, outputDir, `${definition.id}-FAIL`, record).catch(() => {})
           console.log(`[${caseRecord.status}] ${definition.id} ${error.message || error}`)
         }
+        caseRecord = finalizeCaseRecord(caseRecord)
+        record.cases[caseRecordIndex] = caseRecord
         const failureAction = caseFailureAction(
           caseRecord.status,
           args.continueOnFailure
@@ -434,7 +484,9 @@ async function main () {
   process.exit(record.passed ? 0 : 1)
 }
 
-main().catch((error) => {
-  console.error(`[e2e] fatal: ${error.stack || error.message || error}`)
-  process.exit(2)
-})
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error(`[e2e] fatal: ${error.stack || error.message || error}`)
+    process.exit(2)
+  })
+}
