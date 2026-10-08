@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   createFixtureCleanup,
+  createOtherInStock,
   checkMaintenancePage,
   dataOf,
   fixtureId,
@@ -11,10 +12,35 @@ import {
   MAINT_010_LIFECYCLE_ROUTE,
   MAINT_010_COMPENSATION_ROUTE,
   trackDeletable,
-  trackEvent
+  trackEvent,
+  retainInventoryMaster,
+  hasTaskTypeSnapshot,
+  hasRepairWorkflowAudit,
+  hasStatusEventPageEvidence,
+  hasSingleActiveStatusEvent,
+  trackOwnedStatusEvent
 } from '../suites/iot-maintenance.mjs'
 
 const caseRecord = () => ({ checks: [], notes: [] })
+
+test('repair workflow audit requires the exact nonempty sequence and actor/tenant evidence', () => {
+  const rows = [
+    ['CREATE', 'NULL', 'REPORTED'],
+    ['DISPATCH', 'REPORTED', 'DISPATCHED'],
+    ['ACCEPT', 'DISPATCHED', 'ACCEPTED'],
+    ['START_REPAIR', 'ACCEPTED', 'REPAIRING'],
+    ['SPARE_OUT', 'REPAIRING', 'REPAIRING'],
+    ['COMPLETE_REPAIR', 'REPAIRING', 'PENDING_ACCEPT'],
+    ['CLOSE', 'PENDING_ACCEPT', 'CLOSED']
+  ].map((row) => [...row, '1', '1', '2026-10-07 14:30:00'])
+  assert.equal(hasRepairWorkflowAudit(rows, 1, 1), true)
+  assert.equal(hasRepairWorkflowAudit([], 1, 1), false)
+  assert.equal(hasRepairWorkflowAudit(rows.slice(1), 1, 1), false)
+  assert.equal(hasRepairWorkflowAudit([...rows, rows[4]], 1, 1), false)
+  assert.equal(hasRepairWorkflowAudit(rows, 2, 1), false)
+  assert.equal(hasRepairWorkflowAudit(rows, 1, 2), false)
+  assert.equal(hasRepairWorkflowAudit(rows.toReversed(), 1, 1), false)
+})
 
 test('CommonResult data=null unwraps to null instead of returning the envelope', () => {
   assert.equal(dataOf({ code: 0, data: null, msg: '' }), null)
@@ -126,6 +152,76 @@ test('only the expected domain rejection satisfies a negative assertion', () => 
   assert.equal(isExpectedRejection({ code: 0, data: null }, 'expected'), false)
 })
 
+test('status event page evidence requires nonempty same-device rows and expected event IDs', () => {
+  const payload = {
+    total: 2,
+    list: [
+      { id: '101', deviceId: '9001', statusCode: 'RUNNING', startTime: '2026-10-07 10:00:00' },
+      { id: '102', deviceId: '9001', statusCode: 'STOPPED', startTime: '2026-10-07 10:01:00' }
+    ]
+  }
+  assert.equal(hasStatusEventPageEvidence(payload, '9001', ['101', '102']), true)
+  assert.equal(hasStatusEventPageEvidence(payload, '9001', ['101', '999']), false)
+  assert.equal(hasStatusEventPageEvidence({ total: 1, list: [] }, '9001'), false)
+  assert.equal(hasStatusEventPageEvidence({
+    total: 2,
+    list: [{ ...payload.list[0], deviceId: '9002' }, payload.list[1]]
+  }, '9001'), false)
+  assert.equal(hasStatusEventPageEvidence({
+    total: 1,
+    list: payload.list
+  }, '9001'), false)
+  assert.equal(hasStatusEventPageEvidence({ ...payload, total: 'bad' }, '9001', ['101']), false)
+  assert.equal(hasStatusEventPageEvidence({
+    total: 2, list: [payload.list[0], payload.list[0]]
+  }, '9001', ['101']), false)
+  assert.equal(hasStatusEventPageEvidence(payload, '9001', []), false)
+})
+
+test('unique active evidence rejects duplicate active events, incomplete pages and inconsistent flags', () => {
+  const row = { id: '101', deviceId: '9001', coreLayer: 'RUNTIME',
+    statusCode: 'RUNNING', startTime: '2026-10-07T10:00:00', endTime: null, active: true }
+  const closed = { ...row, id: '102', endTime: '2026-10-07T10:07:00', active: false }
+  const payload = { total: 2, list: [row, closed] }
+  assert.equal(hasSingleActiveStatusEvent(payload, '9001', ['101', '102'], '101'), true)
+  assert.equal(hasSingleActiveStatusEvent({
+    total: 2, list: [row, { ...row, id: '102' }]
+  }, '9001', ['101', '102'], '101'), false)
+  assert.equal(hasSingleActiveStatusEvent({ total: 2, list: [row] }, '9001', ['101', '102'], '101'), false)
+  assert.equal(hasSingleActiveStatusEvent({
+    total: 2, list: [row, { ...closed, active: true }]
+  }, '9001', ['101', '102'], '101'), false)
+})
+
+test('MAINT-006 cleanup refuses foreign event ownership and reports ended history as retained', async () => {
+  const foreignRecord = caseRecord()
+  const foreignFixtures = createFixtureCleanup({ caseId: 'MAINT-006', caseRecord: foreignRecord })
+  trackOwnedStatusEvent(foreignFixtures, {
+    getBusiness: async () => ({ code: 0, data: { id: '101', deviceId: '9002' } }),
+    putBusiness: async () => assert.fail('must not end a foreign event')
+  }, '101', '9001')
+  await assert.rejects(() => foreignFixtures.cleanup(false), /清理失败/)
+  assert.equal(foreignRecord.checks[0].passed, false)
+
+  const record = caseRecord()
+  const fixtures = createFixtureCleanup({ caseId: 'MAINT-006', caseRecord: record })
+  let ended = false
+  trackOwnedStatusEvent(fixtures, {
+    getBusiness: async () => ({ code: 0, data: { id: '101', deviceId: '9001',
+      startTime: '2026-10-07T10:00:00', endTime: ended ? '2026-10-07T10:01:00' : null, active: !ended } }),
+    putBusiness: async (path, body) => {
+      assert.equal(path, '/mes/device-status-event/end')
+      assert.equal(body.id, '101')
+      ended = true
+      return { code: 0, data: true }
+    }
+  }, '101', '9001')
+  await fixtures.cleanup(false)
+  assert.equal(ended, true)
+  assert.match(record.checks[0].name, /已保留/)
+  assert.match(record.checks[0].details, /无历史删除入口/)
+})
+
 test('a retained repair fixture is not recorded as deleted', async () => {
   const record = caseRecord()
   const fixtures = createFixtureCleanup({ caseId: 'MAINT-008', caseRecord: record })
@@ -136,6 +232,59 @@ test('a retained repair fixture is not recorded as deleted', async () => {
   assert.equal(record.checks[0].passed, true)
   assert.match(record.checks[0].name, /已保留/)
   assert.doesNotMatch(record.checks[0].name, /已清理/)
+})
+
+test('inventory master cleanup retains positive and zero-quantity references without writes', async () => {
+  for (const field of ['materialId', 'warehouseId']) {
+    for (const qty of [2, 0]) {
+      const api = {
+        getBusiness: async (path) => {
+          assert.match(path, new RegExp(`${field}=2107681797636288514`))
+          return { code: 0, data: { records: [{ [field]: '2107681797636288514', qty }] } }
+        }
+      }
+      assert.deepEqual(await retainInventoryMaster(api, field, '2107681797636288514'),
+        { retained: true, reason: 'inventory-reference' })
+    }
+  }
+  await assert.rejects(() => retainInventoryMaster({
+    getBusiness: async () => ({ code: 0, data: null })
+  }, 'warehouseId', '7'))
+})
+
+test('automatically effective 199 is never approved again or deleted during cleanup', async () => {
+  const record = caseRecord()
+  const fixtures = createFixtureCleanup({ caseId: 'MAINT-008', caseRecord: record })
+  const api = {
+    postBusiness: async (path, body) => {
+      assert.equal(body.stkIoEntryList[0].entryNo, 1)
+      return { code: 0, data: '1991' }
+    },
+    getBusiness: async (path) => ({ code: 0, data: path.includes('queryEntry')
+      ? [{ materialId: '71', warehouseId: '81', qty: 2 }]
+      : path.includes('stkInventory')
+        ? { records: [{ materialId: '71', warehouseId: '81', qty: 2 }] }
+        : { stockIoType: '199', remark: 'E2E-MAINT 专属备件库存', billStage: '34', isEffective: 1 } }),
+    putBusiness: async () => assert.fail('effective stock must not be approved or rolled back'),
+    deleteBusiness: async () => assert.fail('effective stock must not be deleted')
+  }
+  await createOtherInStock(api, fixtures, { id: '71', unitId: '91' }, { id: '81' }, record)
+  await fixtures.cleanup(false)
+  assert.equal(record.checks.every((check) => check.passed), true)
+  assert.match(record.checks.at(-1).name, /已保留/)
+})
+
+test('type snapshot requires exact historical rule identity, version, name and JSON contents', () => {
+  const rule = { id: '2107681797636288514', version: 1, coreDomain: 'UPKEEP',
+    subTypeCode: 'E2E-MAINT-UPKEEP', subTypeName: 'E2E periodic upkeep' }
+  const task = { maintenanceDomain: rule.coreDomain, maintenanceSubTypeCode: rule.subTypeCode,
+    maintenanceSubTypeName: rule.subTypeName, maintenanceTypeRuleId: rule.id,
+    maintenanceTypeRuleVersion: 1, maintenanceTypeRuleSnapshot: JSON.stringify(rule) }
+  assert.equal(hasTaskTypeSnapshot(task, rule), true)
+  assert.equal(hasTaskTypeSnapshot(task, { ...rule, version: 2 }), false)
+  assert.equal(hasTaskTypeSnapshot({ ...task, maintenanceTypeRuleSnapshot: '{}' }, rule), false)
+  assert.equal(hasTaskTypeSnapshot({ ...task, maintenanceTypeRuleId: '2107681797636288515' }, rule), false)
+  assert.equal(hasTaskTypeSnapshot({ ...task, maintenanceTypeRuleSnapshot: 'bad JSON' }, rule), false)
 })
 
 test('a page timeout remains a failed check while preserving screenshots and API follow-up', async () => {

@@ -97,6 +97,7 @@ async function waitForLoginSurface (page, timeout = config.browserTimeoutMs) {
         [...document.querySelectorAll(selector)].some(isVisible)
       )
     },
+    undefined,
     { timeout }
   )
 }
@@ -157,6 +158,11 @@ export async function launchBrowser ({ headed = false, record } = {}) {
   context.setDefaultNavigationTimeout(config.browserTimeoutMs)
   await context.addInitScript(() => performance.setResourceTimingBufferSize(10000))
   const page = await context.newPage()
+  const capture = observePage(page, record)
+  return { browser, context, page, flushResponses: capture.flushResponses }
+}
+
+export function observePage (page, record) {
   const responseTasks = new Set()
   page.on('console', (message) => {
     if (message.type() !== 'error') return
@@ -202,7 +208,7 @@ export async function launchBrowser ({ headed = false, record } = {}) {
     responseTasks.add(task)
     task.finally(() => responseTasks.delete(task))
   })
-  return { browser, context, page, flushResponses: () => Promise.all([...responseTasks]) }
+  return { flushResponses: () => Promise.all([...responseTasks]) }
 }
 
 async function readToken (page) {
@@ -256,28 +262,32 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
   if (credentials && page.url() !== 'about:blank') {
     throw new Error('关联账号必须使用新建、隔离的 Chrome 页面登录，不能覆盖当前管理员会话')
   }
-  if (!credentials && config.reuseSession && page.url().startsWith(config.webBase) && !page.url().includes('/login')) {
+  const reuseSession = async () => {
+    if (credentials || !config.reuseSession || !page.url().startsWith(config.webBase)) return null
     const { token } = await readToken(page)
-    if (token) {
-      check?.step('page', '复用当前登录会话', true, page.url())
-      const cached = loginContexts.get(page)
-      return returnContext
-        ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
-        : token
+    if (!token) return null
+    // Visiting /login with an existing token redirects to the public portal.
+    // Another page in this context may already have completed authentication.
+    if (['/', '/login'].includes(new URL(page.url()).pathname)) {
+      await page.goto(`${config.webBase}/index`, {
+        waitUntil: 'domcontentloaded', timeout: config.browserTimeoutMs
+      })
+      await page.locator('[class*="-user-info"]').first().waitFor({
+        state: 'visible', timeout: config.browserTimeoutMs
+      })
     }
+    check?.step('page', '复用当前登录会话', true, page.url())
+    const cached = loginContexts.get(page.context())
+    return returnContext
+      ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
+      : token
   }
+  const existingSession = await reuseSession()
+  if (existingSession) return existingSession
   await page.goto(`${config.webBase}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
 
-  if (!page.url().includes('/login')) {
-    const { token } = await readToken(page)
-    if (token) {
-      check?.step('page', '已登录但访问登录地址被重定向，复用当前会话', true, page.url())
-      const cached = loginContexts.get(page)
-      return returnContext
-        ? { token, tenantId: cached?.token === token ? cached.tenantId : '' }
-        : token
-    }
-  }
+  const redirectedSession = await reuseSession()
+  if (redirectedSession) return redirectedSession
 
   try {
     await waitForLoginSurface(page)
@@ -336,7 +346,7 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
     check?.step('page', '本地 token 已写入', Boolean(token), keys.slice(0, 10).join(','))
     if (!token) throw new Error('登录成功后未读取到 token')
     const loginContext = resolveLoginContext(loginPayload, token)
-    loginContexts.set(page, loginContext)
+    loginContexts.set(page.context(), loginContext)
     return returnContext ? loginContext : token
   } catch (error) {
     const dump = await dumpLoginDom(page, dumpDir, 'login')
@@ -474,6 +484,7 @@ export async function waitForPageReady (page, timeout = config.browserTimeoutMs)
         ![...document.querySelectorAll(selector)].some(isVisible)
       )
     },
+    undefined,
     { timeout }
   )
 }

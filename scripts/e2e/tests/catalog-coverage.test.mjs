@@ -9,6 +9,8 @@ import { DESIGNED_MES_BASE_ENABLE_CASES } from '../suites/mes-base.mjs'
 import { crmReadOnlyCases } from '../suites/crm.mjs'
 import { procurementReadOnlyViews } from '../suites/procurement.mjs'
 import { cases as iotFoundationReadonlyCases } from '../suites/iot-foundation-readonly.mjs'
+import { ownedInitCases } from '../owned-init/fixtures.mjs'
+import { cases as initGapCases } from '../fixtures/init-gaps.mjs'
 
 const catalog = JSON.parse(fs.readFileSync(
   new URL('../cases/catalog.json', import.meta.url), 'utf8'
@@ -20,7 +22,11 @@ const definitions = new Map(catalog.suites.flatMap((suite) =>
 test('implemented read-only cases are executable but retain incomplete acceptance', () => {
   for (const id of [...DESIGNED_INIT_ENABLE_CASES, ...DESIGNED_MES_BASE_ENABLE_CASES,
     ...crmReadOnlyCases, ...Object.keys(procurementReadOnlyViews), ...iotFoundationReadonlyCases]) {
-    assert.equal(definitions.get(id)?.status, 'PARTIAL', id)
+    if (ownedInitCases.includes(id)) {
+      assert.ok(['PARTIAL', 'READY'].includes(definitions.get(id)?.status), id)
+    } else {
+      assert.equal(definitions.get(id)?.status, 'PARTIAL', id)
+    }
   }
 })
 
@@ -32,8 +38,28 @@ test('IoT foundation integration exposes telemetry and capacity as read-only par
 })
 
 test('unsafe initialization writes are not silently enabled by read-only coverage', () => {
-  for (const id of [...DESIGNED_INIT_BLOCKED_CASES, 'INIT-002', 'INIT-003', 'INIT-004', 'INIT-005']) {
+  for (const id of [...DESIGNED_INIT_BLOCKED_CASES, 'INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB032-006']) {
+    if (ownedInitCases.includes(id) || initGapCases.includes(id) || id === 'PB032-006') continue
     assert.ok(['DESIGNED', 'BLOCKED'].includes(definitions.get(id)?.status), id)
+  }
+})
+
+test('registered gap fixtures are executable but keep incomplete acceptance explicit', () => {
+  for (const id of [...initGapCases, 'AUTH-DATA-007']) {
+    assert.equal(definitions.get(id)?.status, 'PARTIAL', id)
+  }
+  assert.equal(definitions.get('PB032-006')?.status, 'READY')
+})
+
+test('only registered local owned initialization fixtures are executable without full acceptance', () => {
+  assert.deepEqual(ownedInitCases, [
+    'PB004-001', 'PB005-001', 'PB007-001', 'PB008-001', 'PB008-002'
+  ])
+  const source = fs.readFileSync(new URL('../suites/init.mjs', import.meta.url), 'utf8')
+  assert.match(source, /if \(ownedInitCases\.includes\(caseId\)\) return runOwnedInitCase/)
+  for (const id of ownedInitCases) {
+    assert.ok(['PARTIAL', 'READY'].includes(definitions.get(id)?.status), id)
+    assert.ok(definitions.get(id)?.assertions?.length > 0, id)
   }
 })
 

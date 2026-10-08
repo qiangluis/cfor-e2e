@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { createApiClient } from '../lib/api.mjs'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { runReadOnlySql } from '../lib/db.mjs'
 import {
   login,
   openRoute as defaultOpenRoute,
@@ -46,6 +47,25 @@ export const hasFormalMetricEvidence = ({ statusEvents, drilldown } = {}) =>
   Array.isArray(drilldown) &&
   drilldown.length > 0
 
+export const hasRepairWorkflowAudit = (rows, operatorId, tenantId) => {
+  const transitions = [
+    ['CREATE', 'NULL', 'REPORTED'],
+    ['DISPATCH', 'REPORTED', 'DISPATCHED'],
+    ['ACCEPT', 'DISPATCHED', 'ACCEPTED'],
+    ['START_REPAIR', 'ACCEPTED', 'REPAIRING'],
+    ['SPARE_OUT', 'REPAIRING', 'REPAIRING'],
+    ['COMPLETE_REPAIR', 'REPAIRING', 'PENDING_ACCEPT'],
+    ['CLOSE', 'PENDING_ACCEPT', 'CLOSED']
+  ]
+  return Array.isArray(rows) && rows.length === transitions.length &&
+    transitions.every((transition, index) =>
+      transition.every((value, column) => String(rows[index]?.[column]) === value) &&
+      String(rows[index]?.[3]) === String(operatorId) &&
+      String(rows[index]?.[4]) === String(tenantId) &&
+      Boolean(rows[index]?.[5]) && rows[index][5] !== 'NULL'
+    )
+}
+
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
 
 export const fixtureId = (response, label) => {
@@ -69,7 +89,34 @@ export const requiredRows = (response, label) => {
   return rows
 }
 
-const createMaintenanceDevice = async (api, fixtures, caseRecord) => {
+export const hasStatusEventPageEvidence = (payload, deviceId, expectedIds = []) => {
+  const rows = payload?.list
+  if (!Array.isArray(rows) || rows.length === 0 || expectedIds.length === 0) return false
+  if (!Number.isSafeInteger(Number(payload?.total)) || Number(payload.total) < rows.length) return false
+  if (new Set(rows.map((row) => String(row?.id))).size !== rows.length) return false
+  if (!rows.every((row) =>
+    String(row?.deviceId) === String(deviceId) &&
+    /^[1-9]\d*$/.test(String(row?.id)) &&
+    row?.statusCode &&
+    row?.startTime
+  )) return false
+  return expectedIds.every((id) =>
+    rows.some((row) => String(row?.id) === String(id))
+  )
+}
+
+export const hasSingleActiveStatusEvent = (payload, deviceId, expectedIds, activeId) => {
+  if (!hasStatusEventPageEvidence(payload, deviceId, expectedIds) ||
+      Number(payload.total) !== expectedIds.length || payload.list.length !== expectedIds.length) return false
+  if (!payload.list.every((row) =>
+    row.coreLayer === 'RUNTIME' && typeof row.active === 'boolean' &&
+    row.active === (row.endTime == null)
+  )) return false
+  const activeRows = payload.list.filter((row) => row.active)
+  return activeRows.length === 1 && String(activeRows[0].id) === String(activeId)
+}
+
+const createMaintenanceDevice = async (api, fixtures, caseRecord, options = {}) => {
   const products = requiredRows(await api.getBusiness('/iot/product/simple-list'), 'IoT 产品')
   const product = products.find((item) => item?.id != null && item.status === 0)
   if (!product) {
@@ -78,14 +125,194 @@ const createMaintenanceDevice = async (api, fixtures, caseRecord) => {
   }
   const id = trackDeletable(fixtures, api, await api.postBusiness('/iot/device/create', {
     productId: product.id,
-    deviceName: unique('E2E-MAINT')
+    deviceName: options.deviceName || unique('E2E-MAINT')
   }), '/iot/device', 'IoT 设备')
   const device = dataOf(await api.getBusiness(`/iot/device/get?id=${id}`))
   if (String(device?.id) !== String(id)) throw new Error('E2E 设备夹具回读不一致')
   return device
 }
 
-const createPlanFixture = async (api, fixtures, caseRecord, domain, planName) => {
+export const trackOwnedStatusEvent = (fixtures, api, response, deviceId) =>
+  fixtures.track(response, 'MAINT-006 状态事件历史', async (id) => {
+    const path = `/mes/device-status-event/get?id=${encodeURIComponent(id)}`
+    const owned = dataOf(await api.getBusiness(path))
+    if (String(owned?.id) !== String(id) || String(owned?.deviceId) !== String(deviceId)) {
+      throw new Error(`MAINT-006 事件所有权不一致，禁止结束 id=${id}`)
+    }
+    await endFixtureEvent(api, id, 'E2E-MAINT-006 fixture cleanup')
+    const ended = dataOf(await api.getBusiness(path))
+    if (String(ended?.deviceId) !== String(deviceId) || ended?.active !== false || !ended?.endTime) {
+      throw new Error(`MAINT-006 事件未安全结束 id=${id}`)
+    }
+    return { retained: true, reason: '已结束；正式 API 无历史删除入口，未删除审计事实' }
+  })
+
+export const retainInventoryMaster = async (api, field, id) => {
+  if (!['materialId', 'warehouseId'].includes(field)) throw new Error('Unsupported inventory master')
+  const rows = requiredRows(dataOf(await api.getBusiness(
+    `/mes/stkInventory/list?pageNo=1&pageSize=100&${field}=${encodeURIComponent(id)}`
+  )), '专属主数据清理前库存')
+  if (rows.some((row) => String(row[field]) === String(id))) {
+    return { retained: true, reason: 'inventory-reference' }
+  }
+  return null
+}
+
+export const hasTaskTypeSnapshot = (task, rule) => {
+  try {
+    const snapshot = JSON.parse(task?.maintenanceTypeRuleSnapshot)
+    return task?.maintenanceDomain === rule.coreDomain &&
+      task?.maintenanceSubTypeCode === rule.subTypeCode &&
+      task?.maintenanceSubTypeName === rule.subTypeName &&
+      String(task?.maintenanceTypeRuleId) === String(rule.id) &&
+      task?.maintenanceTypeRuleVersion === rule.version &&
+      String(snapshot?.id) === String(rule.id) &&
+      snapshot?.version === rule.version &&
+      snapshot?.coreDomain === rule.coreDomain &&
+      snapshot?.subTypeCode === rule.subTypeCode &&
+      snapshot?.subTypeName === rule.subTypeName
+  } catch {
+    return false
+  }
+}
+
+export const createDedicatedMaintenanceMaterial = async (api, fixtures) => {
+  const units = requiredRows(
+    dataOf(await api.getBusiness('/mes/basUnit/rootList?pageNo=1&pageSize=100')),
+    '计量单位'
+  )
+  const unit = units.find((row) => row?.id)
+  const categories = requiredRows(
+    dataOf(await api.getBusiness('/mes/basMaterialCategory/rootList?pageNo=1&pageSize=100')),
+    '存货分类'
+  )
+  const category = categories.find((row) => row?.id)
+  if (!unit || !category) throw new Error('缺少计量单位或存货分类，无法创建专属备件')
+  const marker = unique('E2E-MAINT-SPARE')
+  const response = await api.postBusiness('/mes/basMaterial/add', {
+    code: marker,
+    name: `E2E MAINT 专属备件 ${marker}`,
+    categoryId: category.id,
+    unitId: unit.id,
+    inventoryNature: 'STOCK',
+    purchased: 'Y',
+    leadTime: 0,
+    bufferTime: 0,
+    saled: 'N',
+    produced: 'N',
+    parented: 'N',
+    soned: 'N',
+    assembled: 'N',
+    batchManaged: 'N',
+    periodManaged: 'N',
+    oneBarcode: 'N',
+    isEnabled: 1,
+    remark: 'E2E-MAINT 专属备件库存'
+  })
+  const id = fixtures.track(response, 'E2E-MAINT 专属备件', async (materialId) => {
+    const retained = await retainInventoryMaster(api, 'materialId', materialId)
+    if (retained) return retained
+    const result = await api.deleteBusiness(`/mes/basMaterial/delete?id=${encodeURIComponent(materialId)}`)
+    assertBusinessSuccess(result, 'E2E-MAINT 专属备件清理')
+    const detail = await api.get(`/mes/basMaterial/queryById?id=${encodeURIComponent(materialId)}`)
+    if (!(detail?.code === 500 && detail?.msg?.includes('未找到对应数据')) && dataOf(detail) !== null) {
+      throw new Error(`E2E-MAINT 专属备件删除后仍可读取 id=${materialId}`)
+    }
+  })
+  const material = dataOf(await api.getBusiness(`/mes/basMaterial/queryById?id=${id}`))
+  if (String(material?.code) !== marker || String(material?.unitId) !== String(unit.id)) {
+    throw new Error(`专属备件回读不一致 id=${id}`)
+  }
+  return material
+}
+
+export const createOtherInStock = async (api, fixtures, material, warehouse, caseRecord) => {
+  const billNo = unique('E2E-MAINT-199')
+  const response = await api.postBusiness('/mes/stkIo/add/submit', {
+    billNo,
+    subject: 'E2E-MAINT 专属备件入库',
+    stockIoType: '199',
+    remark: 'E2E-MAINT 专属备件库存',
+    billStage: '12',
+    isEffective: 0,
+    isVoided: 0,
+    stkIoEntryList: [{
+      materialId: material.id,
+      entryNo: 1,
+      warehouseId: warehouse.id,
+      unitId: material.unitId,
+      stockIoDirection: '1',
+      qty: 2,
+      cost: 15.5,
+      settleAmt: 31
+    }],
+    stkIoDistributionList: [],
+    stkIoBomList: []
+  })
+  const billId = fixtureId(response, '199 其他入库')
+  fixtures.track(billId, '199 专属备件入库单', async (id) => {
+    const detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(id)}`))
+    if (detail?.isEffective === 1) {
+      return { retained: true }
+    }
+    if (String(detail?.billStage) !== '12' || Number(detail?.isEffective || 0) !== 0) {
+      throw new Error(`199 入库单已非可回收草稿 id=${id}`)
+    }
+    const result = await api.deleteBusiness(`/mes/stkIo/delete?id=${encodeURIComponent(id)}`)
+    assertBusinessSuccess(result, `199 入库单清理 id=${id}`)
+  })
+  const draft = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(billId)}`))
+  const entries = requiredRows(
+    await api.getBusiness(`/mes/stkIo/queryEntryByMainId?id=${encodeURIComponent(billId)}`),
+    '199 入库明细'
+  )
+  caseRecord.checks.push({
+    name: '专属 199 其他入库草稿保存物料/仓库/数量',
+    passed: String(draft?.stockIoType) === '199' &&
+      draft?.remark === 'E2E-MAINT 专属备件库存' &&
+      entries.length === 1 &&
+      String(entries[0]?.materialId) === String(material.id) &&
+      String(entries[0]?.warehouseId) === String(warehouse.id) &&
+      Number(entries[0]?.qty) === 2,
+    details: `billId=${billId}, entries=${entries.length}`
+  })
+  let effective = draft
+  if (draft?.isEffective === 1) {
+    caseRecord.checks.push({
+      name: '199 其他入库已自动生效时跳过重复审批',
+      passed: true,
+      details: `billStage=${draft?.billStage}, isEffective=${draft?.isEffective}, effectiveTime=${draft?.effectiveTime}`
+    })
+  } else {
+    if (String(draft?.billStage) !== '14') {
+      throw new Error(`199 入库未生效且非编制完阶段，禁止猜测审批动作 billStage=${draft?.billStage}`)
+    }
+    assertBusinessSuccess(
+      await api.putBusiness(`/mes/stkIo/update-bill-stage?id=${encodeURIComponent(billId)}&billStage=22`),
+      '199 入库单审核'
+    )
+    effective = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(billId)}`))
+  }
+  caseRecord.checks.push({
+    name: '专属 199 入库审核后生效',
+    passed: Number(effective?.isEffective) === 1,
+    details: `billStage=${effective?.billStage}, isEffective=${effective?.isEffective}`
+  })
+  const inventoryPage = dataOf(await api.getBusiness(
+    `/mes/stkInventory/list?pageNo=1&pageSize=100&materialId=${encodeURIComponent(material.id)}&warehouseId=${encodeURIComponent(warehouse.id)}`
+  ))
+  const inventoryRows = requiredRows(inventoryPage, '199 入库后库存')
+  const inventory = inventoryRows.find((row) =>
+    String(row.materialId) === String(material.id) &&
+    String(row.warehouseId) === String(warehouse.id)
+  )
+  if (!inventory || Number(inventory.qty) < 2) {
+    throw new Error(`199 入库未形成专属正库存 materialId=${material.id}, warehouseId=${warehouse.id}`)
+  }
+  return { billId, inventory }
+}
+
+const createPlanFixture = async (api, fixtures, caseRecord, domain, planName, options = {}) => {
   const nodes = requiredRows(await api.getBusiness('/mes/maintenance-item/tree'), '维保项目树')
   const root = nodes.find((node) => node.categoryRoot === domain && node.systemRoot === true)
   if (!root?.id) {
@@ -117,6 +344,7 @@ const createPlanFixture = async (api, fixtures, caseRecord, domain, planName) =>
   )
   const planId = fixtures.track(await api.postBusiness('/mes/maintenance-plan/create', {
     planCode: unique('E2E-MP'), planName, coreDomain: domain,
+    ...(options.subTypeCode ? { subTypeCode: options.subTypeCode } : {}),
     items: [{ itemId, seq: 1, standard: 'E2E 目视无异常' }],
     cycles: [{ cycleType: 'TIME', cycleValue: 1, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
   }), '维保方案', async (id) => {
@@ -170,7 +398,7 @@ export const createFixtureCleanup = ({ caseId, caseRecord }) => {
           caseRecord.checks.push({
             name: outcome?.retained ? `${label}隔离夹具已保留` : `${label}测试数据已清理`,
             passed: true,
-            details: `id=${id}`
+            details: `id=${id}${outcome?.reason ? `, reason=${outcome.reason}` : ''}`
           })
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
@@ -213,7 +441,14 @@ const trackRuleFixture = (fixtures, api, response, caseRecord) =>
 
 const trackInspectionRecord = (fixtures, api, response) =>
   fixtures.track(response, '点检记录', async (id) => {
-    await api.deleteBusiness(`/mes/system/record/${encodeURIComponent(id)}`)
+    const result = await api.deleteBusiness(`/mes/system/record/${encodeURIComponent(id)}`)
+    assertBusinessSuccess(result, `点检记录清理 id=${id}`)
+  })
+
+const trackInspectionTask = (fixtures, api, response) =>
+  fixtures.track(response, '点检任务', async (id) => {
+    const result = await api.deleteBusiness(`/mes/system/task/${encodeURIComponent(id)}`)
+    assertBusinessSuccess(result, `点检任务清理 id=${id}`)
   })
 
 const trackRepairOrder = (fixtures, api, response, caseRecord) =>
@@ -645,77 +880,150 @@ const runAuthenticatedCase = async (
 
   if (caseId === 'MAINT-006') {
     // PB-321 设备状态事件：单设备唯一有效状态、时长计算与状态编码校验
-    const deviceId = await isolatedDeviceId(api)
-    const firstId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord, {
+      deviceName: `${unique('E2E-MAINT-006')}-${randomBytes(3).toString('hex')}`
+    })
+    if (!device) {
+      return {
+        token,
+        api,
+        partial: true,
+        note: '缺少启用 IoT 产品，无法创建独占设备夹具；未执行状态事件写链'
+      }
+    }
+    const deviceId = device.id
+    const pagePath = `/mes/device-status-event/page?pageNo=1&pageSize=100&deviceId=${encodeURIComponent(deviceId)}`
+    const getEvents = async () => dataOf(await api.getBusiness(pagePath))
+    const getActive = async () => dataOf(await api.getBusiness(
+      `/mes/device-status-event/active?deviceId=${encodeURIComponent(deviceId)}&coreLayer=RUNTIME`
+    ))
+    const initial = await getEvents()
+    if (Number(initial?.total) !== 0 || !Array.isArray(initial?.list) || initial.list.length !== 0) {
+      throw new Error('MAINT-006 新建设备已存在事件，禁止执行状态写链')
+    }
+    caseRecord.checks.push({
+      name: '正式 API 创建并回读唯一所有权未激活设备，初始事件为空',
+      passed: device.deviceName?.startsWith('E2E-MAINT-006-') && device.state === 0,
+      details: `deviceId=${deviceId}, deviceName=${device.deviceName}, state=${device.state}`
+    })
+    const clock = Date.now()
+    const firstStart = formatLocalDateTime(new Date(clock - 10 * 60 * 1000))
+    const switchTime = formatLocalDateTime(new Date(clock - 3 * 60 * 1000))
+    const endTime = formatLocalDateTime(new Date(clock - 60 * 1000))
+    const firstId = trackOwnedStatusEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId,
-      deviceName: 'E2E 状态设备',
+      deviceName: device.deviceName,
       coreLayer: 'RUNTIME',
       statusCode: 'RUNNING',
       statusName: '运行',
+      startTime: firstStart,
       sourceType: 'MANUAL'
-    }))
-    const activeRunning = dataOf(await api.getBusiness(
-      `/mes/device-status-event/active?deviceId=${deviceId}`
-    ))
+    }), deviceId)
+    const activeRunning = await getActive()
+    const runningPage = await getEvents()
     caseRecord.checks.push({
       name: '开始状态后该设备仅有一个有效状态事件',
-      passed: activeRunning?.id === firstId && activeRunning?.statusCode === 'RUNNING',
-      details: `activeId=${activeRunning?.id}, firstId=${firstId}`
+      passed: String(activeRunning?.id) === String(firstId) &&
+        String(activeRunning?.deviceId) === String(deviceId) &&
+        activeRunning?.statusCode === 'RUNNING' &&
+        activeRunning?.active === true &&
+        activeRunning?.endTime == null &&
+        hasSingleActiveStatusEvent(runningPage, deviceId, [firstId], firstId),
+      details: `activeId=${activeRunning?.id}, firstId=${firstId}, total=${runningPage?.total}, activeCount=${runningPage?.list?.filter((row) => row.active).length}`
     })
 
-    const secondId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
+    const secondId = trackOwnedStatusEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
       deviceId,
+      deviceName: device.deviceName,
       coreLayer: 'RUNTIME',
       statusCode: 'STOPPED',
       statusName: '停机',
-      sourceType: 'REPAIR_ORDER',
+      startTime: switchTime,
+      sourceType: 'MANUAL',
       reason: 'E2E 切换'
-    }))
-    const activeStopped = dataOf(await api.getBusiness(
-      `/mes/device-status-event/active?deviceId=${deviceId}`
+    }), deviceId)
+    const activeStopped = await getActive()
+    const switchedPage = await getEvents()
+    const firstEvent = dataOf(await api.getBusiness(
+      `/mes/device-status-event/get?id=${encodeURIComponent(firstId)}`
     ))
-    const eventPage = dataOf(await api.getBusiness(
-      `/mes/device-status-event/page?pageNo=1&pageSize=100&deviceId=${deviceId}`
-    ))
-    const firstEvent = (eventPage?.list || []).find((row) => row.id === firstId)
     caseRecord.checks.push({
       name: '再次开始新状态自动结束上一有效状态并计算持续分钟',
       passed:
-        activeStopped?.id === secondId &&
+        String(activeStopped?.id) === String(secondId) &&
+        String(activeStopped?.deviceId) === String(deviceId) &&
         activeStopped?.statusCode === 'STOPPED' &&
-        Boolean(firstEvent?.endTime) &&
-        firstEvent?.durationMinutes >= 0,
-      details: `secondId=${secondId}, firstEnd=${firstEvent?.endTime}, duration=${firstEvent?.durationMinutes}`
+        activeStopped?.active === true &&
+        activeStopped?.endTime == null &&
+        firstEvent?.active === false &&
+        firstEvent?.startTime === firstStart &&
+        firstEvent?.endTime === switchTime &&
+        firstEvent?.durationMinutes === 7 &&
+        hasSingleActiveStatusEvent(switchedPage, deviceId, [firstId, secondId], secondId),
+      details: `secondId=${secondId}, firstStart=${firstEvent?.startTime}, firstEnd=${firstEvent?.endTime}, duration=${firstEvent?.durationMinutes}, expected=7, activeCount=${switchedPage?.list?.filter((row) => row.active).length}`
     })
 
+    const unknownCode = unique('E2E-MAINT-UNKNOWN')
     const invalid = await api.post('/mes/device-status-event/start', {
       deviceId,
       coreLayer: 'RUNTIME',
-      statusCode: 'NOT_A_STATE'
+      statusCode: unknownCode
     })
+    const afterInvalid = await getEvents()
+    const activeAfterInvalid = await getActive()
     caseRecord.checks.push({
       name: '未知状态编码被拒（未映射平台固定核心状态）',
-      passed: isExpectedRejection(invalid, 'NOT_A_STATE'),
-      details: `code=${invalid?.code}, msg=${invalid?.msg || ''}`
+      passed: isExpectedRejection(invalid, `状态编码 ${unknownCode} 不属于 RUNTIME`) &&
+        JSON.stringify(afterInvalid) === JSON.stringify(switchedPage) &&
+        JSON.stringify(activeAfterInvalid) === JSON.stringify(activeStopped),
+      details: `code=${invalid?.code}, msg=${invalid?.msg || ''}, totalAfter=${afterInvalid?.total}, activeAfter=${activeAfterInvalid?.id}`
     })
 
-    const secondEvent = dataOf(await api.getBusiness(`/mes/device-status-event/get?id=${secondId}`))
-    const secondEndTime = formatLocalDateTime(
-      new Date(new Date(secondEvent.startTime).getTime() + 60 * 1000)
-    )
-    await api.putBusiness('/mes/device-status-event/end', {
+    requireTrueResult(await api.putBusiness('/mes/device-status-event/end', {
       id: secondId,
-      endTime: secondEndTime,
+      endTime,
       reason: 'E2E 结束'
-    })
-    const endedAgain = dataOf(await api.putBusiness('/mes/device-status-event/end', { id: secondId }))
+    }), '结束第二个测试事件')
+    const endedOnce = dataOf(await api.getBusiness(`/mes/device-status-event/get?id=${secondId}`))
+    const endedAgain = dataOf(await api.putBusiness('/mes/device-status-event/end', {
+      id: secondId,
+      endTime: formatLocalDateTime(new Date(clock)),
+      reason: 'E2E 幂等重试，不应覆盖'
+    }))
+    const endedTwice = dataOf(await api.getBusiness(`/mes/device-status-event/get?id=${secondId}`))
     const activeAfterEnd = dataOf(await api.getBusiness(
       `/mes/device-status-event/active?deviceId=${deviceId}`
     ))
     caseRecord.checks.push({
       name: '结束状态后无有效状态，重复结束幂等',
-      passed: endedAgain === true && !activeAfterEnd,
-      details: `activeAfterEnd=${activeAfterEnd === null ? 'null' : JSON.stringify(activeAfterEnd)}`
+      passed: endedAgain === true &&
+        activeAfterEnd === null &&
+        endedOnce?.startTime === switchTime &&
+        endedOnce?.endTime === endTime &&
+        endedOnce?.durationMinutes === 2 &&
+        JSON.stringify(endedOnce) === JSON.stringify(endedTwice) &&
+        endedTwice?.active === false,
+      details: `activeAfterEnd=${activeAfterEnd === null ? 'null' : JSON.stringify(activeAfterEnd)}, firstDuration=${endedOnce?.durationMinutes}, retryDuration=${endedTwice?.durationMinutes}, firstEnd=${endedOnce?.endTime}, retryEnd=${endedTwice?.endTime}`
+    })
+
+    const eventPage = await getEvents()
+    const eventRows = eventPage?.list || eventPage?.records || []
+    const paged = []
+    for (const pageNo of [1, 2]) {
+      paged.push(dataOf(await api.getBusiness(
+        `/mes/device-status-event/page?pageNo=${pageNo}&pageSize=1&deviceId=${encodeURIComponent(deviceId)}`
+      )))
+    }
+    caseRecord.checks.push({
+      name: '设备状态事件分页按设备ID过滤返回真实记录',
+      passed: hasStatusEventPageEvidence(eventPage, deviceId, [firstId, secondId]) &&
+        Number(eventPage.total) === 2 && eventRows.length === 2 &&
+        eventRows.every((row) => row.active === false && row.endTime != null) &&
+        paged.every((payload, index) =>
+          hasStatusEventPageEvidence(payload, deviceId, [index === 0 ? secondId : firstId]) &&
+          Number(payload.total) === 2 && payload.list.length === 1
+        ),
+      details: `deviceId=${deviceId}, total=${eventPage?.total}, rows=${eventRows.length}, ids=${eventRows.map((row) => row.id).join(',')}, pageSize1=${paged.map((payload) => payload?.list?.[0]?.id).join(',')}`
     })
 
     await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, { readyText: '统计周期' })
@@ -725,7 +1033,40 @@ const runAuthenticatedCase = async (
       passed: pageText.includes('状态层') && pageText.includes('是否有效'),
       details: `真实打开 ${MAINT_011_DEVICE_STATUS_ROUTE}`
     })
+    const searchForm = page.locator('form').filter({
+      has: page.getByRole('button', { name: '开始状态', exact: true })
+    })
+    await searchForm.getByPlaceholder('请输入设备ID', { exact: true }).fill(String(deviceId))
+    const responsePromise = page.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return url.pathname.endsWith('/mes/device-status-event/page') &&
+        url.searchParams.get('deviceId') === String(deviceId)
+    })
+    await searchForm.getByRole('button', { name: '搜索', exact: true }).click()
+    const response = await responsePromise
+    await page.waitForFunction(({ id, name }) => {
+      const rows = [...document.querySelectorAll('.el-table__body-wrapper tbody tr.el-table__row')]
+      return rows.length === 2 && rows.every((row) =>
+        row.textContent.includes(id) && row.textContent.includes(name) &&
+        row.textContent.includes('已结束')
+      )
+    }, { id: String(deviceId), name: device.deviceName }, { timeout: 15000 })
+    const uiRows = await page.locator('.el-table__body-wrapper tbody tr.el-table__row').allInnerTexts()
+    caseRecord.checks.push({
+      name: 'Chrome 按专属设备ID筛选显示两条已结束事件及7/2分钟时长',
+      passed: response.status() === 200 && uiRows.length === 2 &&
+        uiRows.some((row) => row.includes('运行') && /(?:^|\s)7(?:\s|$)/.test(row)) &&
+        uiRows.some((row) => row.includes('停机') && /(?:^|\s)2(?:\s|$)/.test(row)),
+      details: `deviceId=${deviceId}, rows=${JSON.stringify(uiRows)}`
+    })
     await saveScreenshot(page, outputDir, 'maint-006-device-status', record)
+    caseRecord.evidence.push(
+      `独占设备 ${deviceId} (${device.deviceName})，手工事件 ${firstId}/${secondId}；真实 API 回读及 Chrome 按设备筛选。` +
+      '五条原断言分别对应唯一 active、自动结束7分钟、未知编码无副作用、重复结束保持2分钟、按设备分页两条。'
+    )
+    caseRecord.notes.push(
+      `事件历史 ${firstId}/${secondId} 通过正式 end API 结束后保留审计事实，无删除接口；设备通过正式 delete API 清理。`
+    )
     return { token, api }
   }
 
@@ -892,40 +1233,79 @@ const runAuthenticatedCase = async (
       details: `status=${repairing?.orderStatus}, active=${activeRepairing?.statusCode}`
     })
 
-    const materialPage = dataOf(await api.getBusiness('/mes/basMaterial/list?pageNo=1&pageSize=100'))
-    const materialRows = requiredRows(materialPage, '备件存货')
-    const material = materialRows.find((item) => isE2eFixture(item) && item.unitId)
-    const materialId = material?.id || material?.materialId
-    const warehouseTree = dataOf(await api.getBusiness('/mes/wmsWareHouse/allTree'))
-    const warehouseRows = Array.isArray(warehouseTree)
-      ? warehouseTree
-      : warehouseTree?.list || warehouseTree?.records || []
-    const findFixtureWarehouse = (nodes) => {
-      for (const node of nodes || []) {
-        if (node?.id != null && isE2eFixture(node)) return node
-        const child = findFixtureWarehouse(node?.children)
-        if (child) return child
-      }
-      return null
+    const material = await createDedicatedMaintenanceMaterial(api, fixtures)
+    const materialId = material.id
+    const warehouseCode = unique('E2E-MAINT-WH')
+    let warehouse = null
+    if (!warehouse) {
+      const warehouseResponse = await api.postBusiness('/mes/wmsWareHouse/add', {
+        code: warehouseCode,
+        name: `E2E 维修备件仓 ${warehouseCode}`,
+        mark: 'E2E-MAINT 专属备件库存',
+        pid: '0',
+        isEnabled: true,
+        areaEnabled: false,
+        locationEnabled: false,
+        countInAvailable: true
+      })
+      const rootPage = dataOf(await api.getBusiness(
+        `/mes/wmsWareHouse/rootList?pageNo=1&pageSize=100&code=${encodeURIComponent(warehouseCode)}`
+      ))
+      const rootRows = requiredRows(rootPage, '专属仓库回读')
+      warehouse = rootRows.find((row) => row?.code === warehouseCode)
+      if (!warehouse?.id) throw new Error('E2E 维修备件仓创建后未能按精确编码回读')
+      fixtures.track(warehouse.id, 'E2E 维修备件仓', async (id) => {
+        const retained = await retainInventoryMaster(api, 'warehouseId', id)
+        if (retained) return retained
+        assertBusinessSuccess(await api.deleteBusiness(`/mes/wmsWareHouse/delete?id=${id}`), '专属仓库清理')
+        const rows = requiredRows(await api.getBusiness(
+          `/mes/wmsWareHouse/rootList?pageNo=1&pageSize=100&code=${encodeURIComponent(warehouseCode)}`
+        ), '删除后仓库回读')
+        if (rows.some((row) => String(row.id) === String(id))) throw new Error(`仓库删除后仍存在 id=${id}`)
+      })
+      caseRecord.checks.push({
+        name: '缺少仓库时创建并回读专属 E2E 维修备件仓',
+        passed: Boolean(warehouseResponse) && warehouse.code === warehouseCode,
+        details: `warehouseId=${warehouse.id}, code=${warehouse.code}`
+      })
     }
-    const warehouse = findFixtureWarehouse(warehouseRows)
-    if (!materialId || !warehouse?.id) {
-      caseRecord.notes.push(
-        `缺少明确 E2E 备件或仓库夹具：materialId=${materialId ?? 'none'}, warehouseId=${warehouse?.id ?? 'none'}；未执行备件出库/完工/关闭。`
-      )
-      return {
-        token,
-        api,
-        partial: true,
-        note: '维修工单已验证至开工，缺少明确 E2E 备件或仓库夹具，未生成关联共享主数据的出库草稿；备件/完工/关闭待复测'
-      }
+    if (!warehouse?.id) throw new Error('专属维修备件仓缺少 ID')
+    const inventoryPage = dataOf(await api.getBusiness(
+      `/mes/stkInventory/list?pageNo=1&pageSize=100&materialId=${encodeURIComponent(materialId)}&warehouseId=${encodeURIComponent(warehouse.id)}`
+    ))
+    const inventoryRows = requiredRows(inventoryPage, '专属备件库存')
+    let inventory = inventoryRows.find((row) =>
+      String(row.materialId) === String(materialId) &&
+      String(row.warehouseId) === String(warehouse.id) &&
+      Number(row.qty) > 0
+    )
+    if (!inventory) {
+      const stocked = await createOtherInStock(api, fixtures, material, warehouse, caseRecord)
+      inventory = stocked.inventory
     }
+    caseRecord.checks.push({
+      name: '备件出库前存在专属物料/仓库正库存事实',
+      passed: Boolean(inventory),
+      details: inventory
+        ? `materialId=${inventory.materialId}, warehouseId=${inventory.warehouseId}, qty=${inventory.qty}`
+        : `materialId=${materialId}, warehouseId=${warehouse.id}, rows=${inventoryRows.length}`
+    })
     const spareOutBillId = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/spare-out`, {
       workflowVersion: repairing?.workflowVersion,
       warehouseId: warehouse.id,
       remark: 'E2E 备件领用',
       spareParts: [{ materialId, qty: 2, unitId: material.unitId, cost: 15.5 }]
     }))
+    fixtures.track(spareOutBillId, '299 备件出库草稿', async (id) => {
+      const detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(id)}`))
+      if (String(detail?.billStage) !== '12' || Number(detail?.isEffective || 0) !== 0 ||
+        Number(detail?.isVoided || 0) !== 0) {
+        throw new Error(`本轮 299 草稿已不是可清理状态 id=${id}`)
+      }
+      assertBusinessSuccess(await api.deleteBusiness(`/mes/stkIo/delete?id=${id}`), '299 草稿清理')
+      const entries = requiredRows(await api.getBusiness(`/mes/stkIo/queryEntryByMainId?id=${id}`), '删除后299明细')
+      if (entries.length !== 0) throw new Error(`299 删除后仍有明细 id=${id}`)
+    })
     const afterSpareOut = dataOf(await api.getBusiness(`/mes/system/order/${orderId}`))
     caseRecord.checks.push({
       name: '备件领用生成 WMS 其他出库草稿单并回写费用',
@@ -948,6 +1328,33 @@ const runAuthenticatedCase = async (
       details: `type=${spareOutBill?.stockIoType}, src=${
         spareOutBill?.srcBillType || spareOutBill?.sourceBillType
       }/${spareOutBill?.srcBillId || spareOutBill?.sourceBillId}`
+    })
+    const spareOutRetry = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/spare-out`, {
+      workflowVersion: afterSpareOut?.workflowVersion,
+      warehouseId: warehouse.id,
+      remark: 'E2E 备件领用幂等重试',
+      spareParts: [{ materialId, qty: 2, unitId: material.unitId, cost: 15.5 }]
+    }))
+    caseRecord.checks.push({
+      name: '同一维修工单重复备件领用幂等复用同一 299 草稿',
+      passed: String(spareOutRetry) === String(spareOutBillId),
+      details: `first=${spareOutBillId}, retry=${spareOutRetry}`
+    })
+
+    const staleComplete = await api.post(`/mes/system/order/${orderId}/complete-repair`, {
+      workflowVersion: accepted?.workflowVersion,
+      repairResult: 'E2E 过期版本完工反例',
+      workHours: 2.5,
+      laborCost: 120
+    })
+    const afterStale = dataOf(await api.getBusiness(`/mes/system/order/${orderId}`))
+    caseRecord.checks.push({
+      name: '合法维修状态下过期版本完工被拒绝且状态与费用不变',
+      passed: isWorkflowRejection(staleComplete, '工单状态已变化') &&
+        afterStale?.orderStatus === 'REPAIRING' &&
+        afterStale?.workflowVersion === afterSpareOut?.workflowVersion &&
+        Number(afterStale?.partsCost) === 31,
+      details: `code=${staleComplete?.code}, status=${afterStale?.orderStatus}, version=${afterStale?.workflowVersion}`
     })
 
     const completed = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/complete-repair`, {
@@ -999,10 +1406,28 @@ const runAuthenticatedCase = async (
       assigneeUserId
     })
     caseRecord.checks.push({
-      name: '终态工单不接受过期状态机版本的派工',
+      name: '终态工单不接受再次派工',
       passed: isWorkflowRejection(staleDispatch, '不允许执行'),
       details: `code=${staleDispatch?.code}, msg=${staleDispatch?.msg || ''}`
     })
+
+    fixtureId({ data: orderId, code: 0 }, '维修工单审计')
+    const workflowAudit = await runReadOnlySql(`
+      SELECT action_code, from_status, to_status, operator_id, tenant_id, action_time
+      FROM repair_order_workflow_log
+      WHERE order_id = ${orderId} AND deleted = 0
+      ORDER BY id
+    `)
+    if (!workflowAudit.available) throw new Error(`BLOCKED: ${workflowAudit.reason}`)
+    caseRecord.database = [...(caseRecord.database || []), {
+      stage: 'repair-workflow-audit', ...workflowAudit
+    }]
+    caseRecord.checks.push({
+      name: '七个真实动作日志顺序、状态、操作人、租户一致，拒绝及幂等重试不增日志',
+      passed: hasRepairWorkflowAudit(workflowAudit.rows, assigneeUserId, 1),
+      details: JSON.stringify(workflowAudit.rows)
+    })
+    caseRecord.evidence.push(`专属维修工单 ${orderId} 完整状态机与数据库动作日志；299 草稿幂等复用，未审核出库`)
 
     if (activeRunning?.id) {
       await endFixtureEvent(api, activeRunning.id, 'E2E 清理')
@@ -1042,21 +1467,43 @@ const runAuthenticatedCase = async (
       details: JSON.stringify(missingReason)
     })
 
-    const taskPage = dataOf(await api.getBusiness('/mes/system/task/list?pageNo=1&pageSize=100'))
-    const taskRows = requiredRows(taskPage, '点检任务')
-    const task = taskRows.find((item) =>
-      item?.id != null && item.deviceId != null &&
-      isE2eFixture({ name: item.planName, code: item.projectName }) &&
-      item.inspectionRecordId == null
-    )
+    let task = null
     if (!task) {
-      caseRecord.notes.push('当前租户没有带设备的正式点检任务，未伪造任务 ID；隐患/补检正向写侧保留 PARTIAL。')
-      return {
-        token,
-        api,
-        partial: true,
-        note: '缺少带设备且未执行的正式 E2E 点检任务，未执行需要任务事实的正向异常处置与审批'
+      const taskDevice = await createMaintenanceDevice(api, fixtures, caseRecord)
+      if (!taskDevice) {
+        caseRecord.notes.push('当前租户没有正式 E2E 点检任务，且无法创建专属设备；未触碰共享任务。')
+        return { token, api, partial: true, note: '缺少专属点检设备/任务，正向异常处置与审批待补' }
       }
+      const taskPlanName = unique('E2E-MAINT-INSPECT')
+      await api.postBusiness('/mes/system/task/add', {
+        planName: taskPlanName,
+        planContent: 'E2E 专属异常点检',
+        projectName: 'E2E 专属点检项目',
+        deviceId: taskDevice.id,
+        deviceIds: [String(taskDevice.id)],
+        planDate: formatLocalDateTime(new Date()).slice(0, 10),
+        maintenanceDomain: 'INSPECT',
+        inspectionStatus: '0',
+        abnormalFlag: '0'
+      })
+      const createdTaskPage = dataOf(await api.getBusiness(
+        `/mes/system/task/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(taskPlanName)}`
+      ))
+      const createdTaskRows = requiredRows(createdTaskPage, '专属点检任务回读')
+      task = createdTaskRows.find((row) =>
+        String(row?.deviceId) === String(taskDevice.id) &&
+        row?.planName === taskPlanName &&
+        String(row?.inspectionStatus) === '0'
+      )
+      if (!task?.id) throw new Error('专属点检任务创建未返回 ID')
+      trackInspectionTask(fixtures, api, task.id)
+      caseRecord.checks.push({
+        name: '缺少正式任务时创建并回读专属 E2E 点检任务',
+        passed: String(task.deviceId) === String(taskDevice.id) &&
+          task.maintenanceDomain === 'INSPECT' &&
+          String(task.inspectionStatus) === '0',
+        details: `taskId=${task.id}, deviceId=${task.deviceId}, domain=${task.maintenanceDomain}`
+      })
     }
     const taskDevice = dataOf(await api.getBusiness(`/iot/device/get?id=${task.deviceId}`))
     if (!isE2eFixture({ name: taskDevice?.deviceName, code: taskDevice?.serialNumber })) {
@@ -1093,6 +1540,25 @@ const runAuthenticatedCase = async (
         hazardDetail?.exceptionAction === 'HAZARD' &&
         hazardDetail?.hazardStatus === 'PENDING',
       details: `id=${hazardRecord?.id}, hazardStatus=${hazardDetail?.hazardStatus}`
+    })
+    const repairAction = await api.postBusiness('/mes/system/record/exception-action', {
+      id: hazardRecord.id,
+      exceptionAction: 'REPAIR',
+      repairOrderContent: 'E2E 点检异常转维修'
+    })
+    const repairActionDetail = dataOf(await api.getBusiness(`/mes/system/record/${hazardRecord.id}`))
+    const generatedRepairId = repairActionDetail?.repairOrderId
+    if (generatedRepairId) trackRepairOrder(fixtures, api, generatedRepairId, caseRecord)
+    const generatedRepair = generatedRepairId
+      ? dataOf(await api.getBusiness(`/mes/system/order/${generatedRepairId}`))
+      : null
+    caseRecord.checks.push({
+      name: '异常项转维修通过独立处置接口并回写 REPORTED 工单',
+      passed: Boolean(repairAction) &&
+        Boolean(generatedRepairId) &&
+        generatedRepair?.orderStatus === 'REPORTED' &&
+        String(generatedRepair?.inspectionRecordId) === String(hazardRecord.id),
+      details: `recordId=${hazardRecord.id}, repairOrderId=${generatedRepairId}, status=${generatedRepair?.orderStatus}`
     })
 
     const supplementRecord = dataOf(await api.postBusiness('/mes/system/record/add', {
@@ -1400,51 +1866,79 @@ const runAuthenticatedCase = async (
   }
 
   if (caseId === 'MAINT-013') {
-    const token = await login(page)
-    const api = createApiClient({ token, record })
     // PB-109：维修（REPAIR）方案发布后进入既有 repair_order，不新增平行执行单据
-    const planPage = await api.getBusiness('/mes/maintenance-plan/page?pageNo=1&pageSize=100&coreDomain=REPAIR')
-    const repairPlans = Array.isArray(planPage?.list) ? planPage.list : []
-    const repairPlan = repairPlans.find((plan) => plan?.id && plan?.status !== 'PUBLISHED')
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品，未创建专属 REPAIR 方案' }
+    const fixture = await createPlanFixture(api, fixtures, caseRecord, 'REPAIR', `E2E REPAIR 派单-${Date.now().toString(36)}`)
+    if (!fixture) return { token, api, partial: true, note: '缺少 REPAIR 根项目，未创建专属方案' }
+    const { planId } = fixture
+    const assignmentId = fixtures.track(await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+      targetType: 'DEVICE',
+      targetId: device.id,
+      planId,
+      planVersion: 1,
+      priority: 1,
+      status: 0
+    }), 'REPAIR 专属方案分配', async (id) => {
+      requireTrueResult(await api.deleteBusiness(`/mes/maintenance-plan-assignment/delete?id=${id}`), 'REPAIR 专属方案分配清理')
+    })
 
-    const before = await api.getBusiness('/mes/system/order/list?pageNo=1&pageSize=100')
-    const beforeRows = Array.isArray(before?.rows) ? before.rows : Array.isArray(before?.list) ? before.list : []
+    const before = dataOf(await api.getBusiness('/mes/system/order/list?pageNo=1&pageSize=100'))
+    const beforeRows = requiredRows(before, '发布前维修工单')
     caseRecord.checks.push({
-      name: '维修工单接口可读且承载来源方案快照字段',
-      passed:
-        Array.isArray(beforeRows) &&
-        (beforeRows.length === 0 ||
-          ['sourcePlanId', 'sourcePlanVersion', 'sourceAssignmentId', 'idempotentKey'].every((field) =>
-            Object.prototype.hasOwnProperty.call(beforeRows[0], field)
-          )),
+      name: '维修工单分页按真实 records 契约读取',
+      passed: Array.isArray(beforeRows),
       details: `rows=${beforeRows.length}`
     })
 
-    if (!repairPlan) {
-      caseRecord.checks.push({
-        name: '无待发布 REPAIR 方案时跳过真实派单（结构由单测覆盖）',
-        passed: true,
-        details: `repairPlans=${repairPlans.length}`
-      })
-      caseRecord.evidence.push(
-        '维修方案发布→repair_order 的运行时接线由 MaintenanceRepairOrderPublisherTest 3 例覆盖；当前租户无待发布 REPAIR 方案，未做真实派单'
-      )
-      return { token, api }
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const publishedPlan = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    const after = dataOf(await api.getBusiness('/mes/system/order/list?pageNo=1&pageSize=100'))
+    const afterRows = requiredRows(after, '发布后维修工单')
+    const generated = afterRows.filter((row) =>
+      String(row?.projectName) === String(publishedPlan?.planName) &&
+      String(row?.deviceId) === String(device.id)
+    )
+    for (const row of generated) {
+      trackRepairOrder(fixtures, api, row.id, caseRecord)
     }
-
-    await api.putBusiness(`/mes/maintenance-plan/publish?id=${repairPlan.id}`)
-    const after = await api.getBusiness('/mes/system/order/list?pageNo=1&pageSize=100')
-    const afterRows = Array.isArray(after?.rows) ? after.rows : Array.isArray(after?.list) ? after.list : []
-    const generated = afterRows.filter((row) => String(row?.sourcePlanId) === String(repairPlan.id))
+    const dbEvidence = await runReadOnlySql(`
+      SELECT source_plan_id, source_plan_version, source_assignment_id, idempotent_key
+      FROM repair_order
+      WHERE tenant_id = 1 AND source_plan_id = '${planId}'
+      ORDER BY create_time DESC
+    `)
+    const dbRows = dbEvidence.available ? dbEvidence.rows : []
+    caseRecord.database = [...(caseRecord.database || []), { stage: 'repair-publish', ...dbEvidence }]
+    const sourceRow = dbRows.find((row) => String(row[2]) === String(assignmentId) &&
+      String(row[3]).includes(String(planId)))
+    if (generated.some((row) => !['sourcePlanId', 'sourcePlanVersion', 'sourceAssignmentId', 'idempotentKey']
+      .every((field) => Object.hasOwn(row, field)))) {
+      caseRecord.notes.push('当前 RepairOrderVo 未暴露来源四字段，按用户授权使用只读 DB 来源证据；VO 补齐由主线程处理。')
+    }
     caseRecord.checks.push({
       name: 'REPAIR 方案发布后生成带来源方案与幂等键的维修工单',
-      passed: generated.length > 0 && generated.every((row) => row?.idempotentKey && row?.sourcePlanVersion),
-      details: `generated=${generated.length}, planId=${repairPlan.id}`
+      passed: generated.length === 1 && Boolean(sourceRow) &&
+        String(sourceRow[0]) === String(planId) && Number(sourceRow[1]) === 1,
+      details: `before=${beforeRows.length}, generated=${generated.length}, dbSource=${sourceRow ? sourceRow.join('/') : 'none'}, planId=${planId}, assignment=${assignmentId}`
+    })
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const retry = dataOf(await api.getBusiness('/mes/system/order/list?pageNo=1&pageSize=100'))
+    const retryRows = requiredRows(retry, '重复发布后维修工单')
+    const retriedGenerated = retryRows.filter((row) =>
+      String(row?.projectName) === String(publishedPlan?.planName) &&
+      String(row?.deviceId) === String(device.id)
+    )
+    caseRecord.checks.push({
+      name: '同一 REPAIR 方案版本重复发布不生成重复工单',
+      passed: generated.length === 1 && retriedGenerated.length === 1 &&
+        String(retriedGenerated[0]?.id) === String(generated[0]?.id),
+      details: `first=${generated.length}, retry=${retriedGenerated.length}`
     })
     // 反向：停用方案，避免遗留已发布状态
-    await api.putBusiness(`/mes/maintenance-plan/disable?id=${repairPlan.id}`)
+    await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
     caseRecord.evidence.push(
-      '真实发布 REPAIR 维保方案，验证 repair_order 生成来源方案/版本/分配/幂等键快照，并在结束后停用方案'
+      '真实创建并发布专属 REPAIR 维保方案，验证 repair_order 生成来源方案/版本/分配/幂等键快照、重复发布幂等，并在结束后停用方案'
     )
     return { token, api }
   }
@@ -1483,7 +1977,60 @@ const runAuthenticatedCase = async (
       String(
         row.taskStatus ?? row.status ?? row.inspectionStatus ?? (row.inspectionRecordId ? '1' : '0')
       )
-    const pendingTask = taskRows.find((row) => taskStatusOf(row) === '0' && row.planDate)
+    let pendingTask = null
+
+    if (!pendingTask) {
+      const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+      if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品，未创建专属 UPKEEP 任务' }
+      const upkeepPlanName = `E2E UPKEEP 到期-${Date.now().toString(36)}`
+      const planFixture = await createPlanFixture(
+        api, fixtures, caseRecord, 'UPKEEP', upkeepPlanName
+      )
+      if (!planFixture) return { token, api, partial: true, note: '缺少 UPKEEP 根项目，未创建专属保养任务' }
+      const assignmentId = fixtures.track(await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+        targetType: 'DEVICE',
+        targetId: device.id,
+        planId: planFixture.planId,
+        planVersion: 1,
+        priority: 1,
+        status: 0
+      }), 'UPKEEP 专属方案分配', async (id) => {
+        requireTrueResult(await api.deleteBusiness(`/mes/maintenance-plan-assignment/delete?id=${id}`), 'UPKEEP 分配清理')
+      })
+      await api.putBusiness(`/mes/maintenance-plan/publish?id=${planFixture.planId}`)
+      const runtime = requiredRows(dataOf(await api.getBusiness(
+        `/mes/system/plan/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(upkeepPlanName)}`
+      )), 'UPKEEP 运行计划')
+      const runtimePlan = runtime.find((row) => String(row.sourcePlanId) === String(planFixture.planId))
+      if (!runtimePlan?.id) throw new Error(`UPKEEP 方案发布后未生成运行计划 assignment=${assignmentId}`)
+      fixtures.track(runtimePlan.id, 'UPKEEP 运行计划', async (id) => {
+        assertBusinessSuccess(await api.deleteBusiness(`/mes/system/plan/${id}`), 'UPKEEP 运行计划清理')
+      })
+      const taskResponse = await api.postBusiness('/mes/system/task/add', {
+        planId: runtimePlan.id,
+        inspectionPlanId: runtimePlan.id,
+        planName: runtimePlan.planName,
+        planContent: 'E2E 专属保养任务',
+        projectName: 'E2E UPKEEP 项目',
+        deviceId: device.id,
+        deviceIds: [String(device.id)],
+        planDate: formatLocalDateTime(new Date()).slice(0, 10),
+        maintenanceDomain: 'UPKEEP',
+        inspectionStatus: '0',
+        abnormalFlag: '0'
+      })
+      const taskId = dataOf(taskResponse)?.id
+      if (!taskId) throw new Error('UPKEEP 任务创建未返回 ID')
+      trackInspectionTask(fixtures, api, taskId)
+      pendingTask = dataOf(await api.getBusiness(`/mes/system/task/${taskId}`))
+      caseRecord.checks.push({
+        name: '发布专属 UPKEEP 方案后创建并回读到期保养任务',
+        passed: pendingTask?.maintenanceDomain === 'UPKEEP' &&
+          String(pendingTask?.inspectionPlanId || pendingTask?.planId) === String(runtimePlan.id) &&
+          String(pendingTask?.deviceId) === String(device.id),
+        details: `taskId=${taskId}, runtimePlan=${runtimePlan.id}, assignment=${assignmentId}`
+      })
+    }
 
     if (!pendingTask) {
       caseRecord.checks.push({
@@ -1502,17 +2049,17 @@ const runAuthenticatedCase = async (
     const rawDeviceId = Array.isArray(pendingTask.deviceIds)
       ? pendingTask.deviceIds[0]
       : pendingTask.deviceId ?? String(pendingTask.deviceIds || '').split(',')[0]
-    const deviceId = Number(rawDeviceId)
-    const hasDevice = Number.isFinite(deviceId) && deviceId > 0
+    const deviceId = rawDeviceId
+    const hasDevice = /^[1-9]\d*$/.test(String(deviceId))
     const maintenanceEventsOf = (timeline) =>
       (timeline?.list || []).filter(
         (item) =>
           item.sourceType === 'MAINTENANCE_TASK' && String(item.sourceId) === String(pendingTask.id)
       )
     const timelineBefore = hasDevice
-      ? await api.getBusiness(
+      ? dataOf(await api.getBusiness(
           `/mes/device-lifecycle/timeline?deviceId=${deviceId}&pageNo=1&pageSize=100`
-        )
+        ))
       : null
     const beforeCount = hasDevice ? maintenanceEventsOf(timelineBefore).length : 0
 
@@ -1520,7 +2067,7 @@ const runAuthenticatedCase = async (
     // PB-108：优先用真实维保项目主档，验证执行记录保存项目版本快照
     let snapshotItem = null
     try {
-      const itemTree = await api.getBusiness('/mes/maintenance-item/tree')
+      const itemTree = dataOf(await api.getBusiness('/mes/maintenance-item/tree'))
       const flatItems = []
       const walkItems = (nodes) => {
         for (const node of nodes || []) {
@@ -1529,7 +2076,10 @@ const runAuthenticatedCase = async (
         }
       }
       walkItems(Array.isArray(itemTree) ? itemTree : [])
-      snapshotItem = flatItems[0] || null
+      snapshotItem = flatItems.find((item) =>
+        item.categoryRoot === 'UPKEEP' && item.itemCode?.startsWith('E2E-MI-') &&
+        item.status === 0
+      ) || null
     } catch (error) {
       snapshotItem = null
     }
@@ -1544,6 +2094,7 @@ const runAuthenticatedCase = async (
       nextPlanDate: '2027-03-31',
       inspectionRemark: 'E2E 保养完成登记'
     }))
+    if (maintenanceRecord?.id) trackInspectionRecord(fixtures, api, maintenanceRecord.id)
     caseRecord.checks.push({
       name: '保养完成登记写 inspection_record 并保留项目/结果/耗材/下次日期',
       passed:
@@ -1654,7 +2205,7 @@ const runAuthenticatedCase = async (
     })
 
     const upkeepRoot = roots.find((node) => node.coreDomain === 'UPKEEP') || null
-    const subTypeCode = unique('E2E-UPKEEP').slice(0, 64)
+    const subTypeCode = unique('E2E-MAINT-UPKEEP').slice(0, 64)
     const createResult = trackRuleFixture(fixtures, api, await api.postBusiness('/mes/maintenance-type-rule/create', {
       coreDomain: 'UPKEEP',
       subTypeCode,
@@ -1690,6 +2241,63 @@ const runAuthenticatedCase = async (
         : '未在树中找到新增子类型'
     })
 
+    const initialRule = dataOf(await api.getBusiness(`/mes/maintenance-type-rule/get?id=${ruleId}`))
+    if (initialRule?.version !== 1) throw new Error('MAINT-015 新建规则必须为 v1')
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+    if (!device) return { token, api, partial: true, note: '无法创建专属设备，正式任务快照未验证' }
+    const planName = unique('E2E-MAINT-015')
+    const planFixture = await createPlanFixture(
+      api, fixtures, caseRecord, 'UPKEEP', planName, { subTypeCode }
+    )
+    if (!planFixture) return { token, api, partial: true, note: '缺少 UPKEEP 根项目，正式任务快照未验证' }
+    const assignmentId = fixtures.track(await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+      targetType: 'DEVICE', targetId: device.id, planId: planFixture.planId,
+      planVersion: 1, priority: 1, status: 0
+    }), 'MAINT-015 专属方案分配', async (id) => {
+      requireTrueResult(await api.deleteBusiness(`/mes/maintenance-plan-assignment/delete?id=${id}`), 'MAINT-015 分配清理')
+    })
+    const getRuntime = async () => {
+      const rows = requiredRows(dataOf(await api.getBusiness(
+        `/mes/system/plan/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(planName)}`
+      )), 'MAINT-015 运行计划')
+      const matches = rows.filter((row) =>
+        String(row.sourcePlanId) === String(planFixture.planId) &&
+        String(row.assignmentId) === String(assignmentId)
+      )
+      if (matches.length !== 1) throw new Error(`MAINT-015 专属运行计划数量异常 count=${matches.length}`)
+      return matches[0]
+    }
+    const createTask = async (runtime, date) => {
+      // Snapshot fields are deliberately absent: the backend must fill them from the runtime plan.
+      const created = dataOf(await api.postBusiness('/mes/system/task/add', {
+        planId: runtime.id, planName: runtime.planName,
+        planContent: 'E2E MAINT-015 正式保养任务', projectName: 'E2E MAINT-015 项目',
+        deviceId: device.id, deviceIds: [String(device.id)], planDate: date,
+        maintenanceDomain: 'UPKEEP', inspectionStatus: '0', abnormalFlag: '0'
+      }))
+      if (!created?.id) throw new Error('MAINT-015 正式任务创建未返回任务 VO')
+      trackInspectionTask(fixtures, api, created.id)
+      return dataOf(await api.getBusiness(`/mes/system/task/${created.id}`))
+    }
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planFixture.planId}`)
+    const runtime = await getRuntime()
+    fixtures.track(runtime.id, 'MAINT-015 运行计划', async (id) => {
+      assertBusinessSuccess(await api.deleteBusiness(`/mes/system/plan/${id}`), 'MAINT-015 运行计划清理')
+    })
+    const runtimeSnapshot = JSON.parse(runtime.configSnapshot)
+    const task = await createTask(runtime, formatLocalDateTime(new Date()).slice(0, 10))
+    caseRecord.checks.push({
+      name: '发布运行计划与正式任务自动固化专属类型规则 v1 完整快照',
+      passed: String(runtimeSnapshot.typeRuleId) === String(ruleId) &&
+        runtimeSnapshot.typeRuleVersion === 1 &&
+        runtimeSnapshot.subTypeCode === subTypeCode &&
+        hasTaskTypeSnapshot(task, initialRule) &&
+        task.maintenanceTypeRuleSnapshot === runtimeSnapshot.typeRuleSnapshot &&
+        String(task.planId) === String(runtime.id) &&
+        String(task.deviceId) === String(device.id),
+      details: `planId=${planFixture.planId}, assignment=${assignmentId}, runtime=${runtime.id}, task=${task.id}, rule=${ruleId}/v${task.maintenanceTypeRuleVersion}`
+    })
+
     const updatedName = `E2E 不定期保养 ${subTypeCode}`
     if (ruleId != null) {
       await api.putBusiness('/mes/maintenance-type-rule/update', {
@@ -1702,9 +2310,41 @@ const runAuthenticatedCase = async (
       const detail = dataOf(await api.getBusiness(`/mes/maintenance-type-rule/get?id=${ruleId}`))
       caseRecord.checks.push({
         name: '编辑 E2E 子类型后规则版本递增',
-        passed: detail?.version >= 2 && detail?.subTypeName === updatedName,
+        passed: detail?.version === 2 && detail?.subTypeName === updatedName,
         details: `version=${detail?.version}, name=${detail?.subTypeName}`
       })
+      const historical = dataOf(await api.getBusiness(`/mes/system/task/${task.id}`))
+      caseRecord.checks.push({
+        name: '类型规则升到 v2 后既有正式任务仍保持 v1 原始快照',
+        passed: hasTaskTypeSnapshot(historical, initialRule) &&
+          historical.maintenanceTypeRuleSnapshot === task.maintenanceTypeRuleSnapshot,
+        details: `taskId=${task.id}, historicalVersion=${historical?.maintenanceTypeRuleVersion}, ruleVersion=${detail?.version}`
+      })
+      const plan = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planFixture.planId}`))
+      await api.putBusiness('/mes/maintenance-plan/update', {
+        id: plan.id, planCode: plan.planCode, planName: plan.planName,
+        coreDomain: 'UPKEEP', subTypeCode,
+        items: [{ itemId: planFixture.itemId, seq: 1, standard: 'E2E 目视无异常' }],
+        cycles: [{ cycleType: 'TIME', cycleValue: 1, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
+      })
+      await api.putBusiness(`/mes/maintenance-plan/publish?id=${planFixture.planId}`)
+      const updatedRuntime = await getRuntime()
+      const tomorrow = new Date()
+      tomorrow.setDate(tomorrow.getDate() + 1)
+      const newTask = await createTask(updatedRuntime, formatLocalDateTime(tomorrow).slice(0, 10))
+      const oldTask = dataOf(await api.getBusiness(`/mes/system/task/${task.id}`))
+      caseRecord.checks.push({
+        name: '新方案版本任务采用规则 v2，历史任务 v1 不随重新发布改变',
+        passed: String(updatedRuntime.id) === String(runtime.id) &&
+          Number(updatedRuntime.sourcePlanVersion) === 2 &&
+          hasTaskTypeSnapshot(newTask, detail) &&
+          hasTaskTypeSnapshot(oldTask, initialRule) &&
+          oldTask.maintenanceTypeRuleSnapshot === task.maintenanceTypeRuleSnapshot,
+        details: `runtime=${updatedRuntime.id}, planVersion=${updatedRuntime.sourcePlanVersion}, newTask=${newTask.id}/v${newTask.maintenanceTypeRuleVersion}, oldTask=${task.id}/v${oldTask.maintenanceTypeRuleVersion}`
+      })
+      caseRecord.evidence.push(
+        `MAINT-015 专属正式任务 ${task.id}/v1 与 ${newTask.id}/v2；快照由后端从运行计划自动回填，未在任务请求注入规则字段。`
+      )
     }
 
     if (upkeepRoot && (upkeepRoot.children || []).length === 0) {
@@ -1726,13 +2366,11 @@ const runAuthenticatedCase = async (
 
     caseRecord.evidence.push(
       '真实调用 /mes/maintenance-type-rule/tree 校验固定核心域根节点，新增/编辑企业子类型并断言版本递增，' +
-        '随后在设备维保设置页验证维保类型树渲染；本例未执行正式任务/工单历史快照的回读对比'
+        '随后在设备维保设置页验证维保类型树渲染，并回读正式 UPKEEP 任务的新旧规则版本快照'
     )
     return {
       token,
-      api,
-      partial: true,
-      note: '已验证 E2E 类型树和规则版本；正式任务/工单历史快照未验证，不能登记完整 PASS'
+      api
     }
   }
 

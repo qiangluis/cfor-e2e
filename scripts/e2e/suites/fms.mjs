@@ -11,6 +11,8 @@ import {
 } from '../lib/browser.mjs'
 import { randomBytes } from 'node:crypto'
 import { findMenuRouteByComponent } from './base-partner.mjs'
+import { ownedCases, assertEnvironment } from '../fmshelper/contracts.mjs'
+import { runOwnedCase } from '../fmshelper/scenarios.mjs'
 
 export const cases = [
   'FMS-001',
@@ -264,11 +266,9 @@ async function runOpeningReadonlyChecks ({ api, page, record, caseRecord, output
 }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
-  if (caseId === 'FMS-003' || caseId === 'FMS-004') {
-    return {
-      notImplemented: true,
-      note: `${caseId} 尚未实现真实业务步骤，不能以账套存在或通用检查作为通过证据`
-    }
+  if (ownedCases.includes(caseId)) {
+    assertEnvironment()
+    return runOwnedCase({ caseId, page, record, caseRecord, outputDir })
   }
 
   const token = await login(page)

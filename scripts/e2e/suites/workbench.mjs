@@ -1,6 +1,16 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { decryptResponse, ENCRYPT_HEADER } from '../lib/crypto.mjs'
+import { config } from '../config/index.mjs'
+import {
+  WORKBENCH_FIXTURE_CASES,
+  assertLocalWorkbenchWriteTarget,
+  inspectWorkbenchFixtureTarget,
+  inspectWorkbenchReadGate,
+  isWorkbenchWriteFixturesEnabled,
+  workbenchReadBlockNote
+} from '../workbenchhelper/fixture.mjs'
+import { runOwnedWorkbenchCase } from '../workbenchhelper/owned.mjs'
 
 // 工作台/index 门户化改造（PB-342~PB-377）真实浏览器案例。
 export const cases = [
@@ -160,7 +170,7 @@ export function validateWorkbenchReportPage (response, payload, query, userId, s
   return data
 }
 
-async function readBrowserResponsePayload (response) {
+export async function readBrowserResponsePayload (response) {
   const headers = response.headers()
   const text = await response.text()
   return headers[ENCRYPT_HEADER.toLowerCase()] === 'true'
@@ -195,21 +205,6 @@ export async function captureWorkbenchReports (page, action, userId, scope = 'se
   return { pages, missing }
 }
 
-async function reportIdentity (api) {
-  const permission = await api.get('/system/auth/get-permission-info')
-  const userId = permission?.data?.user?.id
-  const permissions = permission?.data?.permissions || []
-  if (permission?.code !== 0 || !userId || !Array.isArray(permissions)) {
-    return { gap: '未获得有效当前用户及查询权限，未执行报告范围请求' }
-  }
-  const unrestricted = permissions.includes('*:*:*')
-  const missing = ['pm:daily-report:query', 'crm:work-report:query']
-    .filter((key) => !unrestricted && !permissions.includes(key))
-  return missing.length
-    ? { gap: `当前用户缺少查询权限：${missing.join('、')}` }
-    : { userId, unrestricted }
-}
-
 function reportPartial (token, api, caseRecord, gaps) {
   const note = `未验收：${gaps.join('；')}`
   caseRecord.notes.push(note)
@@ -234,20 +229,61 @@ export function summarizeWorkbenchReports (pages, period, today) {
   })
 }
 
-async function waitForReportRendering (panel) {
+export async function waitForReportRendering (panel) {
   await panel.locator('.focus-body .el-loading-mask').waitFor({ state: 'hidden', timeout: 15000 })
   await panel.locator('.focus-body .work-list-row, .focus-body .el-empty').first()
     .waitFor({ state: 'visible', timeout: 15000 })
 }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
-  const token = await (dependencies.login || login)(page)
-  const api = (dependencies.createApiClient || createApiClient)({ token, record })
+  const writeEnabled = isWorkbenchWriteFixturesEnabled(dependencies.env || process.env) &&
+    WORKBENCH_FIXTURE_CASES.has(caseId)
+  const settings = dependencies.workbenchConfig || config
+  if (writeEnabled) assertLocalWorkbenchWriteTarget(settings)
+  const session = await (dependencies.login || login)(page, writeEnabled ? { returnContext: true } : {})
+  const token = typeof session === 'string' ? session : session?.token
+  const api = (dependencies.createApiClient || createApiClient)({
+    token, record, ...(writeEnabled ? { tenantId: session?.tenantId } : {})
+  })
   caseRecord.checks.push({
     name: '真实登录成功',
     passed: Boolean(token),
     details: '登录后携带真实令牌打开工作台并校验待办中心'
   })
+
+  if (writeEnabled) {
+    const targetGate = await inspectWorkbenchFixtureTarget({
+      api, settings, sessionTenantId: session?.tenantId
+    })
+    if (!targetGate.allowed) {
+      return reportPartial(token, api, caseRecord, [targetGate.reason])
+    }
+    caseRecord.notes.push('opt-in 已确认 local/租户 1；执行本轮专属最小角色/账号夹具，不修改共享授权、门户或业务记录。')
+    return (dependencies.runOwnedWorkbenchCase || runOwnedWorkbenchCase)({
+      caseId, page, token, api, record, caseRecord, outputDir, settings,
+      sessionTenantId: session?.tenantId
+    }, {
+      ...dependencies,
+      runReadOnlyCase: runCase,
+      readBrowserResponsePayload,
+      captureWorkbenchReports,
+      waitForReportRendering
+    })
+  }
+
+  let readGate
+  if (WORKBENCH_FIXTURE_CASES.has(caseId)) {
+    readGate = await inspectWorkbenchReadGate({ api, caseId })
+    caseRecord.evidence.push(JSON.stringify({
+      scope: 'E2E-WBF', caseId, readOnly: true, allowed: readGate.allowed,
+      missingPermissions: readGate.missingPermissions,
+      missingMenuDefinitions: readGate.missingMenuDefinitions,
+      diagnostics: readGate.diagnostics
+    }))
+    if (!readGate.allowed) {
+      return reportPartial(token, api, caseRecord, [workbenchReadBlockNote(readGate)])
+    }
+  }
 
   if (caseId === 'WBF-001') {
     const { todoPanel, todoPage } = await openWorkbenchAndWaitForTodo(
@@ -325,6 +361,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     await (dependencies.saveScreenshot || saveScreenshot)(
       page, outputDir, 'wbf002-workbench-todo-dialog', record
     )
+    await dialog.locator('.el-dialog__headerbtn').first().click()
+    await dialog.waitFor({ state: 'hidden' })
     caseRecord.evidence.push('WBF-002 校验待办在门户内弹窗打开原始单据，不离开工作台路由')
     return { token, api }
   }
@@ -379,8 +417,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'WBF-004') {
-    const identity = await reportIdentity(api)
-    if (identity.gap) return reportPartial(token, api, caseRecord, [identity.gap])
+    const identity = readGate
     const { pages, missing } = await captureWorkbenchReports(
       page, () => (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH), identity.userId
     )
@@ -609,8 +646,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   if (caseId === 'WBF-008') {
     const gaps = ['共享用户未改选或保存周报格式；未验证精确保存值、刷新后回显、用户隔离及完整偏好还原',
       '提醒仅核对文案，未逐项核对已填/未填及待审批数值']
-    const identity = await reportIdentity(api)
-    if (identity.gap) return reportPartial(token, api, caseRecord, [...gaps, identity.gap])
+    const identity = readGate
     const { missing } = await captureWorkbenchReports(
       page, () => (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH), identity.userId
     )
@@ -658,7 +694,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'WBF-009') {
     // 多门户与角色绑定：校验登录权限信息下发的门户区块与工作台实际渲染一致（PB-373~377）
-    const permission = await api.get('/system/auth/get-permission-info')
+    const permission = readGate.permissionPayload
     const portal = permission?.data
     const configured = Array.isArray(portal?.portalSections)
     const portalSections = configured ? portal.portalSections : []
@@ -668,21 +704,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       details: `门户编码=${portal?.portalCode || '（未配置，展示全部区块）'}，区块数=${portalSections.length}`
     })
 
-    await openRoute(page, WORKBENCH_PATH)
+    await (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH)
     await page.locator('.personal-workbench').first().waitFor({ state: 'visible' })
 
     const visibility = {}
     for (const [key, selector] of Object.entries(PORTAL_SECTION_SELECTORS)) {
-      visibility[key] = (await page.locator(selector).count()) > 0
+      visibility[key] = await page.locator(selector).first().isVisible()
     }
     const visibleKeys = Object.keys(visibility).filter((key) => visibility[key])
 
     if (portalSections.length === 0) {
-      // 未配置门户时展示全部区块：允许按权限或数据为空省略个别面板，但主区块应存在。
+      const missing = Object.keys(PORTAL_SECTION_SELECTORS).filter((key) => !visibility[key])
       caseRecord.checks.push({
-        name: '未命中门户时工作台展示默认区块组合',
-        passed: visibleKeys.length > 0,
-        details: `可见区块=${visibleKeys.join('/') || '（无）'}`
+        name: '未命中门户时工作台展示默认全部区块',
+        passed: missing.length === 0,
+        details: `可见区块=${visibleKeys.join('/') || '（无）'}；缺失=${missing.join('/') || '无'}`
       })
     } else {
       const missing = portalSections.filter((key) => visibility[key] !== true)
@@ -694,11 +730,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       })
     }
 
-    await saveScreenshot(page, outputDir, 'wbf009-portal-sections', record)
-    caseRecord.evidence.push('WBF-009 校验按角色命中的门户区块组合在工作台真实显隐')
+    await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, 'wbf009-portal-sections', record)
+    caseRecord.evidence.push('WBF-009 仅校验当前登录账号的门户区块真实显隐，未覆盖其他角色分支')
     return {
-      token, api, notImplemented: !configured,
-      note: '仅验证未配置门户的默认区块；需补真实角色与门户映射及无权限账号反例'
+      token, api, partial: true,
+      note: portalSections.length === 0
+        ? '仅验证未配置门户的默认全部区块；未验证专属角色命中 portalCode/portalSections 与无权限账号反例'
+        : '仅验证当前账号配置区块；未验证专属角色映射、无权限账号反例及未配置门户的默认全部区块'
     }
   }
 
@@ -945,8 +983,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'WBF-012') {
-    const identity = await reportIdentity(api)
-    if (identity.gap) return reportPartial(token, api, caseRecord, [identity.gap])
+    const identity = readGate
     const initial = await captureWorkbenchReports(
       page, () => (dependencies.openRoute || openRoute)(page, WORKBENCH_PATH), identity.userId
     )
@@ -987,14 +1024,36 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         const expected = summarizeWorkbenchReports(captured.pages, step.period, today)
         const periodLabel = { month: '本月', quarter: '本季度', year: '本年度' }[step.period]
         const scopeLabel = step.scope === 'self' ? '本人' : '团队（按数据权限）'
-        await page.waitForFunction(({ expected, periodLabel, scopeLabel }) => {
-          const rows = [...document.querySelectorAll('.report-stats-dialog .el-table__body tr')]
-            .map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent.trim()))
-          const selected = [...document.querySelectorAll('.report-stats-dialog label.el-radio-button.is-active')]
-            .map((label) => label.textContent.trim())
-          return selected.includes(periodLabel) && selected.includes(scopeLabel) &&
-            JSON.stringify(rows) === JSON.stringify(expected)
-        }, { expected, periodLabel, scopeLabel }, { timeout: 15000 })
+        // 轮询比对并在超时时输出实际值，避免 waitForFunction 只报超时无法定位差异。
+        const readStats = () => page.evaluate(() => {
+          const dialog = [...document.querySelectorAll('.report-stats-dialog')].find((el) => {
+            const style = window.getComputedStyle(el)
+            return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetHeight > 0
+          })
+          if (!dialog) return { visible: false, rows: [], selected: [] }
+          return {
+            visible: true,
+            rows: [...dialog.querySelectorAll('.el-table__body tr')]
+              .map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent.trim())),
+            selected: [...dialog.querySelectorAll('label.el-radio-button.is-active')]
+              .map((label) => label.textContent.trim())
+          }
+        })
+        const statsDeadline = Date.now() + 20000
+        let actualStats = null
+        while (Date.now() < statsDeadline) {
+          actualStats = await readStats()
+          if (actualStats.visible && actualStats.selected.includes(periodLabel) &&
+            actualStats.selected.includes(scopeLabel) &&
+            JSON.stringify(actualStats.rows) === JSON.stringify(expected)) break
+          await page.waitForTimeout(250)
+        }
+        if (!actualStats?.visible || !actualStats.selected.includes(periodLabel) ||
+          !actualStats.selected.includes(scopeLabel) ||
+          JSON.stringify(actualStats.rows) !== JSON.stringify(expected)) {
+          throw new Error(`${step.period}/${step.scope}报统计表数值或范围不符：` +
+            `实际=${JSON.stringify(actualStats)}；期望=${JSON.stringify({ rows: expected, periodLabel, scopeLabel })}`)
+        }
         caseRecord.checks.push({
           name: `${step.period}/${step.scope}真实范围请求与统计数值一致（PB-364）`,
           passed: true,

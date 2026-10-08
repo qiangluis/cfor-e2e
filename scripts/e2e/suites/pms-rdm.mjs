@@ -1,5 +1,6 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute } from '../lib/browser.mjs'
+import { RDM_CASES, runRdmWriteCase } from '../fixtures/rdm.mjs'
 
 export const cases = [
   'RDM-001',
@@ -312,6 +313,17 @@ export const runRdmEvidenceContract = async ({ caseId, api, caseRecord }) => {
 export const runCase = async ({ caseId, page, record, caseRecord }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
+
+  if (RDM_CASES.has(caseId)) {
+    const expectedPaths = new Set()
+    const result = await runRdmWriteCase({
+      caseId,
+      api,
+      caseRecord,
+      expectedPaths
+    })
+    return { token, api, ...result }
+  }
 
   if (RDM_UNTESTED_STEPS[caseId]) {
     const result = await runRdmEvidenceContract({ caseId, api, caseRecord })

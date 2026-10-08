@@ -8,10 +8,13 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
   allDefinitions,
+  groupDefinitionsBySuite,
   parallelSafeCases,
   partitionDefinitions,
   processTreeHasExited,
   resultFromChildReport,
+  runGroupedChild,
+  runGroupedPool,
   runPool,
   selectDefinitions,
   summarizeResults,
@@ -28,6 +31,17 @@ test('parallel plan keeps safe cases disjoint from serial cases', () => {
   assert.equal([...parallelIds].some((id) => serialIds.has(id)), false)
   assert.ok(parallelIds.size > 0)
   assert.ok(serialIds.size > 0)
+})
+
+test('parallel safe cases are grouped by suite for session reuse', () => {
+  const groups = groupDefinitionsBySuite([
+    { id: 'A', suite: 'workbench' },
+    { id: 'B', suite: 'workbench' },
+    { id: 'C', suite: 'procurement' }
+  ])
+  assert.deepEqual(groups.map((group) => group.suite), ['workbench', 'procurement'])
+  assert.deepEqual(groups[0].definitions.map((item) => item.id), ['A', 'B'])
+  assert.deepEqual(groups[1].definitions.map((item) => item.id), ['C'])
 })
 
 test('default selection excludes designed and blocked cases', () => {
@@ -78,6 +92,22 @@ test('mixed explicit selection cannot silently drop a requested case', () => {
   )
 })
 
+test('suite filtering rejects unknown suites and supports all as an explicit wildcard', () => {
+  assert.throws(
+    () => selectDefinitions({ suites: ['smoke', 'typo-suite'] }),
+    /未知 suite：typo-suite/
+  )
+  const selected = selectDefinitions({
+    definitions: [
+      { id: 'A', suite: 'alpha' },
+      { id: 'B', suite: 'beta' }
+    ],
+    suites: ['all'],
+    safeOnly: false
+  })
+  assert.deepEqual(selected.map((item) => item.id), ['A', 'B'])
+})
+
 test('batch summary exposes failures and partial cases for one retest list', () => {
   const summary = summarizeResults([
     { caseId: 'A', status: 'PASS' },
@@ -112,6 +142,17 @@ test('conditionally mutating quality cases stay in the serial pool', () => {
   assert.equal(parallelIds.has('QUALITY-TRACE-001'), false)
   assert.equal(serialIds.has('QUALITY-NG-001'), true)
   assert.equal(serialIds.has('QUALITY-TRACE-001'), true)
+})
+
+test('owned write fixtures cannot enter the automatic read-only worker pool', () => {
+  const writeCases = [
+    'PROC-005', 'QUALITY-METRIC-001',
+    'RDM-001', 'RDM-002', 'RDM-003', 'RDM-004', 'RDM-005', 'RDM-006'
+  ]
+  for (const caseId of writeCases) {
+    assert.equal(parallelSafeCases.has(caseId), false, caseId)
+    assert.throws(() => selectDefinitions({ cases: [caseId] }), /不属于并行只读池/)
+  }
 })
 
 test('read-only WBF-008 is eligible for the parallel pool', () => {
@@ -187,6 +228,157 @@ test('expected PARTIAL exit 1 stays PARTIAL but fatal exits override stale repor
   assert.equal(resultFromChildReport(args).status, 'PARTIAL')
   assert.equal(resultFromChildReport({ ...args, exitCode: 2 }).status, 'ERROR')
   assert.equal(resultFromChildReport({ ...args, signal: 'SIGTERM' }).status, 'ERROR')
+})
+
+test('a grouped runner may exit 1 for another case without invalidating PASS cases', () => {
+  const result = resultFromChildReport({
+    definition: { id: 'A', suite: 'unit', title: 'A' },
+    record: {
+      cases: [
+        { id: 'A', status: 'PASS', notes: [] },
+        { id: 'B', status: 'FAIL', notes: ['断言失败'] }
+      ]
+    },
+    exitCode: 1,
+    signal: null,
+    grouped: true
+  })
+  assert.equal(result.status, 'PASS')
+})
+
+test('grouped exit 1 with an all-PASS report is still an error', () => {
+  const result = resultFromChildReport({
+    definition: { id: 'A', suite: 'unit', title: 'A' },
+    record: { cases: [{ id: 'A', status: 'PASS', notes: [] }] },
+    exitCode: 1,
+    signal: null,
+    grouped: true
+  })
+  assert.equal(result.status, 'ERROR')
+})
+
+test('grouped child starts one runner with shared-session flags and maps each case report', async (t) => {
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfor-grouped-child-'))
+  t.after(() => fs.rmSync(batchDir, { recursive: true, force: true }))
+  const definitions = [
+    { id: 'A', suite: 'workbench', title: 'A' },
+    { id: 'B', suite: 'workbench', title: 'B' }
+  ]
+  const calls = []
+  const child = new EventEmitter()
+  const resultPromise = runGroupedChild({
+    definitions,
+    batchDir,
+    headless: false,
+    caseTimeoutMs: 1000,
+    spawnChild: (_executable, args, options) => {
+      calls.push({ args, options })
+      const groupDir = path.join(batchDir, 'workers', 'workbench')
+      fs.writeFileSync(
+        path.join(groupDir, 'result.json'),
+        JSON.stringify({
+          cases: [
+            { id: 'A', status: 'PASS', notes: [] },
+            { id: 'B', status: 'FAIL', notes: ['断言失败'] }
+          ]
+        })
+      )
+      setImmediate(() => child.emit('close', 1, null))
+      return child
+    },
+    terminateChild: () => () => {},
+    processTreeExited: () => true
+  })
+  const result = await resultPromise
+
+  assert.equal(calls.length, 1)
+  const { args, options } = calls[0]
+  assert.deepEqual(
+    args.filter((value) => value === '--case').length,
+    2
+  )
+  assert.deepEqual(
+    args.slice(0, 5),
+    [
+      path.join(path.dirname(fileURLToPath(import.meta.url)), '../runner.mjs'),
+      '--case',
+      'A',
+      '--case',
+      'B'
+    ]
+  )
+  assert.ok(args.includes('--reuse-session'))
+  assert.ok(args.includes('--continue-on-failure'))
+  assert.ok(args.includes('--headed'))
+  assert.equal(options.env.CFOR_E2E_OUT, path.join(batchDir, 'workers', 'workbench'))
+  assert.deepEqual(result.results.map((item) => item.status), ['PASS', 'FAIL'])
+  assert.equal(result.results[0].report, path.join(batchDir, 'workers', 'workbench', 'result.json'))
+})
+
+test('grouped child rejects mixed suites and duplicate case ids', async () => {
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfor-grouped-validation-'))
+  try {
+    assert.throws(
+      () => runGroupedChild({
+        definitions: [{ id: 'A', suite: 'one' }, { id: 'B', suite: 'two' }],
+        batchDir,
+        headless: true,
+        caseTimeoutMs: 1000,
+        spawnChild: () => { throw new Error('must not spawn') }
+      }),
+      /只能运行同一 suite/
+    )
+    assert.throws(
+      () => runGroupedChild({
+        definitions: [{ id: 'A', suite: 'one' }, { id: 'A', suite: 'one' }],
+        batchDir,
+        headless: true,
+        caseTimeoutMs: 1000,
+        spawnChild: () => { throw new Error('must not spawn') }
+      }),
+      /不能包含重复/
+    )
+  } finally {
+    fs.rmSync(batchDir, { recursive: true, force: true })
+  }
+})
+
+test('grouped pool runs one unit per suite and keeps queued cases together when aborted', async () => {
+  const groups = [
+    {
+      groupId: 'one',
+      suite: 'one',
+      definitions: [{ id: 'A', suite: 'one' }, { id: 'B', suite: 'one' }]
+    },
+    {
+      groupId: 'two',
+      suite: 'two',
+      definitions: [{ id: 'C', suite: 'two' }]
+    }
+  ]
+  const started = []
+  const results = await runGroupedPool(
+    groups,
+    { workers: 1 },
+    async ({ group, definitions }) => {
+      started.push(group.suite)
+      return {
+        groupId: group.groupId,
+        definitions,
+        terminationWaitTimedOut: true,
+        results: definitions.map((definition) => ({
+          caseId: definition.id,
+          suite: definition.suite,
+          status: 'ERROR'
+        }))
+      }
+    }
+  )
+  assert.deepEqual(started, ['one'])
+  assert.equal(results.length, 2)
+  assert.deepEqual(results[1].results.map((item) => item.caseId), ['C'])
+  assert.equal(results[1].results[0].status, 'SKIPPED')
+  assert.equal(results[1].definitions.length, 1)
 })
 
 test('termination escalation can be cancelled after confirmed process-group exit', async () => {

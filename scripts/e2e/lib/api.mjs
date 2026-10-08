@@ -124,13 +124,21 @@ export const createApiClient = ({ token = '', tenantId = config.tenantId, check,
   }
 }
 
-export async function checkHealth () {
-  if (!config.apiHealthUrl) return { response: null, body: null }
-  const response = await fetch(config.apiHealthUrl, {
-    signal: AbortSignal.timeout(config.requestTimeoutMs)
-  })
-  const body = await response.json().catch(() => ({}))
-  return { response, body }
+export async function checkHealth ({ timeoutMs = Math.min(config.requestTimeoutMs, 5000) } = {}) {
+  if (!config.apiHealthUrl) return { response: null, body: null, error: null }
+  try {
+    const response = await fetch(config.apiHealthUrl, {
+      signal: AbortSignal.timeout(timeoutMs)
+    })
+    const body = await response.json().catch(() => ({}))
+    return { response, body, error: null }
+  } catch (error) {
+    return {
+      response: null,
+      body: null,
+      error: error instanceof Error ? error.message : String(error)
+    }
+  }
 }
 
 export async function apiHealth ({ check } = {}) {

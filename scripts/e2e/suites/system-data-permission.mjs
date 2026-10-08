@@ -1,12 +1,15 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { cases as aiDataCases, runCase as runAiDataCase } from '../fixtures/ai-data-permission.mjs'
 
-export const cases = ['AUTH-DATA-003', 'AUTH-DATA-005', 'AUTH-DATA-006', 'PB006-001']
+export const cases = ['AUTH-DATA-003', 'AUTH-DATA-005', 'AUTH-DATA-006', 'PB006-001', ...aiDataCases]
 
 const DEPT_CUSTOM = 2
 const dataOf = (response) => response?.data ?? response
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+export const runCase = async (context, dependencies = {}) => {
+  const { caseId, page, record, caseRecord, outputDir } = context
+  if (aiDataCases.includes(caseId)) return runAiDataCase(context, dependencies)
   const token = await login(page)
   const api = createApiClient({ token, record })
 

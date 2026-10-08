@@ -23,8 +23,8 @@ node scripts/e2e/runner.mjs --suite all --headed
 node scripts/e2e/runner.mjs \
   --case COST-002 --case COST-003 --case COST-005 \
   --continue-on-failure
-# 服务只需启动一次；并行批次会独立启动 Chrome、进程和证据目录
-CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs --workers 2
+# 服务只需启动一次；按 suite 分组，每组一个 Chrome/进程/证据目录，组内复用一次登录
+CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs --workers 2 --headed
 # 查看并行只读组和后续串行组
 node scripts/e2e/parallel-runner.mjs --plan
 # 统一重启后只复测上一个批次的失败/部分通过案例
@@ -43,6 +43,8 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 | `CFOR_PURCHASE_APPROVER_USERNAME` / `CFOR_PURCHASE_APPROVER_PASSWORD` | 请购 BPM 第一段采购负责人账号，默认用户名 `purmgr01`，密码只从环境或 local.env 注入 |
 | `CFOR_FINANCE_APPROVER_USERNAME` / `CFOR_FINANCE_APPROVER_PASSWORD` | 请购 BPM 第二段财务复核账号，默认用户名 `finrvw01`，密码只从环境或 local.env 注入 |
 | `CFOR_FINAL_APPROVER_USERNAME` / `CFOR_FINAL_APPROVER_PASSWORD` | 请购 BPM 第三段负责人终审账号，默认用户名 `opsmgr01`，密码只从环境或 local.env 注入 |
+| `CFOR_WAREHOUSE_APPROVER_USERNAME` / `CFOR_WAREHOUSE_APPROVER_PASSWORD` | WMS 调拨/借用 BPM 仓储负责人账号，默认用户名 `whmgr01`，密码只从环境或 local.env 注入 |
+| `CFOR_WAREHOUSE_FINAL_APPROVER_USERNAME` / `CFOR_WAREHOUSE_FINAL_APPROVER_PASSWORD` | WMS 调拨/借用 BPM 库存复核终审账号，默认用户名 `invmgr01`，密码只从环境或 local.env 注入 |
 | `CFOR_CHROME_PATH` | 可选，本机 Chrome 可执行文件 |
 | `CFOR_E2E_OUT` | 证据目录，默认 `/tmp/cfor-e2e` |
 | `CFOR_E2E_PARALLEL_WORKERS` | 并行 worker 数，默认 3；只用于登记为无共享写状态的案例 |
@@ -63,10 +65,14 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 - 默认 `FAIL/BLOCKED` 立即停止；只有显式 `--continue-on-failure` 才会收集后续案例。
   continue 模式会先关闭失败案例的 browser/context，再为下一例创建隔离上下文，避免失败页面、登录态和监听器污染下一例。
   `PARTIAL` 按现有规则继续执行；未实现、`DESIGNED`、`BLOCKED` 不会升级为 PASS。
-- `parallel-runner.mjs` 只并行执行已登记为无共享写状态的案例；每个案例独立子进程、
-  Chrome 上下文和证据目录，失败不会停止其他案例。输出批次下的
-  `parallel-result.json` 和 `parallel-summary.md` 是统一重启/复测清单。涉及单据、审批、
-  库存、初始化、Job 或账号权限写入的案例保留到串行阶段。
+- `parallel-runner.mjs` 只并行执行已登记为无共享写状态的案例；同一 suite 的案例在一个
+  runner 子进程和 Chrome 会话中按顺序执行并复用登录，不同 suite 使用独立的进程、浏览器
+  会话和证据目录。`--headed` 会让实际 Chrome 可见，便于观察自动化过程。涉及单据、审批、
+  库存、初始化、Job 或账号权限写入的案例保留到串行阶段，写侧仍由串行流程执行。
+  输出批次下的 `parallel-result.json` 和 `parallel-summary.md` 是统一重启/复测清单。
+  一个 suite 内的 FAIL/BLOCKED 在并行 runner 的 continue 模式下会关闭失败的 browser/context，
+  后续案例重新登录；PARTIAL 按现有规则继续。因此“按 suite 复用登录”不保证失败后整组始终
+  只有一次登录，且浏览器/进程/证据目录隔离不等于数据库回滚或业务数据隔离。
 - 并行批次完成后集中修复；应用代码需要重新加载时统一构建、重启，再使用 `--case`
   重跑失败、部分通过和超时案例。仅改脚本、断言或路由定位时无需重启。
   不要为每个案例单独重启。`runner.mjs` 的多个 `--case` 参数可放在同一条串行命令中；
@@ -99,7 +105,7 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 | 命令 | 执行模型 | 失败处理 | 适用范围 |
 | --- | --- | --- | --- |
 | `runner.mjs` | 串行；默认复用一个 browser/context | 默认 fail-stop；`--continue-on-failure` 时失败后销毁当前 browser/context，再隔离启动下一例 | 有顺序依赖、业务写侧、多角色或需要稳定上下文的案例 |
-| `parallel-runner.mjs` | 多 worker；每例独立子进程、Chrome、context 和证据目录 | 其他 worker 不受单例失败影响，批次结束统一汇总 | 仅适用于静态 `parallelSafeCases` 白名单；不会自动补 suite 或业务前置 |
+| `parallel-runner.mjs` | 多 worker；按 suite 分组，每组一个子进程和 Chrome/context，组内复用登录并串行执行 | 其他 suite 不受单例失败影响；失败 suite 内后续案例重新隔离登录，批次结束统一汇总 | 仅适用于静态 `parallelSafeCases` 白名单；不会自动补 suite 或业务前置 |
 
 `parallel-runner.mjs --plan` 的 `serial` 是“未进入并行白名单”的集合，可能包含
 `PARTIAL`；它不是当前可直接执行的串行 READY 清单。

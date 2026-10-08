@@ -354,6 +354,7 @@ test('WBF-002 waits for the real non-empty todo response before accepting a row'
   assert.equal(fixture.result.partial, undefined)
   assert.deepEqual(fixture.evaluations, [{ expectedRowCount: 1 }])
   assert.match(fixture.caseRecord.checks[1].details, /响应 rows=1，DOM rows=1/)
+  assert.ok(fixture.events.includes('click:.el-dialog__headerbtn'))
 })
 
 test('todo capture ignores login-document responses and cleans up its request listener', async () => {

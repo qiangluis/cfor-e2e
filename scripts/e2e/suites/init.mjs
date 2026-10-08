@@ -2,7 +2,11 @@ import { config } from '../config/index.mjs'
 import * as XLSX from 'xlsx'
 import { publicRequest } from '../lib/api.mjs'
 import { findMenuRouteByComponent } from './base-partner.mjs'
+import { ownedInitCases, runOwnedInitCase } from '../owned-init/fixtures.mjs'
+import { cases as initGapCases, runCase as runInitGapCase } from '../fixtures/init-gaps.mjs'
+import { cases as materialCapabilityCases, runCase as runMaterialCapabilityCase } from '../fixtures/material-capability.mjs'
 import {
+  login,
   loginWithCredentials,
   openRegistration,
   openRoute as openRouteDefault,
@@ -159,7 +163,11 @@ const requestApi = (page, method, path, options) =>
     }
   })
 
-export const runCase = async ({ caseId, page, caseRecord, record }, dependencies = {}) => {
+export const runCase = async (context, dependencies = {}) => {
+  const { caseId, page, caseRecord, record } = context
+  if (ownedInitCases.includes(caseId)) return runOwnedInitCase(context, dependencies)
+  if (initGapCases.includes(caseId)) return runInitGapCase(context, dependencies)
+  if (materialCapabilityCases.includes(caseId)) return runMaterialCapabilityCase(context, dependencies)
   assertSafeCaseScope(caseRecord, caseId)
   const navigate = dependencies.openRoute || openRouteDefault
   let permissionMenus
@@ -215,38 +223,35 @@ export const runCase = async ({ caseId, page, caseRecord, record }, dependencies
       password = config.registerPassword
     }
 
-    // Use an isolated page for the registration/reuse branch so the current
-    // administrator page is never reused for a second credential context.
-    const authPage = await page.context().newPage()
-    let token
-    try {
-      token = await loginWithCredentials(authPage, { tenantName, username, password })
-      currentToken = token
-      record.tokenAvailable = Boolean(token)
-      caseRecord.checks.push({
-        name: '登录即序科技并获得访问令牌',
-        passed: Boolean(token),
-        details: `tenant=${tenantName}, username=${username}`
-      })
-      const currentUrl = new URL(authPage.url())
-      caseRecord.checks.push({
-        name: '登录后停留普通工作台',
-        passed:
-          currentUrl.pathname === '/index' &&
-          currentUrl.searchParams.get('mode') !== 'collaboration',
-        details: authPage.url()
-      })
-      await openRoute(authPage, '/systemInit', {
-        readySelector: '.system-init',
-        readyTimeoutMs: 90000
-      })
-    } finally {
-      await authPage.close().catch(() => {})
-    }
+    // Keep the first login on the suite's primary page so later cases reuse
+    // the same browser context instead of authenticating again.
+    const defaultIdentity = tenantName === config.tenantName && username === config.username
+    const token = defaultIdentity
+      ? await login(page)
+      : await loginWithCredentials(page, { tenantName, username, password })
+    currentToken = token
+    record.tokenAvailable = Boolean(token)
+    caseRecord.checks.push({
+      name: '登录即序科技并获得访问令牌',
+      passed: Boolean(token),
+      details: `tenant=${tenantName}, username=${username}`
+    })
+    const currentUrl = new URL(page.url())
+    caseRecord.checks.push({
+      name: '登录后停留普通工作台',
+      passed:
+        currentUrl.pathname === '/index' &&
+        currentUrl.searchParams.get('mode') !== 'collaboration',
+      details: page.url()
+    })
+    await openRoute(page, '/systemInit', {
+      readySelector: '.system-init',
+      readyTimeoutMs: 90000
+    })
     caseRecord.checks.push({
       name: '初始化入口可进入',
       passed: Boolean(token),
-      details: '初始化入口已在隔离登录页完成导航'
+      details: '初始化入口已在套件主页面完成导航，后续案例复用同一登录态'
     })
     caseRecord.evidence.push('企业存在性查询、注册/复用分支、登录、普通工作台和初始化入口')
     return { token }

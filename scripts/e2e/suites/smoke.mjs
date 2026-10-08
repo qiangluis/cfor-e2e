@@ -6,10 +6,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   const { response, body } = await checkHealth()
   caseRecord.checks.push({
     name: '后端健康检查',
-    passed: response ? response.ok && body?.status === 'UP' : true,
+    passed: Boolean(response && response.ok && body?.status === 'UP'),
     details: response
       ? `${config.apiHealthUrl}`
-      : '生产环境未暴露 actuator，改由真实登录和业务 API 验证'
+      : '健康端点不可用或超时；继续通过真实登录和业务 API 验证主链路'
   })
 
   const token = await login(page)

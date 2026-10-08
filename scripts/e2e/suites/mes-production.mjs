@@ -199,9 +199,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         Array.isArray(inboundRows),
       details: `works=${workRows.length}, inbound=${inboundRows.length}`
     })
-    const invalidClose = await api.request('POST', '/mes/prodWork/close', {
-      id: '__not_exists__'
-    })
+    // 关闭接口契约是 List<CloseProdWorkRequest>；用不存在的工单号验证业务拒绝，而非触发 JSON 形状错误。
+    const invalidClose = await api.request('POST', '/mes/prodWork/close', [{
+      id: '__not_exists__',
+      prodWorkOrderId: '__not_exists__',
+      reason: 'E2E 校验不存在工单应被拒绝'
+    }])
     caseRecord.checks.push({
       name: '不存在工单的完工/入库请求被拒绝',
       passed: invalidClose?.code !== 0,

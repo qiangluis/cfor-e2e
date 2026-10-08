@@ -34,13 +34,6 @@ export const parallelSafeCases = new Set([
   'PROC-002',
   'PROC-003',
   'PROC-004',
-  'PROC-005',
-  'RDM-001',
-  'RDM-002',
-  'RDM-003',
-  'RDM-004',
-  'RDM-005',
-  'RDM-006',
   'MES-PROD-003',
   'PB038-003',
   'PB149-OUTSOURCE-WIP-001',
@@ -51,7 +44,6 @@ export const parallelSafeCases = new Set([
   'QUALITY-IQC-001',
   'QUALITY-IPQC-001',
   'QUALITY-OQC-001',
-  'QUALITY-METRIC-001',
   'COST-001',
   'COST-004',
   'IOT-004',
@@ -119,8 +111,14 @@ export function selectDefinitions ({
   safeOnly = true
 } = {}) {
   const caseFilter = new Set(cases.filter(Boolean))
-  const suiteFilter = new Set(suites.filter(Boolean))
+  const requestedSuites = suites.filter(Boolean)
+  const suiteFilter = new Set(requestedSuites.filter((suite) => suite !== 'all'))
   const knownDefinitions = new Map(definitions.map((definition) => [definition.id, definition]))
+  const knownSuites = new Set(definitions.map((definition) => definition.suite))
+  const unknownSuites = [...suiteFilter].filter((suite) => !knownSuites.has(suite))
+  if (unknownSuites.length) {
+    throw new Error(`未知 suite：${unknownSuites.join(', ')}`)
+  }
   if (caseFilter.size) {
     const unknown = [...caseFilter].filter((id) => !knownDefinitions.has(id))
     if (unknown.length) throw new Error(`未知 case：${unknown.join(', ')}`)
@@ -159,6 +157,23 @@ export function partitionDefinitions (definitions = allDefinitions()) {
     parallel: definitions.filter((definition) => parallelSafeCases.has(definition.id)),
     serial: definitions.filter((definition) => !parallelSafeCases.has(definition.id))
   }
+}
+
+// Keep cases from the same business suite in one browser session.
+export function groupDefinitionsBySuite (definitions = []) {
+  const groups = new Map()
+  for (const definition of definitions) {
+    const suite = definition.suite || 'ungrouped'
+    if (!groups.has(suite)) {
+      groups.set(suite, {
+        groupId: suite,
+        suite,
+        definitions: []
+      })
+    }
+    groups.get(suite).definitions.push(definition)
+  }
+  return [...groups.values()]
 }
 
 function mkdir (directory) {
@@ -250,13 +265,17 @@ export function resultFromChildReport ({
   report,
   exitCode,
   signal,
-  logFile
+  logFile,
+  grouped = false
 }) {
   const caseRecord = record?.cases?.find((item) => item.id === definition.id)
   const status = caseRecord?.status || 'ERROR'
+  const groupedExitHasNonPassCase = grouped &&
+    exitCode === 1 &&
+    record?.cases?.some((item) => item.status !== 'PASS')
   const abnormalExit = Boolean(signal) ||
     ![0, 1].includes(exitCode) ||
-    (status === 'PASS' && exitCode !== 0)
+    (status === 'PASS' && exitCode !== 0 && !groupedExitHasNonPassCase)
   if (abnormalExit) {
     return {
       caseId: definition.id,
@@ -448,6 +467,204 @@ export function runChild ({
   })
 }
 
+export function runGroupedChild ({
+  definitions,
+  batchDir,
+  headless,
+  caseTimeoutMs,
+  spawnChild = spawn,
+  terminateChild = terminateProcessTree,
+  terminationTimeoutMs = 7000,
+  processTreeExited = processTreeHasExited,
+  terminationPollMs = 50
+}) {
+  if (!Array.isArray(definitions) || definitions.length === 0) {
+    throw new Error('批量 worker 至少需要一个测试案例')
+  }
+  const suiteIds = new Set(definitions.map((definition) => definition.suite || 'ungrouped'))
+  if (suiteIds.size !== 1) {
+    throw new Error('批量 worker 只能运行同一 suite 的测试案例')
+  }
+  const caseIds = definitions.map((definition) => definition.id)
+  if (new Set(caseIds).size !== caseIds.length) {
+    throw new Error('批量 worker 不能包含重复的测试案例')
+  }
+  const groupId = definitions[0].suite || 'ungrouped'
+  const startedAt = new Date().toISOString()
+  const groupDir = mkdir(path.join(batchDir, 'workers', groupId))
+  const groupTimeoutMs = caseTimeoutMs * definitions.length + 30000
+  const childEnv = {
+    ...process.env,
+    CFOR_TARGET: 'local',
+    CFOR_WEB_BASE: process.env.CFOR_WEB_BASE || 'http://127.0.0.1:9151',
+    CFOR_API_BASE: process.env.CFOR_API_BASE || 'http://127.0.0.1:48083',
+    CFOR_E2E_OUT: groupDir,
+    CFOR_EVIDENCE_DIR: groupDir,
+    CFOR_E2E_HEADLESS: headless ? 'true' : 'false'
+  }
+  const args = [
+    path.join(here, 'runner.mjs'),
+    ...definitions.flatMap((definition) => ['--case', definition.id]),
+    '--case-timeout-ms',
+    String(caseTimeoutMs),
+    '--no-resume',
+    '--reuse-session',
+    '--continue-on-failure',
+    ...(headless ? ['--headless'] : ['--headed'])
+  ]
+  const logFile = path.join(groupDir, 'worker.log')
+  const output = fs.createWriteStream(logFile, { flags: 'w' })
+
+  return new Promise((resolve) => {
+    let settled = false
+    let timedOut = false
+    let timer
+    let timeoutFallback
+    let terminationProbeTimer
+    let cancelTermination
+    let closedExit
+    const finish = (value, { cancelTerminationTimer = true } = {}) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      if (timeoutFallback) clearTimeout(timeoutFallback)
+      if (terminationProbeTimer) clearTimeout(terminationProbeTimer)
+      if (cancelTerminationTimer) cancelTermination?.()
+      child.stdout?.unpipe(output)
+      child.stderr?.unpipe(output)
+      output.end()
+      resolve({
+        groupId,
+        definitions,
+        ...value,
+        startedAt,
+        finishedAt: new Date().toISOString()
+      })
+    }
+    const child = spawnChild(process.execPath, args, {
+      cwd: path.resolve(here, '../..'),
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32'
+    })
+    child.stdout?.pipe(output)
+    child.stderr?.pipe(output)
+    const confirmTermination = () => {
+      if (settled) return
+      if (!processTreeExited(child)) {
+        terminationProbeTimer = setTimeout(confirmTermination, terminationPollMs)
+        return
+      }
+      finish({
+        results: definitions.map((definition) => ({
+          caseId: definition.id,
+          suite: definition.suite,
+          title: definition.title,
+          status: 'ERROR',
+          exitCode: closedExit.exitCode,
+          signal: closedExit.signal,
+          error: `批量 worker 超过 ${groupTimeoutMs}ms 未结束，已确认进程组退出`,
+          report: findResultFile(groupDir),
+          logFile,
+          timedOut: true
+        })),
+        timedOut: true
+      })
+    }
+    waitForChildExit(child).then(({ error, exitCode, signal }) => {
+      if (timedOut) {
+        closedExit = { exitCode, signal }
+        confirmTermination()
+        return
+      }
+      if (error) {
+        finish({
+          results: definitions.map((definition) => ({
+            caseId: definition.id,
+            suite: definition.suite,
+            title: definition.title,
+            status: 'ERROR',
+            exitCode: null,
+            error: error.message,
+            report: '',
+            logFile
+          }))
+        })
+        return
+      }
+      const report = findResultFile(groupDir)
+      if (!report) {
+        finish({
+          results: definitions.map((definition) => ({
+            caseId: definition.id,
+            suite: definition.suite,
+            title: definition.title,
+            status: 'ERROR',
+            exitCode,
+            signal,
+            error: `批量 worker 未生成 result.json，详见 ${logFile}`,
+            report,
+            logFile
+          }))
+        })
+        return
+      }
+      try {
+        const record = JSON.parse(fs.readFileSync(report, 'utf8'))
+        finish({
+          results: definitions.map((definition) => resultFromChildReport({
+            definition,
+            record,
+            report,
+            exitCode,
+            signal,
+            logFile,
+            grouped: true
+          }))
+        })
+      } catch (parseError) {
+        finish({
+          results: definitions.map((definition) => ({
+            caseId: definition.id,
+            suite: definition.suite,
+            title: definition.title,
+            status: 'ERROR',
+            exitCode,
+            signal,
+            error: `批量 result.json 解析失败：${parseError.message}`,
+            report,
+            logFile
+          }))
+        })
+      }
+    })
+    timer = setTimeout(() => {
+      if (settled || timedOut) return
+      timedOut = true
+      cancelTermination = terminateChild(child)
+      timeoutFallback = setTimeout(() => {
+        finish({
+          results: definitions.map((definition) => ({
+            caseId: definition.id,
+            suite: definition.suite,
+            title: definition.title,
+            status: 'ERROR',
+            exitCode: closedExit?.exitCode ?? null,
+            signal: closedExit?.signal ?? null,
+            error: `批量 worker 超过 ${groupTimeoutMs}ms 未结束，无法确认进程组终止`,
+            report: findResultFile(groupDir),
+            logFile,
+            timedOut: true,
+            terminationWaitTimedOut: true
+          })),
+          timedOut: true,
+          terminationWaitTimedOut: true
+        }, { cancelTerminationTimer: false })
+      }, terminationTimeoutMs)
+    }, groupTimeoutMs)
+  })
+}
+
 export async function runPool (definitions, options, runCase = runChild) {
   const results = []
   let cursor = 0
@@ -478,6 +695,44 @@ export async function runPool (definitions, options, runCase = runChild) {
   return results.sort((left, right) => left.caseId.localeCompare(right.caseId))
 }
 
+export async function runGroupedPool (groups, options, runGroup = runGroupedChild) {
+  const results = []
+  let cursor = 0
+  let aborted = false
+  const worker = async () => {
+    while (!aborted && cursor < groups.length) {
+      const group = groups[cursor++]
+      console.log(
+        `[parallel] RUN suite=${group.suite} cases=${group.definitions.map((item) => item.id).join(',')}`
+      )
+      const result = await runGroup({ group, definitions: group.definitions, ...options })
+      results.push(result)
+      if (result.terminationWaitTimedOut) aborted = true
+      for (const item of result.results || []) {
+        console.log(`[parallel] ${item.status} ${item.caseId}`)
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(options.workers, groups.length) }, worker)
+  )
+  for (const group of groups.slice(cursor)) {
+    results.push({
+      groupId: group.groupId,
+      definitions: group.definitions,
+      results: group.definitions.map((definition) => ({
+          caseId: definition.id,
+          suite: definition.suite,
+          title: definition.title,
+          status: 'SKIPPED',
+          blockedByProcessTermination: true,
+          note: '前序批量 worker 终止未确认，队列已停止，未启动此案例'
+      }))
+    })
+  }
+  return results
+}
+
 export async function runBatch ({
   definitions,
   outputRoot,
@@ -490,17 +745,23 @@ export async function runBatch ({
   const startedAt = new Date().toISOString()
   const batchId = `parallel-${startedAt.replace(/[-:.TZ]/g, '')}-${process.pid}`
   const batchDir = mkdir(path.join(outputRoot, batchId))
-  const results = await runPool(
-    definitions,
+  const groups = groupDefinitionsBySuite(definitions)
+  const groupResults = await runGroupedPool(
+    groups,
     { batchDir, workers, headless, caseTimeoutMs }
   )
+  const results = groupResults.flatMap((group) => group.results || [])
   const summary = summarizeResults(results)
   const record = {
     batchId,
     startedAt,
     finishedAt: new Date().toISOString(),
-    mode: 'parallel-readonly',
+    mode: 'parallel-suite-batched',
     workers,
+    groups: groups.map((group) => ({
+      suite: group.suite,
+      caseIds: group.definitions.map((definition) => definition.id)
+    })),
     caseTimeoutMs,
     selectedCases: definitions.map((definition) => definition.id),
     aborted: results.some((result) => result.terminationWaitTimedOut),

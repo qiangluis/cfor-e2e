@@ -62,7 +62,8 @@ const suiteFiles = {
   'system-data-permission': 'system-data-permission.mjs',
   'base-partner': 'base-partner.mjs',
   'mes-prod-task-report': 'mes-prod-task-report.mjs',
-  'mes-monitor': 'mes-monitor.mjs'
+  'mes-monitor': 'mes-monitor.mjs',
+  'bpm-business': 'bpm-business.mjs'
 }
 
 const definitions = new Map(
@@ -121,7 +122,8 @@ function checkpointPath () {
     environment: [
       config.target, config.webBase, config.apiUrl, config.tenantId,
       config.tenantName, config.username, config.db.name,
-      config.purchaseApproverUsername, config.financeApproverUsername, config.finalApproverUsername
+      config.purchaseApproverUsername, config.financeApproverUsername, config.finalApproverUsername,
+      config.warehouseApproverUsername, config.warehouseFinalApproverUsername
     ],
     catalog,
     implementation: implementationFingerprint(here)

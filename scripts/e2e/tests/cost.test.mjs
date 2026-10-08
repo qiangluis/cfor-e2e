@@ -164,7 +164,7 @@ const fakeFixtureApi = (context) => {
     },
     async put (path, payload) {
       writes.push({ method: 'PUT', path, payload })
-      if (payload.lines?.[0]?.allocationMode === 'LABOR_HOUR') {
+      if (['LABOR_HOUR', 'MACHINE_HOUR', 'AREA', 'OUTPUT'].includes(payload.lines?.[0]?.allocationMode)) {
         return { code: 422001, msg: 'factor source must be SNAPSHOT or MANUAL for factor allocation' }
       }
       if (payload.lines?.[0]?.allocationMode === 'UNKNOWN_FACTOR') {
@@ -185,6 +185,8 @@ const runFakeCostCase = async (context, fake) => {
     {
       login: async () => 'fake-token',
       createApiClient: () => fake.api,
+      prepareCostFixture: async () => {},
+      recordCostDatabase: async () => {},
       saveCostPrerequisiteEvidence: async (entry) => evidence.push(entry.note),
       openRoute: async () => {},
       saveScreenshot: async () => {}
@@ -353,12 +355,12 @@ test('COST-032 keeps model, center, and component IDs as strings', () => {
   assert.match(cost032, /componentItemId:\s*String\(componentItemId\)/)
 })
 
-test('COST-032 sends the exact registered Snowflake strings in all three mocked write payloads', async () => {
+test('COST-032 sends exact registered Snowflake strings for every factor and quantity payload', async () => {
   const context = ownedFixtureContext()
   const fake = fakeFixtureApi(context)
   const { result } = await runFakeCostCase(context, fake)
   assert.notEqual(result.partial, true)
-  assert.equal(fake.writes.length, 3)
+  assert.equal(fake.writes.length, 6)
   for (const { path, payload } of fake.writes) {
     assert.equal(path, '/cost/allocation-rules')
     assert.equal(payload.modelVersionId, context.registration.modelVersionId)

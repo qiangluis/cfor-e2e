@@ -149,10 +149,16 @@ export async function runCrmReadOnlyPreconditions({ caseId, api, caseRecord: rec
     }
     const businesses = await crmPage(api, '/crm/business/page', record)
     if (businesses.length) {
+      // catalog 口径：赢单/战败只写 end_status，终态商机 execution_status 允许为空；
+      // 未结束商机必须有稳定执行编码，且任何情况下都不得把终态写进 execution_status。
+      const terminalOnlyInEndStatus = (row) =>
+        row.endStatus != null
+          ? (row.executionStatus == null || !/^(WON|LOST|INVALID|赢单|战败|无效)$/i.test(row.executionStatus))
+          : (typeof row.executionStatus === 'string' && row.executionStatus.length > 0 &&
+            !/^(WON|LOST|INVALID|赢单|战败|无效)$/i.test(row.executionStatus))
       checkFact(record, '商机阶段、执行编码与终态保持独立字段',
         businesses.every((row) => stableId(row.statusTypeId) && stableId(row.statusId) &&
-          typeof row.executionStatus === 'string' &&
-          !/^(WON|LOST|INVALID|赢单|战败|无效)$/i.test(row.executionStatus) &&
+          terminalOnlyInEndStatus(row) &&
           (row.endStatus == null || [1, 2, 3].includes(row.endStatus))))
     }
     record.notes.push('未停用共享字典、未新建商机；停用阻断新建与历史可查写侧未验收')

@@ -251,7 +251,7 @@
         {
           "id": "INIT-002",
           "title": "第一页预览、确认、权限立即同步和顶部业务域刷新",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["INIT-001 PASS", "选择电子/PCB", "勾选全部业务域"],
           "routes": ["/systemInit/index"],
           "assertions": [
@@ -277,7 +277,7 @@
         {
           "id": "INIT-003",
           "title": "首轮预置回执、刷新恢复和只补缺失",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["INIT-002 PASS"],
           "routes": ["/systemInit/index"],
           "assertions": [
@@ -302,7 +302,7 @@
         {
           "id": "INIT-004",
           "title": "初始化页签与设置菜单配置回读",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["INIT-003 PASS"],
           "routes": ["/systemInit/index", "/settings/enterprise"],
           "assertions": [
@@ -317,7 +317,7 @@
         {
           "id": "INIT-005",
           "title": "初始化必配、可选和外部前置边界",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["INIT-003 PASS"],
           "routes": ["/systemInit/index"],
           "assertions": [
@@ -342,7 +342,7 @@
         {
           "id": "PB001-002",
           "title": "企业 Logo 缺省时交由服务端生成",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["PB001-001 PASS"],
           "routes": ["/system/enterprise-organization", "/systemInit/index"],
           "assertions": ["Logo 上传为可选", "保存时服务端补齐持久化 Logo", "刷新后 Logo 可回读"],
@@ -523,7 +523,7 @@
         {
           "id": "PB032-006",
           "title": "存货业务能力关闭保护",
-          "status": "DESIGNED",
+          "status": "READY",
           "preconditions": ["当前租户已登录", "Base 存货档案页面可访问"],
           "routes": ["/base/material"],
           "assertions": [
@@ -634,7 +634,7 @@
         {
           "id": "PB004-001",
           "title": "多角色并集、角色安全默认值与用户角色编辑",
-          "status": "DESIGNED",
+          "status": "READY",
           "preconditions": ["存在租户管理员和测试用户", "可访问角色与用户管理"],
           "routes": ["/system/role", "/system/user"],
           "assertions": [
@@ -677,7 +677,7 @@
         {
           "id": "PB007-001",
           "title": "岗位引用保护与租户唯一约束",
-          "status": "DESIGNED",
+          "status": "READY",
           "preconditions": ["存在租户管理员和岗位管理权限", "可访问岗位管理"],
           "routes": ["/system/post"],
           "assertions": [
@@ -693,7 +693,7 @@
         {
           "id": "PB008-001",
           "title": "企业用户稳定账号与手机号换绑边界",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["存在租户管理员和用户管理权限", "可访问用户管理"],
           "routes": ["/system/user"],
           "assertions": [
@@ -709,7 +709,7 @@
         {
           "id": "PB008-002",
           "title": "成员邀请与密码安全入口",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["存在租户管理员和用户管理权限", "可访问用户管理"],
           "routes": ["/system/user", "/tenant-invitation/accept"],
           "assertions": [
@@ -980,7 +980,7 @@
         {
           "id": "ERP-SALES-005",
           "title": "期初销售出库不影响库存但可支撑开票",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["ERP-SALES-003 PASS", "存在可用的 WMS 库存余额基线"],
           "routes": ["/erp/sale/out", "/erp/sale/invoice"],
           "assertions": [
@@ -4846,7 +4846,7 @@
         },
         {
           "id": "MAINT-008",
-          "status": "PARTIAL",
+          "status": "READY",
           "title": "维修工单状态机与备件出库：派工/接单/开工/完工/验收关闭（PB-322）",
           "preconditions": [
             "当前租户已登录且具备 mes:repair-order:* 动作权限",
@@ -5456,7 +5456,7 @@
         {
           "id": "AUTH-DATA-007",
           "title": "AI 与异步链路复用发起人的数据与金额权限",
-          "status": "DESIGNED",
+          "status": "PARTIAL",
           "preconditions": ["已登录管理端", "存在 ERP AI 工具与报表导出入口"],
           "routes": ["/erp/sale/order"],
           "assertions": [
@@ -5590,6 +5590,29 @@
           ],
           "database": ["mes_monitor_alarm_dispatch"],
           "reverse": ["自动化只做只读校验，不触发 alarms/dispatch，避免环境内产生待办与站内通知"]
+        }
+      ]
+    },
+    {
+      "id": "bpm-business",
+      "title": "ERP业务审批快照与节点填写回归",
+      "status": "READY",
+      "cases": [
+        {
+          "id": "BPM-BUSINESS-001",
+          "title": "专属销售出库审批明细、仓库财务填写与历史展示",
+          "status": "READY",
+          "preconditions": ["本地CFOR标准平台租户", "实际仓库和财务审批账号已有测试凭据"],
+          "routes": ["/bpm/process-instance/detail"],
+          "assertions": [
+            "审批业务头及物料明细来自本轮专属单据且页面实际非空",
+            "实际审批人按节点权限填写仓库及财务字段并由浏览器提交",
+            "同一业务连续完成所有审批节点且每个账号在链路内只登录一次",
+            "每个节点历史表单保留当时填写的数据且历史弹窗正常显示"
+          ],
+          "api": ["/erp/sale-out/create", "/bpm/process-instance/get-approval-detail", "/bpm/task/approve"],
+          "database": ["erp_sale_out", "erp_sale_out_items", "ACT_HI_TASKINST"],
+          "reverse": ["仅创建专属期初出库，不改变实物库存；失败通过发起人正式取消流程，保留历史"]
         }
       ]
     }

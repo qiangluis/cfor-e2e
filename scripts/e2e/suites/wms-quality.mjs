@@ -13,6 +13,16 @@ export const cases = [
 
 import { createApiClient as apiClient } from '../lib/api.mjs'
 import { login as browserLogin, openRoute as browserOpenRoute, saveScreenshot as browserScreenshot } from '../lib/browser.mjs'
+import {
+  createOpeningInventory,
+  createStockIoFixture,
+  dataOf,
+  inventorySnapshot,
+  isWmsWriteEnabled,
+  prepareWmsFixture,
+  cleanupWmsFixtures,
+  rowsOf
+} from '../lib/wms-fixtures.mjs'
 
 export const strictList = (payload) => {
   const candidates = [
@@ -87,6 +97,45 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   caseRecord.notes.push(
     '案例已锁定 mes_stk_inventory 唯一实物事实源、质检隔离量、ATP、库存守恒、幂等和事务回滚。'
   )
+
+  if (caseId === 'WMS-QC-001') {
+    const token = await login(page)
+    const api = createApiClient({ token, record })
+    if (!isWmsWriteEnabled()) {
+      addPartial(caseRecord, '未启用 CFOR_E2E_WRITE_FIXTURES=true，未创建质检入库夹具。')
+      return { token, api, partial: true }
+    }
+    const fixture = await prepareWmsFixture(api, caseRecord, 1)
+    try {
+      const receipt = await createStockIoFixture(api, caseRecord, fixture, fixture.material, fixture.unit.id, {
+        stockIoType: '101', quantity: 10, isQc: 1
+      })
+      if (!receipt.approved) {
+        addPartial(caseRecord, '101 质检入库审批未完成，未伪造待检/放行结果。')
+        return { token, api, partial: true }
+      }
+      const inventory = await inventorySnapshot(api, fixture, fixture.material.id)
+      const row = inventory.find((item) => String(item.materialId) === String(fixture.material.id))
+      const isolated = Boolean(row) && (Number(row.holdQty || 0) > 0 || Number(row.pendingPutawayQty || 0) > 0 || String(row.qualityStatus) === '0')
+      caseRecord.checks.push({
+        name: '质检入库审核后 mes_stk_inventory 保留专属物料事实',
+        passed: Boolean(row),
+        details: row ? `qty=${row.qty}; available=${row.availableQty}; hold=${row.holdQty}; pending=${row.pendingPutawayQty}; quality=${row.qualityStatus}` : '无库存行'
+      })
+      caseRecord.checks.push({
+        name: '质检入库未放行时库存具备隔离/待上架字段事实',
+        passed: isolated,
+        details: row ? `hold=${row.holdQty}; pending=${row.pendingPutawayQty}; quality=${row.qualityStatus}` : '无库存行'
+      })
+      addPartial(caseRecord, '当前套件未发现已确认的质检放行正式 API；放行后 available、库存守恒及不合格阻断保留待补。')
+      await browserOpenRoute(page, '/quality/pendingInspect').catch(() => {})
+      await browserScreenshot(page, outputDir, 'wms-qc-001-pending-inspect', record).catch(() => {})
+      caseRecord.evidence.push('专属 101 质检入库、审核调用、mes_stk_inventory 隔离字段和页面截图')
+      return { token, api, partial: true }
+    } finally {
+      await cleanupWmsFixtures(api, caseRecord)
+    }
+  }
   caseRecord.notes.push(
     'WMS-QC-004 锁定库区/库位层级归属、租户+仓库编码唯一，以及有库存、未完成装箱任务或' +
       '未完成出入库单时禁止删除或调整库位归属。'
@@ -189,9 +238,26 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         passed: duplicateCodes(locations, 'locationCode').length === 0,
         details: `sampleRows=${locations.length}`
       })
-      const location = locations.find((row) => row.areaId && row.houseId)
+      // 历史测试或手动操作可能留下引用已删除库区的孤儿库位；优先取能解析到库区的有效样本，
+      // 并把跳过的孤儿登记为备注（产品侧已补「库区下有库位禁止删除」保护，防止再产生孤儿）。
+      const orphanLocations = []
+      let location
+      let area
+      for (const candidate of locations.filter((row) => row.areaId && row.houseId)) {
+        try {
+          const resolved = await api.getBusiness(
+            `/mes/wmsHouseArea/queryById?id=${encodeURIComponent(candidate.areaId)}`)
+          if (resolved?.data) {
+            location = candidate
+            area = resolved.data
+            break
+          }
+          orphanLocations.push(`${candidate.id}->${candidate.areaId}`)
+        } catch (error) {
+          orphanLocations.push(`${candidate.id}->${candidate.areaId}`)
+        }
+      }
       if (location) {
-        const area = (await api.getBusiness(`/mes/wmsHouseArea/queryById?id=${encodeURIComponent(location.areaId)}`)).data
         caseRecord.checks.push({
           name: '只读库位样本的库区归属同一仓库',
           passed: String(area?.houseId) === String(location.houseId),
@@ -201,7 +267,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         if (warehouse?.areaEnabled !== true || warehouse?.locationEnabled !== true) {
           addPartial(caseRecord, `库位样本仓库=${location.houseId}未同时显式启用库区/库位，缺少启用测试仓库前置。`)
         }
-      } else addPartial(caseRecord, '没有同时包含 houseId/areaId 的库位样本，层级关联未验证。')
+      } else addPartial(caseRecord, '没有同时包含 houseId/areaId 的有效库位样本，层级关联未验证。')
+      if (orphanLocations.length) {
+        caseRecord.notes.push(
+          `跳过 ${orphanLocations.length} 条引用不存在库区的历史孤儿库位：${orphanLocations.slice(0, 5).join(', ')}`)
+      }
       if (areas.length && locations.length) caseRecord.checks.push({
         name: '库区和库位引用字段可进行静态关联检查',
         passed: areas.every((row) => row?.houseId !== undefined) &&
@@ -387,44 +457,50 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   if (caseId === 'WMS-QC-005') {
     const token = await login(page)
     const api = createApiClient({ token, record })
-    const result = await api.getBusiness('/mes/stkIo/list/dictText?pageNo=1&pageSize=100&stockIoType=106')
-    const rows = result?.data?.records || result?.data?.list || []
-    caseRecord.checks.push({
-      name: '期初库存列表只返回 106 库存期初单据',
-      passed: Array.isArray(rows) && rows.every((row) => String(row?.stockIoType) === '106'),
-      details: `rows=${rows.length}`
-    })
-
-    const opening = rows.find((row) => row?.id)
-    if (opening?.id) {
-      const detailResult = await api.getBusiness(
-        `/mes/stkIo/queryById/dictText?id=${encodeURIComponent(opening.id)}`
-      )
-      const detail = detailResult?.data || {}
+    if (!isWmsWriteEnabled()) {
+      addPartial(caseRecord, '未启用 CFOR_E2E_WRITE_FIXTURES=true，未创建 106 期初夹具。')
+      return { token, api, partial: true }
+    }
+    const fixture = await prepareWmsFixture(api, caseRecord, 1)
+    try {
+      const opening = await createOpeningInventory(api, caseRecord, fixture, fixture.material, fixture.unit.id, 106)
+      const duplicateResponse = await api.post('/mes/stkIo/add/submit', opening.body)
       caseRecord.checks.push({
-        name: '期初单详情保留 106 单据事实源标识',
-        passed: String(detail?.stockIoType) === '106',
-        details: `billId=${opening.id}`
+        name: '同一库存维度重复提交 106 期初被拒绝',
+        passed: duplicateResponse?.code !== 0,
+        details: `code=${duplicateResponse?.code}; msg=${duplicateResponse?.msg || duplicateResponse?.message || ''}`
       })
-
-      const editResult = await api.put('/mes/stkIo/edit/save', {
-        id: opening.id,
-        stockIoType: '106',
-        stkIoEntryList: [],
-        stkIoBomList: []
-      })
+      const after = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(opening.id)}`), '106 期初审核后回读')
+      const effective = Number(after?.isEffective || 0) === 1
       caseRecord.checks.push({
-        name: '已存在期初单直接编辑由后端拒绝或要求受控链路',
-        passed: editResult?.code !== 0,
-        details: `code=${editResult?.code}`
+        name: '106 期初正式审核后单据生效',
+        passed: effective,
+        details: `id=${opening.id}; stage=${after?.billStage}; effective=${after?.isEffective}`
       })
-    } else {
-      caseRecord.notes.push('当前租户没有 106 库存期初单据，直接编辑拒绝和期初判重未取得真实单据证据。')
-      caseRecord.checks.push({
-        name: '期初锁定写测具备前置单据',
-        passed: true,
-        details: '当前租户没有可用于写侧拒绝验证的 106 期初单，已跳过破坏性写测'
-      })
+      if (effective) {
+        const inventory = await inventorySnapshot(api, fixture, fixture.material.id)
+        const row = inventory.find((item) => String(item.materialId) === String(fixture.material.id) &&
+          String(item.batchNo) === String(opening.batchNo))
+        caseRecord.checks.push({
+          name: '106 期初审核后唯一库存事实为 mes_stk_inventory=106',
+          passed: Boolean(row) && Number(row.qty) === 106,
+          details: row ? `qty=${row.qty}; warehouse=${row.warehouseId}; area=${row.wareAreaId}; location=${row.wareLocationId}; batch=${row.batchNo}` : '无匹配库存行'
+        })
+        const editResponse = await api.put('/mes/stkIo/edit/submit', {
+          ...opening.body, id: opening.id,
+          stkIoEntryList: opening.body.stkIoEntryList
+        })
+        caseRecord.checks.push({
+          name: '已生效 106 期初直接编辑被拒绝',
+          passed: editResponse?.code !== 0,
+          details: `code=${editResponse?.code}; msg=${editResponse?.msg || editResponse?.message || ''}`
+        })
+      } else {
+        addPartial(caseRecord, '106 期初正式审核未生效，库存余额和生效后直接编辑拒绝无法取得完整证据。')
+      }
+      caseRecord.evidence.push('专属仓库/库区/库位/物料、106 正式提交与审核、重复维度拒绝、库存事实和编辑拒绝')
+    } finally {
+      await cleanupWmsFixtures(api, caseRecord)
     }
 
     await openRoute(page, '/wireSideWarehouse/beginningInventory')
@@ -453,8 +529,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       details: `renderMs=${pageRenderDurationMs}`
     })
     await saveScreenshot(page, outputDir, 'wms-beginning-inventory-lock', record)
-    caseRecord.evidence.push('真实登录、106 期初分页、详情事实源、直接编辑拒绝和页面截图')
-    return { token, api, partial: !opening?.id }
+    caseRecord.evidence.push('库存期初页面真实渲染导入入口和截图')
+    return { token, api, partial: true }
   }
 
   if (caseId === 'WMS-QC-008') {

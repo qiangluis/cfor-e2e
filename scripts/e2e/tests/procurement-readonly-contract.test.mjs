@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import {
+  createProcurementReadonlyApi,
   procurementReadOnlyViews,
   procurementReadonlyPage,
   runCase,
@@ -285,4 +286,52 @@ test('only the two target cases enter the added branch; contract contains no wri
     source.indexOf('const readBrowserBusinessResponse'))
   assert.doesNotMatch(contract, /api\.(post|put|delete|request)|runReadOnlySql|readySelector: ['"]body/)
   assert.match(contract, /partial: true/)
+})
+
+test('foundation procurement wrapper records orphan-supplier evidence without synthesizing detail success', async () => {
+  const calls = []
+  const caseRecord = { checks: [], notes: [], evidence: [] }
+  const api = createProcurementReadonlyApi({
+    caseRecord,
+    api: {
+      async getBusiness (path) {
+        calls.push(path)
+        if (path === '/erp/purchase-order/page?pageNo=1&pageSize=100') {
+          return ok({ list: [{
+            id: 'purchase-1',
+            settleMethodCode: 'BANK',
+            settleMethodRuleVersion: 2
+          }], total: 1 })
+        }
+        throw new Error(
+          '采购订单详情 business failure: {"code":1030100000,"msg":"供应商不存在"}'
+        )
+      }
+    }
+  })
+
+  const page = await api.getBusiness('/erp/purchase-order/page?pageNo=1&pageSize=100')
+  assert.equal(page.data.list[0].settleMethodCode, 'BANK')
+  await assert.rejects(
+    () => api.getBusiness('/erp/purchase-order/get?id=purchase-1'),
+    /供应商不存在/
+  )
+  assert.equal(calls.length, 2)
+  assert.match(caseRecord.notes[0], /保留 FAIL/)
+  assert.match(caseRecord.evidence[0], /1030100000/)
+})
+
+test('foundation procurement wrapper does not hide unrelated purchase detail failures', async () => {
+  const api = createProcurementReadonlyApi({
+    caseRecord: { checks: [], notes: [], evidence: [] },
+    api: {
+      async getBusiness () {
+        throw new Error('采购订单详情 business failure: {"code":500,"msg":"数据库不可用"}')
+      }
+    }
+  })
+  await assert.rejects(
+    () => api.getBusiness('/erp/purchase-order/get?id=purchase-1'),
+    /数据库不可用/
+  )
 })

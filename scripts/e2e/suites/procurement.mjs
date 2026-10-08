@@ -3,6 +3,8 @@ import { launchBrowser, login, loginWithCredentials, openRoute, saveScreenshot }
 import { config } from '../config/index.mjs'
 import { decryptResponse, ENCRYPT_HEADER } from '../lib/crypto.mjs'
 import { createPurchaseRequest, snapshotPurchaseRequest } from '../fixtures/purchase-request.mjs'
+import { createProcurementSettlementFixture } from '../fixtures/procurement-settlement.mjs'
+import { runSupplierAuth } from '../fixtures/supplier-auth.mjs'
 import { databaseConfigured, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 import { createPurchaseReader } from '../fixtures/purchase-reader.mjs'
 import { collectPagePerformance } from '../lib/performance.mjs'
@@ -41,6 +43,38 @@ const readonlyArray = (payload, label) => {
     throw new Error(`${label} data 必须为对象数组`)
   }
   return rows
+}
+
+const isMissingSupplierPurchaseDetail = (error) => {
+  const message = String(error?.message || error)
+  return message.includes('1030100000') && message.includes('供应商不存在')
+}
+
+export function createProcurementReadonlyApi ({ api, caseRecord } = {}) {
+  if (!api || typeof api.getBusiness !== 'function') {
+    throw new Error('采购只读适配器必须注入 GET API 客户端')
+  }
+  return {
+    ...api,
+    async getBusiness (path, ...args) {
+      try {
+        return await api.getBusiness(path, ...args)
+      } catch (error) {
+        const pathname = path.split('?')[0]
+        const match = pathname === '/erp/purchase-order/get' &&
+          /(?:^|&)id=([^&]+)/.exec(path.split('?')[1] || '')
+        if (!match || !isMissingSupplierPurchaseDetail(error)) throw error
+        const id = decodeURIComponent(match[1])
+        caseRecord?.notes?.push(
+          `采购订单 ${id} 详情被后端拒绝：code=1030100000，供应商不存在；不以分页快照替代真实详情，保留 FAIL`
+        )
+        caseRecord?.evidence?.push(
+          `GET ${path} -> code=1030100000 供应商不存在`
+        )
+        throw error
+      }
+    }
+  }
 }
 
 const normalizeTenantId = (value, label = 'tenantId') => {
@@ -459,9 +493,65 @@ export const cases = [
 ]
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  if (caseId === 'PROC-010') {
+    return runSupplierAuth({ page, record, caseRecord, outputDir }, dependencies.supplierAuth)
+  }
+  if (caseId === 'PROC-005') {
+    const token = await (dependencies.login || login)(page)
+    const baseApi = (dependencies.createApiClient || createApiClient)({ token, record })
+    const api = createProcurementReadonlyApi({ api: baseApi, caseRecord })
+    const result = await createProcurementSettlementFixture(api, caseRecord)
+    caseRecord.checks.push(
+      {
+        name: 'PROC-005 专属供应商通过正规 API 创建并可用于采购订单',
+        passed: true,
+        details: `supplierId=${result.fixture.supplierId}`
+      },
+      {
+        name: 'PROC-005 专属结算方式写入 x_settle_method 且规则版本1命中采购订单',
+        passed: result.first.settleMethodCode === result.fixture.settleMethodCode &&
+          Number(result.first.settleMethodRuleVersion) === 1,
+        details: `orderId=${result.fixture.orderId}, code=${result.first.settleMethodCode}, version=${result.first.settleMethodRuleVersion}`
+      },
+      {
+        name: 'PROC-005 规则更新为版本2后历史采购订单版本快照仍为1',
+        passed: Number(result.currentRule.version) === 2 &&
+          Number(result.second.settleMethodRuleVersion) === 1,
+        details: `ruleId=${result.fixture.ruleId}, current=${result.currentRule.version}, order=${result.second.settleMethodRuleVersion}`
+      },
+      {
+        name: 'PROC-005 同一专属客商开启客户角色后销售订单命中结算规则版本2',
+        passed: result.fixture.customerId === result.fixture.supplierId &&
+          result.saleSnapshot.settleMethodCode === result.fixture.settleMethodCode &&
+          Number(result.saleSnapshot.settleMethodRuleVersion) === 2,
+        details: `customerId=${result.fixture.customerId}, saleOrderId=${result.fixture.saleOrderId}, version=${result.saleSnapshot.settleMethodRuleVersion}`
+      },
+      {
+        name: 'PROC-005 停用自身专属字典后新销售订单被正规 API 拒绝',
+        passed: result.fixture.disabledDictionary === true &&
+          result.fixture.disabledCreateRejected === true &&
+          Number(result.disabledDictionary.status) === 1 &&
+          result.rejectedSale?.code !== 0 &&
+          result.rejectedSale?.code !== 200,
+        details: `dictionaryId=${result.fixture.dictionaryId}, status=${result.disabledDictionary.status}, code=${result.rejectedSale?.code}, msg=${result.rejectedSale?.msg || ''}`
+      }
+    )
+    caseRecord.notes.push(
+      'PROC-005 专属写侧已验证：供应商/客户角色、x_settle_method 字典项、采购订单版本1、销售订单版本2、规则更新及历史快照不回溯、专属字典停用拒绝新销售单；专属实体全部 retained'
+    )
+    return {
+      token,
+      api,
+      partial: true,
+      note: 'PROC-005 专属采购/销售结算快照及专属字典停用拒绝新单已完成；其他销售规则场景仍未验证'
+    }
+  }
   if (procurementFoundationReadonlyCases.includes(caseId)) {
     const token = await (dependencies.login || login)(page)
-    const api = (dependencies.createApiClient || createApiClient)({ token, record })
+    const baseApi = (dependencies.createApiClient || createApiClient)({ token, record })
+    const api = ['PROC-002', 'PROC-004', 'PROC-005'].includes(caseId)
+      ? createProcurementReadonlyApi({ api: baseApi, caseRecord })
+      : baseApi
     const result = await runProcurementFoundationReadonlyContract({
       caseId, api, caseRecord
     })

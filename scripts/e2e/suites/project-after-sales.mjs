@@ -385,13 +385,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     if (project) {
       let invalidRejected = false
       try {
-        await api.put(`/pm/project/update`, {
+        const payload = await api.put(`/pm/project/update`, {
           id: project.id,
           projectName: project.projectName,
           projectType: project.projectType,
           projectManagerId: project.projectManagerId,
           healthStatus: 'NOT_A_HEALTH_STATE'
         })
+        // 业务校验失败时后端仍返回 HTTP 200，需要读取业务错误码判断是否拒绝。
+        invalidRejected = Number(payload?.code) !== 0
+        if (invalidRejected) {
+          caseRecord.notes.push(`非法健康状态被拒绝：code=${payload.code} msg=${payload.msg}`)
+        }
       } catch (error) {
         invalidRejected = true
         caseRecord.notes.push(`非法健康状态被拒绝：${error.message}`)

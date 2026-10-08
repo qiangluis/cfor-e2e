@@ -1,6 +1,8 @@
 import { assertBusinessSuccess, isBusinessSuccess } from '../lib/assertions.mjs'
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { config } from '../config/index.mjs'
+import { assertLocalDatabase, assertLocalWriteSafety } from '../lib/db.mjs'
 
 export const cases = [
   'QUALITY-BASE-001',
@@ -18,6 +20,310 @@ export const cases = [
   'QUALITY-TRACE-001',
   'QUALITY-METRIC-001'
 ]
+
+export const QUALITY_METRIC_DETAIL_PAGE_SIZE = 100
+export const QUALITY_METRIC_OVERSIZED_PAGE_SIZE = 500
+export const QUALITY_METRIC_FIXTURE_INSPECTION_COUNT = 101
+
+export function assertQualityMetricFixtureScope(settings = config) {
+  if (settings.target !== 'local' || String(settings.tenantId) !== '1' ||
+      settings.tenantName !== 'CFOR 标准平台') {
+    throw new Error('BLOCKED: quality metric fixtures require local tenant1/CFOR 标准平台')
+  }
+  for (const [base, port] of [[settings.apiBase, '48083'], [settings.webBase, '9151']]) {
+    const url = new URL(base)
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ||
+        url.port !== port || url.username || url.password) {
+      throw new Error('BLOCKED: quality metric fixtures require loopback 48083/9151')
+    }
+  }
+  try {
+    assertLocalDatabase(settings.db)
+  } catch {
+    throw new Error('BLOCKED: quality metric fixtures require loopback:3306/cfor_admin_standard')
+  }
+}
+
+export async function assertQualityMetricWritePreflight({ api, auth, caseRecord }, dependencies = {}) {
+  const settings = dependencies.config || config
+  assertQualityMetricFixtureScope(settings)
+  if (!auth?.token || String(auth.tenantId) !== '1' ||
+      String(await api.tenantIdByName(settings.tenantName)) !== '1') {
+    throw new Error('BLOCKED: quality metric authenticated tenant does not match the fixture scope')
+  }
+  await (dependencies.assertLocalWriteSafety || assertLocalWriteSafety)(caseRecord)
+}
+
+export const evaluateMetricPageClamp = ({ response, apiEntry, expectedRows, expectedTotal } = {}) => {
+  const data = response?.data || {}
+  const code = response?.code ?? apiEntry?.code
+  const status = apiEntry?.status
+  const rows = Array.isArray(data.list) ? data.list : []
+  const total = Number(data.total)
+  return {
+    passed:
+      Number(status) === 200 && Number(code) === 0 &&
+      rows.length === expectedRows && total === expectedTotal,
+    details: `status=${status ?? 'n/a'}，code=${code ?? 'n/a'}，rows=${rows.length}，total=${data.total ?? 'n/a'}`
+  }
+}
+
+const qualityRows = (response) => {
+  const data = response?.data
+  return data?.records || data?.list || (Array.isArray(data) ? data : [])
+}
+
+const qualityMetricFixtureToken = () =>
+  `E2E-QM-${Date.now().toString(36).toUpperCase()}`
+
+const createQualityMetricFixture = async ({ api, caseRecord }) => {
+  const token = qualityMetricFixtureToken()
+  const fixture = {
+    token,
+    itemId: null,
+    planId: null,
+    materialId: null,
+    ruleId: null,
+    inspectionIds: []
+  }
+
+  const cleanup = async () => {
+    const cleanupResults = []
+    const cleanupActions = [
+      ...fixture.inspectionIds.map((inspectionId) => ['inspection', inspectionId, async () => {
+        await api.putBusiness('/mes/quality/qualityInspection/void', { id: inspectionId })
+        await api.deleteBusiness(
+          `/mes/quality/qualityInspection/delete?id=${encodeURIComponent(inspectionId)}`
+        )
+      }]),
+      fixture.ruleId && ['rule', fixture.ruleId, () => api.deleteBusiness(
+        `/mes/quality/qualityMaterial/delete?id=${encodeURIComponent(fixture.ruleId)}`
+      )],
+      fixture.planId && ['plan-disable', fixture.planId, () => api.postBusiness(
+        `/mes/quality/qualityPlan/disable?id=${encodeURIComponent(fixture.planId)}`
+      )],
+      fixture.planId && ['plan', fixture.planId, () => api.deleteBusiness(
+        `/mes/quality/qualityPlan/delete?id=${encodeURIComponent(fixture.planId)}`
+      )],
+      fixture.itemId && ['item-disable', fixture.itemId, () => api.postBusiness(
+        `/mes/quality/item/disable?id=${encodeURIComponent(fixture.itemId)}`
+      )],
+      fixture.itemId && ['item', fixture.itemId, () => api.deleteBusiness(
+        `/mes/quality/item/delete?id=${encodeURIComponent(fixture.itemId)}`
+      )],
+      fixture.materialId && ['material', fixture.materialId, () => api.deleteBusiness(
+        `/mes/basMaterial/delete?id=${encodeURIComponent(fixture.materialId)}`
+      )]
+    ].filter(Boolean)
+    for (const [kind, id, action] of cleanupActions) {
+      try {
+        await action()
+        cleanupResults.push(`${kind}=${id}:ok`)
+      } catch (error) {
+        cleanupResults.push(`${kind}=${id}:failed`)
+        caseRecord.notes.push(`质量指标专属夹具清理失败：${error.message}`)
+      }
+    }
+    caseRecord.checks.push({
+      name: '专属质量指标夹具清理完成并记录全部 fixture ID',
+      passed: cleanupResults.every((result) => result.endsWith(':ok')),
+      details: `token=${fixture.token}; ${cleanupResults.join('; ') || '无已创建实体'}`
+    })
+  }
+
+  try {
+    const unitsResponse = await api.getBusiness('/mes/basUnit/list/enabled')
+    const unit = (unitsResponse?.data || []).find((row) => row?.id)
+    if (!unit?.id) throw new Error('没有可用启用计量单位，无法创建质量指标夹具')
+
+    const itemCode = `${token}-ITEM`
+    await api.postBusiness('/mes/quality/item/add', {
+      itemName: `${token} 质检项`,
+      itemType: '采购入库检验项目',
+      inspectionResultType: 'select',
+      inspectionResult: '1',
+      remark: token,
+      target: '100%',
+      frequency: '每批',
+      standardBaseValue: 1,
+      standardFloatValue: 0,
+      judgmentMode: 'ENUM',
+      itemCode,
+      unitId: String(unit.id),
+      decimalScale: 0,
+      sampleRequired: true,
+      isRequired: true,
+      attachmentRequired: false,
+      publishStatus: 0
+    })
+    const item = qualityRows(await api.getBusiness(
+      `/mes/quality/item/list/dictText?pageNo=1&pageSize=100&itemCode=${encodeURIComponent(itemCode)}`
+    )).find((row) => String(row?.itemCode) === itemCode)
+    if (!item?.id) throw new Error(`专属质检项创建后未回读：${itemCode}`)
+    fixture.itemId = String(item.id)
+    await api.postBusiness(`/mes/quality/item/publish?id=${encodeURIComponent(fixture.itemId)}`)
+    caseRecord.checks.push({
+      name: '创建并发布质量指标专属质检项',
+      passed: true,
+      details: `itemId=${fixture.itemId}; itemCode=${itemCode}`
+    })
+
+    const planCode = `${token}-PLAN`
+    await api.postBusiness('/mes/quality/qualityPlan/add', {
+      planName: `${token} 质检方案`,
+      planCode,
+      type: 101,
+      remark: token,
+      qualityPlanSubList: [{
+        itemId: fixture.itemId,
+        inspectionResultType: 'select',
+        inspectionResult: '1',
+        remark: token,
+        sortOrder: 1,
+        isRequired: 1,
+        sampleQty: 1,
+        standardValue: '1',
+        judgmentMode: 'ENUM',
+        itemVersion: 1,
+        planVersion: 1
+      }]
+    })
+    // The legacy plan endpoint returns a success message from create and does not
+    // reliably apply planCode as a QueryGenerator filter, so recover the owned row
+    // from the bounded type-101 page using both stable fixture fields.
+    const plan = qualityRows(await api.getBusiness(
+      '/mes/quality/qualityPlan/list/dictText?pageNo=1&pageSize=100&type=101'
+    )).find((row) =>
+      String(row?.planName) === `${token} 质检方案` && String(row?.remark) === token
+    )
+    if (!plan?.id) throw new Error(`专属质检方案创建后未回读：${planCode}`)
+    fixture.planId = String(plan.id)
+    await api.postBusiness(`/mes/quality/qualityPlan/publish?id=${encodeURIComponent(fixture.planId)}`)
+    caseRecord.checks.push({
+      name: '创建并发布质量指标专属质检方案，不改默认方案',
+      passed: true,
+      details: `planId=${fixture.planId}; planCode=${planCode}`
+    })
+
+    const materialCode = `${token}-MAT`
+    const materialId = await api.postBusiness('/mes/basMaterial/add', {
+      code: materialCode,
+      name: `${token} 质检物料`,
+      auxName: `${token} 质检物料`,
+      unitId: String(unit.id),
+      inventoryNature: 'STOCK',
+      isMaterial: 'Y',
+      isEnabled: 1,
+      purchased: 'Y',
+      saled: 'N',
+      produced: 'N',
+      source: 'purchase',
+      leadTime: 1,
+      bufferTime: 1,
+      batchManaged: 'Y',
+      oneBarcode: 'N',
+      periodManaged: 'N',
+      gradeManaged: 'N',
+      remark: token
+    })
+    fixture.materialId = String(materialId?.data ?? materialId)
+    const material = await api.getBusiness(
+      `/mes/basMaterial/queryById?id=${encodeURIComponent(fixture.materialId)}`
+    )
+    if (String(material?.data?.code) !== materialCode || String(material?.data?.remark) !== token) {
+      throw new Error(`专属质检物料所有权回读失败：${fixture.materialId}`)
+    }
+    await api.postBusiness('/mes/quality/qualityMaterial/addBatch', [{
+      materialId: fixture.materialId,
+      planId: fixture.planId,
+      type: '101',
+      effectiveFrom: new Date().toISOString().slice(0, 10),
+      isDefault: true,
+      priority: 999,
+      applyOrgId: '',
+      businessSubType: ''
+    }])
+    const rule = qualityRows(await api.getBusiness(
+      `/mes/quality/qualityMaterial/list/dictText?pageNo=1&pageSize=100&types=101&materialId=${encodeURIComponent(fixture.materialId)}`
+    )).find((row) => String(row?.materialId) === fixture.materialId && String(row?.type) === '101')
+    if (!rule?.id) throw new Error(`专属质检存货规则创建后未回读：${fixture.materialId}`)
+    fixture.ruleId = String(rule.id)
+    caseRecord.checks.push({
+      name: '创建质量指标专属物料与 101 质检存货规则',
+      passed: true,
+      details: `materialId=${fixture.materialId}; ruleId=${fixture.ruleId}`
+    })
+
+    const quantity = 3
+    const billDate = new Date().toISOString().slice(0, 10)
+    for (let index = 1; index <= QUALITY_METRIC_FIXTURE_INSPECTION_COUNT; index++) {
+      const inspectionResponse = await api.postBusiness('/mes/quality/qualityInspection/add/submit', {
+        // Keep this fixture independent from optional tenant bill-number presets.
+        billNo: `${token}-QC-${String(index).padStart(3, '0')}`,
+        billDate,
+        subject: `${token} 隔离质检单 ${index}`,
+        remark: `${token}-${index}`,
+        isRubric: 0,
+        isAuto: 0,
+        type: '101',
+        inspectionPlan: fixture.planId,
+        inspectionQty: quantity,
+        qty: quantity,
+        passQty: quantity,
+        concessionQty: 0,
+        pendingJudgeQty: 0,
+        inspector: '1',
+        inspectionResult: '全部合格',
+        qualityInspectionEntryList: [{
+          billType: '101',
+          materialId: fixture.materialId,
+          unitId: String(unit.id),
+          inspectionQty: quantity,
+          passQty: quantity,
+          concessionQty: 0,
+          pendingJudgeQty: 0,
+          inspectionConclusion: '全部合格',
+          finalResult: '全部合格',
+          qty: quantity,
+          entryNo: 1,
+          remark: `${token}-${index}`
+        }],
+        qualityInspectionItemList: [{
+          itemId: fixture.itemId,
+          itemName: `${token} 质检项`,
+          itemType: '采购入库检验项目',
+          inspectionResultType: 'select',
+          inspectionResult: '1',
+          finalInspectionResult: '1',
+          inspectionQty: quantity,
+          passQty: quantity,
+          ngQty: 0,
+          remark: `${token}-${index}`
+        }]
+      })
+      const inspectionId = String(inspectionResponse?.data ?? inspectionResponse)
+      if (!inspectionId || inspectionId === '[object Object]') {
+        throw new Error(`专属隔离质检单未返回 ID：index=${index}; response=${JSON.stringify(inspectionResponse)}`)
+      }
+      fixture.inspectionIds.push(inspectionId)
+    }
+    const sampleInspection = await api.getBusiness(
+      `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(fixture.inspectionIds[0])}`
+    )
+    if (Number(sampleInspection?.data?.isEffective || 0) !== 1) {
+      throw new Error(`专属隔离质检单未生效：inspectionId=${fixture.inspectionIds[0]}`)
+    }
+    caseRecord.checks.push({
+      name: '合法 API 创建并完检 101 条专属隔离质检单，形成分页事实',
+      passed: true,
+      details: `materialId=${fixture.materialId}; inspectionCount=${fixture.inspectionIds.length}; sampleQty=${quantity}; firstInspectionId=${fixture.inspectionIds[0]}; isEffective=${sampleInspection.data.isEffective}`
+    })
+    return { fixture, cleanup }
+  } catch (error) {
+    await cleanup()
+    throw error
+  }
+}
 
 const runNgDispositionReviewCase = async ({ page, record, caseRecord, outputDir }) => {
   const token = await login(page)
@@ -591,89 +897,112 @@ const runQualityTraceCase = async ({ page, record, caseRecord, outputDir }) => {
 }
 
 const runQualityMetricCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+  assertQualityMetricFixtureScope()
+  const auth = await login(page, { returnContext: true })
+  const token = auth.token
+  const api = createApiClient({ token, tenantId: auth.tenantId, record })
+  await assertQualityMetricWritePreflight({ api, auth, caseRecord })
+  const metricFixture = await createQualityMetricFixture({ api, caseRecord })
+  const materialFilter = `materialId=${encodeURIComponent(metricFixture.fixture.materialId)}`
 
-  const reportResp = await api.getBusiness('/mes/quality/metric/report?pageNo=1&pageSize=100')
-  const report = reportResp?.data || {}
-  caseRecord.checks.push({
-    name: '质量指标报表返回固定口径版本与五类指标',
-    passed:
-      report.metricVersion === 1 &&
-      Object.prototype.hasOwnProperty.call(report, 'inspectionTaskCount') &&
-      Object.prototype.hasOwnProperty.call(report, 'sampleQty') &&
-      Object.prototype.hasOwnProperty.call(report, 'defectQty') &&
-      Object.prototype.hasOwnProperty.call(report, 'dispositionCount') &&
-      Object.prototype.hasOwnProperty.call(report, 'returnBillCount'),
-    details: `metricVersion=${report.metricVersion}，task=${report.inspectionTaskCount}，sample=${report.sampleQty}，defect=${report.defectQty}，disposition=${report.dispositionCount}，return=${report.returnBillCount}`
-  })
-  caseRecord.checks.push({
-    name: '质量指标报表回显实际应用筛选并提示退货口径',
-    passed:
-      report.appliedFilters?.metricVersion === 1 &&
-      Array.isArray(report.warnings) &&
-      report.warnings.some((warning) => String(warning).includes('WMS/MES')),
-    details: `appliedFilters=${JSON.stringify(report.appliedFilters).slice(0, 200)}`
-  })
+  try {
+    const reportResp = await api.getBusiness(
+      `/mes/quality/metric/report?pageNo=1&pageSize=100&${materialFilter}`
+    )
+    const report = reportResp?.data || {}
+    caseRecord.checks.push({
+      name: '质量指标报表按专属 materialId 返回 101 条正式单据与五类指标',
+      passed:
+        report.metricVersion === 1 &&
+        Number(report.inspectionTaskCount) === QUALITY_METRIC_FIXTURE_INSPECTION_COUNT &&
+        Number(report.sampleQty) === QUALITY_METRIC_FIXTURE_INSPECTION_COUNT * 3 &&
+        Object.prototype.hasOwnProperty.call(report, 'inspectionTaskCount') &&
+        Object.prototype.hasOwnProperty.call(report, 'sampleQty') &&
+        Object.prototype.hasOwnProperty.call(report, 'defectQty') &&
+        Object.prototype.hasOwnProperty.call(report, 'dispositionCount') &&
+        Object.prototype.hasOwnProperty.call(report, 'returnBillCount'),
+      details: `materialId=${metricFixture.fixture.materialId}; appliedMaterialId=${report.appliedFilters?.materialId}; metricVersion=${report.metricVersion}，task=${report.inspectionTaskCount}，sample=${report.sampleQty}，defect=${report.defectQty}，disposition=${report.dispositionCount}，return=${report.returnBillCount}`
+    })
+    caseRecord.checks.push({
+      name: '质量指标报表回显实际应用筛选并提示退货口径',
+      passed:
+        report.appliedFilters?.metricVersion === 1 &&
+        String(report.appliedFilters?.materialId) === metricFixture.fixture.materialId &&
+        Array.isArray(report.warnings) &&
+        report.warnings.some((warning) => String(warning).includes('WMS/MES')),
+      details: `appliedFilters=${JSON.stringify(report.appliedFilters).slice(0, 200)}`
+    })
 
-  const detailResp = await api.getBusiness('/mes/quality/metric/detail/page?pageNo=1&pageSize=100')
-  const detailRows = detailResp?.data?.list || []
-  const metricValues = [
-    report.inspectionTaskCount,
-    report.sampleQty,
-    report.defectQty,
-    report.dispositionCount,
-    report.returnBillCount
-  ].map((value) => Number(value || 0))
-  const hasMetricData = detailRows.length > 0 || metricValues.some((value) => value > 0)
-  if (!hasMetricData) {
-    caseRecord.notes.push('当前质量指标报表和明细均无真实业务数据，指标定义与零聚合通过但不代表真实统计闭环已验收。')
+    const detailPath = (pageNo) =>
+      `/mes/quality/metric/detail/page?pageNo=${pageNo}&pageSize=${QUALITY_METRIC_OVERSIZED_PAGE_SIZE}&${materialFilter}`
+    const firstDetailResp = await api.getBusiness(detailPath(1))
+    const firstDetailRows = firstDetailResp?.data?.list || []
+    const firstDetailTotal = Number(firstDetailResp?.data?.total)
+    caseRecord.checks.push({
+      name: '专属 materialId 明细 pageSize=500 第一页收敛为 100 条',
+      passed:
+        firstDetailRows.length === QUALITY_METRIC_DETAIL_PAGE_SIZE &&
+        firstDetailTotal === QUALITY_METRIC_FIXTURE_INSPECTION_COUNT &&
+        firstDetailRows.every((row) =>
+          String(row.billNo || '').startsWith(`${metricFixture.fixture.token}-QC-`) &&
+          String(row.inspectionType) === '101' &&
+          Number(row.isEffective) === 1 &&
+          Number(row.isVoided) === 0
+        ),
+      details: `materialId=${metricFixture.fixture.materialId}; requestedPageSize=${QUALITY_METRIC_OVERSIZED_PAGE_SIZE}; rows=${firstDetailRows.length}; total=${firstDetailTotal}`
+    })
+    const secondDetailResp = await api.getBusiness(detailPath(2))
+    const secondDetailRows = secondDetailResp?.data?.list || []
+    const secondDetailTotal = Number(secondDetailResp?.data?.total)
+    const firstIds = new Set(firstDetailRows.map((row) => String(row.id)))
+    caseRecord.checks.push({
+      name: '专属 materialId 明细第二页返回余数且与第一页不重复',
+      passed:
+        secondDetailRows.length === QUALITY_METRIC_FIXTURE_INSPECTION_COUNT - QUALITY_METRIC_DETAIL_PAGE_SIZE &&
+        secondDetailTotal === QUALITY_METRIC_FIXTURE_INSPECTION_COUNT &&
+        secondDetailRows.every((row) =>
+          !firstIds.has(String(row.id)) &&
+          String(row.billNo || '').startsWith(`${metricFixture.fixture.token}-QC-`) &&
+          String(row.inspectionType) === '101' &&
+          Number(row.isEffective) === 1 &&
+          Number(row.isVoided) === 0
+        ),
+      details: `materialId=${metricFixture.fixture.materialId}; page1Rows=${firstDetailRows.length}; page2Rows=${secondDetailRows.length}; total=${secondDetailTotal}; page2BillNo=${secondDetailRows[0]?.billNo || 'none'}`
+    })
+
+    const definitionResp = await api.getBusiness('/mes/quality/metric/definitions')
+    const metrics = definitionResp?.data?.metrics || []
+    const returnMetric = metrics.find((item) => item.code === 'RETURN_BILL')
+    caseRecord.checks.push({
+      name: '口径定义声明五类指标且退货取 WMS/MES 正式退货出入库单',
+      passed:
+        definitionResp?.data?.metricVersion === 1 &&
+        metrics.length === 5 &&
+        returnMetric?.source === 'mes_stk_io' &&
+        String(returnMetric?.formula || '').includes('301') &&
+        String(returnMetric?.formula || '').includes('302'),
+      details: `metrics=${metrics.length}，returnSource=${returnMetric?.source}`
+    })
+
+    await openRoute(page, '/quality/metric')
+    await page.locator('[data-testid="quality-metric-page"]').waitFor({ state: 'visible' })
+    const bodyText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '质量指标页面真实渲染五类指标卡片',
+      passed:
+        new URL(page.url()).pathname.startsWith('/quality/metric') &&
+        bodyText.includes('检验任务数') &&
+        bodyText.includes('退货单数') &&
+        bodyText.includes('口径版本'),
+      details: page.url()
+    })
+
+    await saveScreenshot(page, outputDir, 'quality-metric-page', record)
+    caseRecord.evidence.push('真实登录、专属质检项/方案/物料/质检单合法 API 夹具、质量指标报表/明细/口径定义接口与浏览器截图')
+    return { token, api, partial: false }
+  } finally {
+    await metricFixture.cleanup()
   }
-  caseRecord.checks.push({
-    name: '质量指标明细与报表同筛选口径且分页不超过 100',
-    passed: Array.isArray(detailRows) && detailRows.length <= 100,
-    details: `rows=${Array.isArray(detailRows) ? detailRows.length : 'invalid'}`
-  })
-
-  // pageSize 超限必须被后端收敛，避免大分页拖垮报表
-  const clampedResp = await api.getBusiness('/mes/quality/metric/detail/page?pageNo=1&pageSize=500')
-  const clampedRows = clampedResp?.data?.list || []
-  caseRecord.checks.push({
-    name: '明细分页 pageSize 超限被收敛到 100',
-    passed: Array.isArray(clampedRows) && clampedRows.length <= 100,
-    details: `rows=${Array.isArray(clampedRows) ? clampedRows.length : 'invalid'}`
-  })
-
-  const definitionResp = await api.getBusiness('/mes/quality/metric/definitions')
-  const metrics = definitionResp?.data?.metrics || []
-  const returnMetric = metrics.find((item) => item.code === 'RETURN_BILL')
-  caseRecord.checks.push({
-    name: '口径定义声明五类指标且退货取 WMS/MES 正式退货出入库单',
-    passed:
-      definitionResp?.data?.metricVersion === 1 &&
-      metrics.length === 5 &&
-      returnMetric?.source === 'mes_stk_io' &&
-      String(returnMetric?.formula || '').includes('301') &&
-      String(returnMetric?.formula || '').includes('302'),
-    details: `metrics=${metrics.length}，returnSource=${returnMetric?.source}`
-  })
-
-  await openRoute(page, '/quality/metric')
-  await page.locator('[data-testid="quality-metric-page"]').waitFor({ state: 'visible' })
-  const bodyText = await page.locator('body').innerText()
-  caseRecord.checks.push({
-    name: '质量指标页面真实渲染五类指标卡片',
-    passed:
-      new URL(page.url()).pathname.startsWith('/quality/metric') &&
-      bodyText.includes('检验任务数') &&
-      bodyText.includes('退货单数') &&
-      bodyText.includes('口径版本'),
-    details: page.url()
-  })
-
-  await saveScreenshot(page, outputDir, 'quality-metric-page', record)
-  caseRecord.evidence.push('真实登录、质量指标报表/明细/口径定义接口与浏览器截图')
-  return { token, api, partial: !hasMetricData }
 }
 
 const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir }) => {

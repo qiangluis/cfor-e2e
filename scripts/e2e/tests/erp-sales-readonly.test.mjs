@@ -413,6 +413,7 @@ test('readonly wrapper resolves the menu route, waits for the table and performs
     caseRecord: record(),
     outputDir: '/unused'
   }, {
+    readonly: true,
     login: async () => 'unit-token',
     createApiClient: () => api,
     openRoute: async (_page, route, options) => {
