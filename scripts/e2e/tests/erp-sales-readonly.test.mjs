@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import {
   erpSalesMenuRoute,
+  erpSalesPartialReadOnlyCases,
   erpSalesReadOnlyCases,
   erpSalesReadOnlyViews,
   erpSalesReadonlyArray,
@@ -25,7 +26,7 @@ test('sales readonly catalog cases are executable without claiming full acceptan
   const definitions = new Map(catalog.suites.flatMap((suite) =>
     suite.cases.map((item) => [item.id, item])
   ))
-  for (const caseId of erpSalesReadOnlyCases) {
+  for (const caseId of erpSalesPartialReadOnlyCases) {
     assert.equal(definitions.get(caseId)?.status, 'PARTIAL', caseId)
   }
 })

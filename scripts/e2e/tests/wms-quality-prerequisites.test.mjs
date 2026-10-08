@@ -106,13 +106,12 @@ test('WMS-QC-008 readonly branch stays partial and performs no API writes', asyn
   assert.match(caseRecord.notes.join('\n'), /未验证|未执行任何仓库写操作/)
 })
 
-test('WMS target suite contains no write probe for readonly target cases', () => {
+test('WMS remaining readonly cases stay free of write probes', () => {
   const source = fs.readFileSync(new URL('../suites/wms-quality.mjs', import.meta.url), 'utf8')
-  const target = source.split("if (caseId === 'WMS-QC-005')")[0]
-  assert.doesNotMatch(target, /api\.(post|put|delete)\(/)
-  const switches = source.split("if (caseId === 'WMS-QC-008')")[1].split("if (caseId === 'WMS-QC-009')")[0]
-  assert.doesNotMatch(switches, /api\.(post|put|delete)\(/)
-  assert.match(switches, /finally/)
-  assert.match(switches, /partial: true/)
-  assert.doesNotMatch(target, /readySelector: 'body'/)
+  // WMS-QC-004 / WMS-QC-008 已完成写侧闭环升级；缺口案例 QC-006 / QC-007 仍保持只读，不得私自写库。
+  const qc006 = source.split("if (caseId === 'WMS-QC-006')")[1].split("if (caseId === 'WMS-QC-007')")[0]
+  const qc007 = source.split("if (caseId === 'WMS-QC-007')")[1].split("if (caseId === 'WMS-QC-005')")[0]
+  assert.doesNotMatch(qc006, /api\.(post|put|delete)\(/)
+  assert.doesNotMatch(qc007, /api\.(post|put|delete)\(/)
+  assert.doesNotMatch(source, /readySelector: 'body'/)
 })

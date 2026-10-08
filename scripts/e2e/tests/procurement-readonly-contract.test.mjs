@@ -77,6 +77,95 @@ const run = async (caseId, row, overrides) => {
   return { ...f, caseRecord, result }
 }
 
+const dataModule = (text) => `data:text/javascript;base64,${Buffer.from(text).toString('base64')}`
+let moduleSequence = 0
+const writeEntryError = new Error('UNIT_PROC006_WRITE_FIXTURE_ENTERED')
+
+// Probe the actual wrapper's write boundary without a database, browser or network.
+async function procurementWriteHarness ({ target = 'local', database = true, safetyError } = {}) {
+  const f = fixture('PROC-006', settlement())
+  const caseRecord = record()
+  const events = []
+  let opened
+  let currentUrl = 'http://127.0.0.1:9151/'
+  const page = {
+    url: () => currentUrl,
+    locator: (selector) => {
+      assert.equal(selector, '.el-table__header-wrapper th')
+      return { allInnerTexts: async () => procurementReadOnlyViews['PROC-006'].headers }
+    }
+  }
+  const dependencies = {
+    login: async () => 'unit-token',
+    createApiClient: () => f.api,
+    openRoute: async (_page, route, options) => {
+      opened = { route, options }
+      currentUrl = `http://127.0.0.1:9151${route}`
+    },
+    saveScreenshot: async () => '/unit-only/proc006.png'
+  }
+  const key = `__procurementWriteContract${++moduleSequence}`
+  const injected = {
+    '../config/index.mjs': {
+      config: {
+        target, tenantId: '1', tenantName: 'CFOR 标准平台',
+        webBase: 'http://127.0.0.1:9151', apiBase: 'http://127.0.0.1:48083',
+        db: { host: '127.0.0.1', port: '3306', name: 'cfor_admin_standard', user: 'unit' }
+      }
+    },
+    '../lib/db.mjs': {
+      databaseConfigured: () => database,
+      assertLocalWriteSafety: async () => {
+        events.push('safety')
+        if (safetyError) throw safetyError
+      },
+      runReadOnlySql: async () => assert.fail('wrapper must not execute a real SQL command')
+    },
+    '../fixtures/procurement-settle-rule-write.mjs': {
+      createSettleRuleWriteFixture: async () => {
+        events.push('write-fixture')
+        throw writeEntryError
+      }
+    }
+  }
+  globalThis[key] = injected
+  let module
+  try {
+    const suiteUrl = new URL('../suites/procurement.mjs', import.meta.url)
+    const source = fs.readFileSync(suiteUrl, 'utf8')
+    const body = source.replace(/from '(\.\.?\/[^']+)'/g, (match, specifier) => {
+      const mock = injected[specifier]
+      const url = mock
+        ? dataModule(Object.keys(mock).map((name) =>
+          `export const ${name} = globalThis[${JSON.stringify(key)}][${JSON.stringify(specifier)}].${name};`
+        ).join('\n'))
+        : new URL(specifier, suiteUrl).href
+      return `from ${JSON.stringify(url)}`
+    })
+    module = await import(dataModule(body))
+  } finally {
+    delete globalThis[key]
+  }
+  return {
+    ...f, caseRecord, events, opened: () => opened,
+    run: () => module.runCase({
+      caseId: 'PROC-006', page, caseRecord, record: {}, outputDir: '/unused'
+    }, { ...dependencies, env: { CFOR_E2E_WRITE_FIXTURES: process.env.CFOR_E2E_WRITE_FIXTURES } })
+  }
+}
+
+async function withWriteOptIn (value, action) {
+  const previous = process.env.CFOR_E2E_WRITE_FIXTURES
+  try {
+    if (value === undefined) delete process.env.CFOR_E2E_WRITE_FIXTURES
+    else process.env.CFOR_E2E_WRITE_FIXTURES = value
+    return await action()
+  } finally {
+    if (previous === undefined) delete process.env.CFOR_E2E_WRITE_FIXTURES
+    else process.env.CFOR_E2E_WRITE_FIXTURES = previous
+  }
+}
+
 test('read-only page rejects failed business codes, envelopes and malformed rows/counts', () => {
   for (const payload of [
     { code: 500, data: { list: [], total: 0 } },
@@ -145,7 +234,7 @@ for (const caseId of ['PROC-006', 'PROC-008']) {
     ]) await assert.rejects(() => run(caseId, row, { [path]: ok(versions) }))
   })
 
-  test(`${caseId} wrapper uses actual nested menu component route and specific ready selector`, async () => {
+  if (caseId === 'PROC-008') test(`${caseId} wrapper uses actual nested menu component route and specific ready selector`, async () => {
     const f = fixture(caseId, caseId === 'PROC-006' ? settlement() : purchase())
     const caseRecord = record()
     let currentUrl = 'http://127.0.0.1:9151/'
@@ -187,6 +276,74 @@ for (const caseId of ['PROC-006', 'PROC-008']) {
     assert.equal(f.calls.length, 1)
   })
 }
+
+test('PROC-006 opted-in local wrapper opens the real menu route, then checks safety before write entry', async () => {
+  await withWriteOptIn('true', async () => {
+    const h = await procurementWriteHarness()
+    await assert.rejects(h.run, (error) => error === writeEntryError)
+    assert.deepEqual(h.opened(), {
+      route: '/settings/erp/settle-method-rule',
+      options: { readySelector: procurementReadOnlyViews['PROC-006'].readySelector }
+    })
+    assert.deepEqual(h.events, ['safety', 'write-fixture'])
+    assert.ok(h.caseRecord.checks.every((check) => check.passed))
+    assert.deepEqual(h.caseRecord.evidence, ['/unit-only/proc006.png'])
+  })
+})
+
+for (const value of [undefined, 'false', '1', 'yes']) {
+  test(`PROC-006 opt-in=${value} remains read-only PARTIAL, even with a configured local DB`, async () => {
+    await withWriteOptIn(value, async () => {
+      const h = await procurementWriteHarness()
+      const result = await h.run()
+      assert.equal(result.partial, true)
+      assert.deepEqual(h.events, [], `opt-in=${value} must not enter write preflight or fixture`)
+      assert.ok(h.calls.some((path) => path.includes('/get?id=')))
+      assert.ok(h.calls.some((path) => path.includes('/list-by-')))
+    })
+  })
+}
+
+test('PROC-006 opt-in cannot write on a nonlocal target, even with a loopback evidence DB', async () => {
+  await withWriteOptIn('true', async () => {
+    const h = await procurementWriteHarness({ target: 'production' })
+    await assert.rejects(h.run, /^Error: BLOCKED:.*(?:local|本地|target)/i)
+    assert.deepEqual(h.events, [], 'target guard must run before write preflight or fixture')
+  })
+})
+
+test('PROC-006 opt-in requires configured and safe DB evidence before write entry', async () => {
+  await withWriteOptIn('true', async () => {
+    const missing = await procurementWriteHarness({ database: false })
+    await assert.rejects(missing.run, /BLOCKED.*本地数据库/)
+    assert.deepEqual(missing.events, [])
+    const unsafe = await procurementWriteHarness({
+      safetyError: new Error('BLOCKED: unit enabled-jobs must be zero')
+    })
+    await assert.rejects(unsafe.run, /BLOCKED.*enabled-jobs/)
+    assert.deepEqual(unsafe.events, ['safety'])
+  })
+})
+
+test('PROC-006 read-only contract never writes, even when write opt-in is explicitly enabled', async () => {
+  await withWriteOptIn('true', async () => {
+    const f = fixture('PROC-006', settlement())
+    const writes = []
+    for (const method of ['postBusiness', 'putBusiness', 'deleteBusiness', 'post', 'put', 'delete', 'request']) {
+      f.api[method] = async (...args) => {
+        writes.push([method, ...args])
+        assert.fail(`read-only contract called ${method}`)
+      }
+    }
+    const cr = record()
+    const result = await runProcurementReadOnlyContract({ caseId: 'PROC-006', api: f.api, caseRecord: cr })
+    assert.equal(result.partial, true)
+    assert.deepEqual(writes, [])
+    assert.ok(cr.checks.every((check) => check.passed))
+    assert.ok(f.calls.some((path) => path.includes('/get?id=')))
+    assert.ok(f.calls.some((path) => path.includes('/list-by-')))
+  })
+})
 
 test('PROC-006 rejects invalid direction, boolean flags and account type structure', async () => {
   for (const change of [

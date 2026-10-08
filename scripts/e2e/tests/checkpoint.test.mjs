@@ -41,11 +41,12 @@ test('only current complete runnable cases can reuse passed checkpoints', () => 
     ['READY', { status: 'READY' }],
     ['DEFAULT', {}],
     ['PARTIAL', { status: 'PARTIAL' }],
+    ['GAPS', { status: 'READY', acceptanceGaps: ['Unverified consumption'] }],
     ['DESIGNED', { status: 'DESIGNED' }],
     ['BLOCKED', { status: 'BLOCKED' }]
   ])
   assert.deepEqual([...resumableCases(
-    ['READY', 'DEFAULT', 'PARTIAL', 'DESIGNED', 'BLOCKED', 'REMOVED'], definitions
+    ['READY', 'DEFAULT', 'PARTIAL', 'GAPS', 'DESIGNED', 'BLOCKED', 'REMOVED'], definitions
   )], ['READY', 'DEFAULT'])
   assert.equal(resumableCases(null, definitions).size, 0)
 })

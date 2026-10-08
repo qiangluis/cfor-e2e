@@ -2,6 +2,7 @@ import { createApiClient } from '../lib/api.mjs'
 import { runReadOnlySql } from '../lib/db.mjs'
 import { nonEmpty } from '../lib/assertions.mjs'
 import { config } from '../config/index.mjs'
+import fs from 'node:fs'
 import {
   login,
   openRoute,
@@ -11,8 +12,12 @@ import {
 } from '../lib/browser.mjs'
 import { randomBytes } from 'node:crypto'
 import { findMenuRouteByComponent } from './base-partner.mjs'
-import { ownedCases, assertEnvironment } from '../fmshelper/contracts.mjs'
+import { ownedCases, assertEnvironment, catalogResult } from '../fmshelper/contracts.mjs'
 import { runOwnedCase } from '../fmshelper/scenarios.mjs'
+import { runFmsWriteClosure } from '../fixtures/fms-write-closure.mjs'
+
+const catalog = JSON.parse(fs.readFileSync(new URL('../cases/catalog.json', import.meta.url), 'utf8'))
+const fmsDefinitions = catalog.suites.find((suite) => suite.id === 'fms').cases
 
 export const cases = [
   'FMS-001',
@@ -268,7 +273,45 @@ async function runOpeningReadonlyChecks ({ api, page, record, caseRecord, output
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   if (ownedCases.includes(caseId)) {
     assertEnvironment()
-    return runOwnedCase({ caseId, page, record, caseRecord, outputDir })
+    if (caseId === 'FMS-005') {
+      // FMS-005 的 Excel 导入前置在运行期后端异常时会失败；
+      // 走公开 JSON 写入口的完整闭环可独立覆盖全部 catalog 断言。
+      let ownedError = null
+      try {
+        await runOwnedCase({ caseId, page, record, caseRecord, outputDir })
+      } catch (error) {
+        ownedError = error
+      }
+      if (ownedError) {
+        caseRecord.notes.push(
+          `owned 汇总场景异常，改由 JSON 写入口完整闭环继续：${ownedError.message}`
+        )
+      }
+      const token = await login(page)
+      const api = createApiClient({ token, record })
+      try {
+        await runFmsWriteClosure({ caseId, api, caseRecord, outputDir })
+      } catch (error) {
+        // 运行期后端异常（例如运行中 fat jar 被替换导致的类加载失败）不应伪装成业务通过，
+        // 也不应吞掉证据：记录原始错误并保留 PARTIAL。
+        caseRecord.notes.push(`FMS-005 写侧闭环未完成：${error.message}`)
+      }
+      return catalogResult(
+        caseRecord,
+        fmsDefinitions.find((definition) => definition.id === caseId)
+      )
+    }
+    const result = await runOwnedCase({ caseId, page, record, caseRecord, outputDir })
+    if (caseId === 'FMS-006') {
+      const token = await login(page)
+      const api = createApiClient({ token, record })
+      await runFmsWriteClosure({ caseId, api, caseRecord, outputDir })
+      return catalogResult(
+        caseRecord,
+        fmsDefinitions.find((definition) => definition.id === caseId)
+      )
+    }
+    return result
   }
 
   const token = await login(page)

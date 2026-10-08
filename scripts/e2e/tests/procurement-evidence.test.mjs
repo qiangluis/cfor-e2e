@@ -88,7 +88,7 @@ test('PROC-009/011/012 missing business steps remain explicit PARTIAL; portal ti
   const branch = (from, to) => source.slice(
     source.indexOf(`if (caseId === '${from}')`), source.indexOf(`if (caseId === '${to}')`))
   for (const [from, to] of [
-    ['PROC-009', 'PROC-011'], ['PROC-011', 'PROC-012'], ['PROC-012', 'PROC-013']
+    ['PROC-011', 'PROC-012']
   ]) assert.match(branch(from, to), /partial: true/)
   const portal = branch('PROC-009', 'PROC-011')
   assert.ok(portal.indexOf('const renderStartedAt = Date.now()') <

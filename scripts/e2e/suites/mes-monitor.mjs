@@ -1,95 +1,103 @@
 import { createApiClient } from '../lib/api.mjs'
-import { login, saveScreenshot } from '../lib/browser.mjs'
+import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { ExecutionWorkflowFixture } from '../fixtures/mes-execution-write.mjs'
 
 export const cases = ['MES-MONITOR-001']
+
+const unwrap = (response, label) => {
+  assertBusinessSuccess(response, label)
+  return response && Object.prototype.hasOwnProperty.call(response, 'data')
+    ? response.data
+    : response
+}
 
 /**
  * PB-312：生产执行看板车间数据权限过滤与预警下钻字段回归。
  *
- * 只做只读校验，不触发 /mes/monitor/alarms/dispatch，避免在环境内产生待办与站内通知。
+ * 自动化只创建专属逾期工单并读取看板，不触发
+ * /mes/monitor/alarms/dispatch，避免在环境中产生额外待办与站内通知。
  */
 export const runCase = async ({ page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
+  const fixture = new ExecutionWorkflowFixture(api, record, caseRecord.id, { overdue: true })
+  try {
+    await fixture.setup(caseRecord)
 
-  const workplacesResult = await api.getBusiness('/mes/monitor/workplaces')
-  const workplaces = workplacesResult?.data ?? workplacesResult
-  caseRecord.checks.push({
-    name: '车间列表按当前登录用户数据权限返回，字段完整',
-    passed:
-      Array.isArray(workplaces) &&
-      workplaces.every(
-        (workplace) =>
-          workplace?.id != null &&
-          typeof workplace?.name === 'string' &&
-          workplace.name.length > 0
-      ),
-    details: JSON.stringify({
-      count: Array.isArray(workplaces) ? workplaces.length : -1,
-      sample: Array.isArray(workplaces)
-        ? workplaces.slice(0, 3).map((item) => ({ id: item.id, name: item.name }))
-        : null
-    })
-  })
-
-  if (!Array.isArray(workplaces) || workplaces.length === 0) {
+    const workplacesResult = await api.getBusiness('/mes/monitor/workplaces')
+    const workplaces = workplacesResult?.data ?? workplacesResult
     caseRecord.checks.push({
-      name: '生产看板返回预警下钻字段（alarmKey/sourceType/sourceId）',
-      passed: false,
-      details: '当前登录账号没有可见车间，无法验证看板预警字段；需先为账号配置部门与车间归属'
+      name: '车间列表按当前登录用户数据权限返回，且包含专属工单所属车间',
+      passed:
+        Array.isArray(workplaces) &&
+        workplaces.some((workplace) => String(workplace?.id) === String(fixture.workplace.id)) &&
+        workplaces.every(
+          (workplace) =>
+            workplace?.id != null &&
+            typeof workplace?.name === 'string' &&
+            workplace.name.length > 0
+        ),
+      details: JSON.stringify({
+        count: Array.isArray(workplaces) ? workplaces.length : -1,
+        workplaceId: fixture.workplace.id
+      })
     })
+
+    const dashboardResult = await api.getBusiness(
+      `/mes/monitor/production-dashboard?workplaceId=${encodeURIComponent(fixture.workplace.id)}`
+    )
+    const dashboard = dashboardResult?.data ?? dashboardResult
+    caseRecord.checks.push({
+      name: '生产看板按车间返回 lines/alarms/trends 结构化数据',
+      passed:
+        Array.isArray(dashboard?.lines) &&
+        Array.isArray(dashboard?.alarms) &&
+        Array.isArray(dashboard?.trends),
+      details: JSON.stringify({
+        workplaceId: fixture.workplace.id,
+        lines: dashboard?.lines?.length ?? -1,
+        alarms: dashboard?.alarms?.length ?? -1,
+        trends: dashboard?.trends?.length ?? -1
+      })
+    })
+
+    const alarms = Array.isArray(dashboard?.alarms) ? dashboard.alarms : []
+    const ownAlarms = alarms.filter(
+      (alarm) => String(alarm?.sourceId) === String(fixture.works[0].id)
+    )
+    caseRecord.checks.push({
+      name: '真实逾期专属工单产生带 alarmKey/sourceType/sourceId 的可下钻预警',
+      passed:
+        ownAlarms.length === 1 &&
+        ownAlarms[0]?.sourceType === 'WORK' &&
+        ownAlarms[0]?.alarmKey === `WORK_OVERDUE:${fixture.works[0].id}` &&
+        String(ownAlarms[0]?.sourceId) === String(fixture.works[0].id),
+      details: JSON.stringify(ownAlarms.slice(0, 3))
+    })
+
+    const drilldown = unwrap(await api.getBusiness(
+      `/mes/prodWork/queryById?id=${encodeURIComponent(fixture.works[0].id)}`
+    ), '预警工单下钻')
+    caseRecord.checks.push({
+      name: '预警 sourceId 下钻回读同一专属工单且所有权一致',
+      passed:
+        String(drilldown?.id) === String(fixture.works[0].id) &&
+        drilldown?.remark === fixture.marker,
+      details: JSON.stringify({
+        workId: drilldown?.id,
+        remark: drilldown?.remark,
+        marker: fixture.marker
+      })
+    })
+
+    await openRoute(page, '/mes/monitor', { readyText: '生产看板' }).catch(() => null)
+    await saveScreenshot(page, outputDir, 'mes-monitor-workplace-alarms', record)
+    caseRecord.evidence.push(
+      `真实创建 ${fixture.marker} 逾期工单并读取生产看板聚合与工单下钻；未调用 alarms/dispatch`
+    )
     return { api }
+  } finally {
+    await fixture.cleanup(caseRecord)
   }
-
-  const selected = workplaces[0]
-  const dashboardResult = await api.getBusiness(
-    `/mes/monitor/production-dashboard?workplaceId=${encodeURIComponent(selected.id)}`
-  )
-  const dashboard = dashboardResult?.data ?? dashboardResult
-
-  caseRecord.checks.push({
-    name: '生产看板按车间返回结构化数据',
-    passed:
-      Array.isArray(dashboard?.lines) &&
-      Array.isArray(dashboard?.alarms) &&
-      Array.isArray(dashboard?.trends),
-    details: JSON.stringify({
-      workplaceId: selected.id,
-      lines: dashboard?.lines?.length ?? -1,
-      alarms: dashboard?.alarms?.length ?? -1,
-      trends: dashboard?.trends?.length ?? -1
-    })
-  })
-
-  const alarms = Array.isArray(dashboard?.alarms) ? dashboard.alarms : []
-  const malformed = alarms.filter(
-    (alarm) =>
-      typeof alarm?.alarmKey !== 'string' ||
-      alarm.alarmKey.length === 0 ||
-      !['DEVICE', 'WORK'].includes(alarm?.sourceType) ||
-      String(alarm?.sourceId || '').length === 0
-  )
-  caseRecord.checks.push({
-    name: '每条预警都带来源唯一键，可下钻到设备或生产工单',
-    passed: malformed.length === 0,
-    details: JSON.stringify({
-      alarms: alarms.length,
-      malformed: malformed.length,
-      sample: alarms.slice(0, 3).map((alarm) => ({
-        alarmKey: alarm?.alarmKey,
-        sourceType: alarm?.sourceType,
-        sourceId: alarm?.sourceId
-      }))
-    })
-  })
-
-  await saveScreenshot(page, outputDir, 'mes-monitor-workplace-alarms', record)
-  caseRecord.evidence.push('真实登录后调用生产看板车间列表与看板聚合接口（只读）')
-  return alarms.length > 0
-    ? { api }
-    : {
-        api,
-        partial: true,
-        note: '当前可见车间暂无预警，来源唯一键下钻待产生真实预警后复测'
-      }
 }

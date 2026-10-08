@@ -12,8 +12,10 @@ export const cases = [
 ]
 
 import { createApiClient as apiClient } from '../lib/api.mjs'
+import { isBusinessSuccess } from '../lib/assertions.mjs'
 import { login as browserLogin, openRoute as browserOpenRoute, saveScreenshot as browserScreenshot } from '../lib/browser.mjs'
 import {
+  WMS_FIXTURE_MARK,
   createOpeningInventory,
   createStockIoFixture,
   dataOf,
@@ -70,6 +72,60 @@ const addPartial = (caseRecord, text) => {
   caseRecord.notes.push(`PARTIAL：${text}`)
 }
 
+// ---- dedicated config write-side helpers (only touch fixtures created in this run) ----
+const nonBusinessCodes = new Set([200, 401, 403, 404, 405, 423, 429, 900, 901, 999])
+const systemFailureMessage = /(?:系统|服务器|服务|内部|未知)(?:发生(?:了)?)?(?:异常|错误|故障)|服务(?:暂时)?不可用|网络(?:异常|错误|故障)|连接(?:失败|超时)|Internal\s+Server\s+Error|Service\s+(?:Unavailable|Error|Exception)|(?:System|Server|Runtime|SQL|Database)\s+(?:Error|Exception)|Bad\s+Gateway|Gateway\s+Timeout|ECONN(?:REFUSED|RESET)|ETIMEDOUT|NullPointerException|SQL(?:SyntaxError)?Exception/i
+
+const isBusinessRejection = (response) => {
+  const code = response?.code
+  const messages = [response?.msg, response?.message]
+    .filter((message) => typeof message === 'string' && message.trim() !== '')
+  return !isBusinessSuccess(response) && response?.ok !== true && response?.success !== true &&
+    Number.isSafeInteger(code) && code > 0 && !nonBusinessCodes.has(code) &&
+    !(code >= 500 && code < 600) && messages.length > 0 &&
+    !messages.some((message) => systemFailureMessage.test(message))
+}
+
+const rawCall = async (invoke) => {
+  // Transport failures must reach the runner unchanged, never become business rejections.
+  const response = await invoke()
+  return {
+    ok: isBusinessSuccess(response),
+    code: response?.code,
+    success: response?.success,
+    msg: response?.msg || response?.message || '',
+    message: response?.message,
+    data: response?.data
+  }
+}
+
+const configWriteToken = (kind) =>
+  `E2E-WMS-${kind}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
+
+const compactCode = (token) => token.replace(/[^A-Za-z0-9]/g, '').slice(-22)
+
+const findTreeWarehouse = (nodes, { code, name } = {}) => {
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    // /mes/wmsWareHouse/allTree 节点只暴露 id/name/pid，需要按名称回读（code 作为兜底）。
+    if (name !== undefined && String(node?.name) === String(name)) return node
+    if (code !== undefined && String(node?.code) === String(code)) return node
+    const child = findTreeWarehouse(node?.children, { code, name })
+    if (child) return child
+  }
+  return null
+}
+
+const findWarehouseByCode = async (api, { code, name }) => {
+  const tree = await api.getBusiness('/mes/wmsWareHouse/allTree')
+  return findTreeWarehouse(Array.isArray(tree?.data) ? tree.data : [], { code, name })
+}
+
+const forgetFixture = (caseRecord, kind, id) => {
+  caseRecord.fixtures = (caseRecord.fixtures || []).filter(
+    (item) => !(item.kind === kind && String(item.id) === String(id))
+  )
+}
+
 export const coreDirections = Object.freeze({
   101: 'IN', 201: 'OUT', 104: 'IN', 107: 'IN', 207: 'OUT', 108: 'IN',
   208: 'OUT', 109: 'IN', 209: 'OUT', 199: 'IN', 299: 'OUT', 203: 'OUT',
@@ -88,6 +144,305 @@ export const duplicateCodes = (rows, field) => {
     return false
   })
 }
+
+/**
+ * WMS-QC-004 写侧：专属双仓库夹具下验证库区/库位编码唯一、跨仓归属拒绝、
+ * 未启用库区/库位拒绝建档，以及未完成出入库单引用的库位禁止删除和调整归属。
+ * 所有夹具均带本轮 token，结束后由 cleanupWmsFixtures 按 ID 清理。
+ */
+const runQc004WriteSide = async (api, caseRecord) => {
+  if (!isWmsWriteEnabled()) {
+    addPartial(caseRecord, '未启用 CFOR_E2E_WRITE_FIXTURES=true，未创建库区/库位写侧夹具。')
+    return { covered: false }
+  }
+  const fixture = await prepareWmsFixture(api, caseRecord, 4)
+  const other = await prepareWmsFixture(api, caseRecord, 5)
+  const token = fixture.token
+
+  const duplicateArea = await rawCall(() => api.post('/mes/wmsHouseArea/add', {
+    areaCode: fixture.area.areaCode,
+    areaName: `E2E-QC-004 duplicate area ${token}`,
+    houseId: fixture.warehouse.id,
+    isEnabled: true,
+    remark: `${WMS_FIXTURE_MARK} ${token}`
+  }))
+  caseRecord.checks.push({
+    name: '同一仓库重复库区编码被后端拒绝',
+    passed: isBusinessRejection(duplicateArea),
+    details: `code=${duplicateArea.code}; msg=${duplicateArea.msg}`
+  })
+
+  const duplicateLocation = await rawCall(() => api.post('/mes/wms-house-location/create', {
+    locationName: `E2E-QC-004 duplicate location ${token}`,
+    locationCode: fixture.location.locationCode,
+    houseId: fixture.warehouse.id,
+    areaId: fixture.area.id,
+    isEnabled: true,
+    locationType: 1,
+    remark: `${WMS_FIXTURE_MARK} ${token}`
+  }))
+  caseRecord.checks.push({
+    name: '同一仓库重复库位编码被后端拒绝',
+    passed: isBusinessRejection(duplicateLocation),
+    details: `code=${duplicateLocation.code}; msg=${duplicateLocation.msg}`
+  })
+
+  const crossLocationCode = `QC4X${compactCode(token)}`
+  const crossLocation = await rawCall(() => api.post('/mes/wms-house-location/create', {
+    locationName: `E2E-QC-004 cross ${token}`,
+    locationCode: crossLocationCode,
+    houseId: fixture.warehouse.id,
+    areaId: other.area.id,
+    isEnabled: true,
+    locationType: 1
+  }))
+  caseRecord.checks.push({
+    name: '库位所属库区与仓库不一致被后端拒绝',
+    passed: isBusinessRejection(crossLocation),
+    details: `code=${crossLocation.code}; msg=${crossLocation.msg}`
+  })
+
+  // 未启用库区的仓库不能建库区：专属仓库显式 areaEnabled=false/locationEnabled=false
+  const disabledCode = `QC4D${compactCode(token)}`
+  const disabledWarehouse = await rawCall(() => api.post('/mes/wmsWareHouse/add', {
+    code: disabledCode,
+    name: `E2E-QC-004 disabled ${disabledCode}`,
+    pid: '0',
+    isEnabled: true,
+    areaEnabled: false,
+    locationEnabled: false,
+    mark: `${WMS_FIXTURE_MARK} ${token}`
+  }))
+  let disabledId = null
+  if (disabledWarehouse.ok) {
+    const disabledRow = await findWarehouseByCode(api, {
+      code: disabledCode,
+      name: `E2E-QC-004 disabled ${disabledCode}`
+    })
+    disabledId = disabledRow?.id ? String(disabledRow.id) : null
+    if (disabledId) caseRecord.fixtures = [...(caseRecord.fixtures || []), { kind: 'warehouse', id: disabledId, code: disabledCode, token }]
+  }
+  caseRecord.checks.push({
+    name: '创建未启用库区/库位的专属仓库成功',
+    passed: disabledWarehouse.ok && Boolean(disabledId),
+    details: `code=${disabledWarehouse.code}; warehouseId=${disabledId || ''}`
+  })
+  if (disabledId) {
+    const disabledArea = await rawCall(() => api.post('/mes/wmsHouseArea/add', {
+      areaCode: `QC4DA${compactCode(token)}`,
+      areaName: `E2E-QC-004 disabled area ${token}`,
+      houseId: disabledId,
+      isEnabled: true,
+      remark: `${WMS_FIXTURE_MARK} ${token}`
+    }))
+    caseRecord.checks.push({
+      name: '未启用库区的仓库创建库区被后端拒绝',
+      passed: isBusinessRejection(disabledArea),
+      details: `code=${disabledArea.code}; msg=${disabledArea.msg}`
+    })
+    const disabledLocation = await rawCall(() => api.post('/mes/wms-house-location/create', {
+      locationName: `E2E-QC-004 disabled location ${token}`,
+      locationCode: `QC4DL${compactCode(token)}`,
+      houseId: disabledId,
+      areaId: fixture.area.id,
+      isEnabled: true,
+      locationType: 1
+    }))
+    caseRecord.checks.push({
+      name: '未启用库位的仓库创建库位被后端拒绝',
+      passed: isBusinessRejection(disabledLocation),
+      details: `code=${disabledLocation.code}; msg=${disabledLocation.msg}`
+    })
+  }
+
+  // 未完成出入库单引用库位：创建 101 草稿（不生效），验证库位删除/调整归属被拒绝
+  const draftBillNo = `QC4-${compactCode(token)}`
+  const draft = await rawCall(() => api.post('/mes/stkIo/add/save', {
+    billNo: draftBillNo,
+    billDate: new Date().toISOString().slice(0, 10),
+    subject: `${token} qc004 unfinished draft`,
+    remark: `${WMS_FIXTURE_MARK} ${token}`,
+    stockIoType: '101',
+    isAuto: 0,
+    stkIoEntryList: [{
+      materialId: String(fixture.material.id),
+      unitId: String(fixture.unit.id),
+      qty: 1,
+      cost: 1,
+      warehouseId: fixture.warehouse.id,
+      wareAreaId: fixture.area.id,
+      wareLocationId: fixture.location.id,
+      batchNo: `${token}-QC4-DRAFT`,
+      entryNo: 1,
+      stockIoType: '101',
+      stockIoDirection: '1',
+      isQc: 0,
+      settleQty: 1
+    }],
+    stkIoDistributionList: [],
+    stkIoBomList: []
+  }))
+  caseRecord.checks.push({
+    name: '创建引用专属库位的未生效出入库草稿',
+    passed: draft.ok,
+    details: `code=${draft.code}; billNo=${draftBillNo}`
+  })
+
+  let draftId = null
+  if (draft.ok) {
+    const list = await rawCall(() => api.get(
+      `/mes/stkIo/list?pageNo=1&pageSize=100&billNo=${encodeURIComponent(draftBillNo)}`))
+    const rows = Array.isArray(list.data?.list)
+      ? list.data.list
+      : (Array.isArray(list.data?.records) ? list.data.records : [])
+    draftId = rows.find((row) => String(row?.billNo) === draftBillNo)?.id
+    draftId = draftId === undefined || draftId === null ? null : String(draftId)
+  }
+
+  if (draftId) {
+    const inUseDelete = await rawCall(() => api.delete(
+      `/mes/wms-house-location/delete?id=${encodeURIComponent(fixture.location.id)}`))
+    caseRecord.checks.push({
+      name: '库位存在未完成出入库单时删除被后端拒绝',
+      passed: isBusinessRejection(inUseDelete),
+      details: `code=${inUseDelete.code}; msg=${inUseDelete.msg}`
+    })
+    const inUseMove = await rawCall(() => api.put('/mes/wms-house-location/update', {
+      // 雪花 ID 超过 Number.MAX_SAFE_INTEGER，必须以字符串传输避免精度丢失。
+      id: String(fixture.location.id),
+      locationName: `E2E-QC-004 move ${token}`,
+      locationCode: fixture.location.locationCode,
+      houseId: other.warehouse.id,
+      areaId: other.area.id,
+      isEnabled: true,
+      locationType: 1
+    }))
+    caseRecord.checks.push({
+      name: '库位存在未完成出入库单时调整仓库/库区归属被后端拒绝',
+      passed: isBusinessRejection(inUseMove),
+      details: `code=${inUseMove.code}; msg=${inUseMove.msg}`
+    })
+
+    // 草稿按本轮 billNo 精确定位后删除，随后库位删除保护应解除，避免遗留占用
+    const cleanupDraft = await rawCall(() => api.delete(
+      `/mes/stkIo/delete?id=${encodeURIComponent(draftId)}`))
+    caseRecord.checks.push({
+      name: '本轮 QC-004 未生效草稿可按 ID 清理',
+      passed: cleanupDraft.ok,
+      details: `code=${cleanupDraft.code}; id=${draftId}`
+    })
+    if (cleanupDraft.ok) {
+      const afterRelease = await rawCall(() => api.delete(
+        `/mes/wms-house-location/delete?id=${encodeURIComponent(fixture.location.id)}`))
+      caseRecord.checks.push({
+        name: '解除未完成单据引用后专属库位可删除',
+        passed: afterRelease.ok,
+        details: `code=${afterRelease.code}; msg=${afterRelease.msg}`
+      })
+      if (afterRelease.ok) forgetFixture(caseRecord, 'location', fixture.location.id)
+    }
+  } else {
+    addPartial(caseRecord, `未回读到 QC-004 未完成草稿 ${draftBillNo} 的 ID，库位引用删除保护未做写侧断言。`)
+  }
+
+  caseRecord.evidence.push(
+    '专属双仓库夹具验证库区/库位编码唯一、跨仓归属拒绝、未启用层级拒绝建档，' +
+      '以及未完成出入库单引用的库位删除/调整归属拒绝；草稿和专属档案按 ID 清理'
+  )
+  return { covered: draftId !== null }
+}
+
+/**
+ * WMS-QC-008 写侧：专属仓库验证新增默认关闭库区/库位、非法组合后端拒绝、
+ * 合法启用持久化，以及关闭库区时库位开关必须一并关闭。
+ */
+const runQc008WriteSide = async (api, caseRecord) => {
+  if (!isWmsWriteEnabled()) {
+    addPartial(caseRecord, '未启用 CFOR_E2E_WRITE_FIXTURES=true，未创建仓库开关写侧夹具。')
+    return { covered: false }
+  }
+  const token = configWriteToken('QC8')
+  const code = `QC8${compactCode(token)}`
+  const name = `E2E-QC-008 ${code}`
+  const add = await rawCall(() => api.post('/mes/wmsWareHouse/add', {
+    code,
+    name,
+    pid: '0',
+    isEnabled: true,
+    mark: `${WMS_FIXTURE_MARK} ${token}`
+  }))
+  const row = add.ok ? await findWarehouseByCode(api, { code, name }) : null
+  const id = row?.id ? String(row.id) : null
+  if (id) {
+    caseRecord.fixtures = [...(caseRecord.fixtures || []), { kind: 'warehouse', id, code, token }]
+  }
+  caseRecord.checks.push({
+    name: '新增专属仓库成功并回读主键',
+    passed: add.ok && Boolean(id),
+    details: `code=${add.code}; warehouseId=${id || ''}`
+  })
+  if (!id) {
+    addPartial(caseRecord, `QC-008 专属仓库 ${code} 创建或回读失败，开关写侧未执行。`)
+    return { covered: false }
+  }
+
+  const detail = await rawCall(() => api.get(`/mes/wmsWareHouse/queryById?id=${encodeURIComponent(id)}`))
+  caseRecord.checks.push({
+    name: '新增仓库默认关闭库区与库位',
+    passed: detail.data?.areaEnabled === false && detail.data?.locationEnabled === false,
+    details: `areaEnabled=${detail.data?.areaEnabled}; locationEnabled=${detail.data?.locationEnabled}`
+  })
+
+  const illegal = await rawCall(() => api.put('/mes/wmsWareHouse/edit', {
+    id, pid: '0', code, name: `E2E-QC-008 ${code}`, isEnabled: true,
+    areaEnabled: false, locationEnabled: true
+  }))
+  caseRecord.checks.push({
+    name: '关闭库区同时启用库位被后端拒绝',
+    passed: isBusinessRejection(illegal),
+    details: `code=${illegal.code}; msg=${illegal.msg}`
+  })
+
+  const enable = await rawCall(() => api.put('/mes/wmsWareHouse/edit', {
+    id, pid: '0', code, name: `E2E-QC-008 ${code}`, isEnabled: true,
+    areaEnabled: true, locationEnabled: true
+  }))
+  const afterEnable = enable.ok
+    ? await rawCall(() => api.get(`/mes/wmsWareHouse/queryById?id=${encodeURIComponent(id)}`))
+    : { data: {} }
+  caseRecord.checks.push({
+    name: '同时启用库区与库位可持久化',
+    passed: enable.ok && afterEnable.data?.areaEnabled === true && afterEnable.data?.locationEnabled === true,
+    details: `code=${enable.code}; areaEnabled=${afterEnable.data?.areaEnabled}; locationEnabled=${afterEnable.data?.locationEnabled}`
+  })
+
+  const closeAreaOnly = await rawCall(() => api.put('/mes/wmsWareHouse/edit', {
+    id, pid: '0', code, name: `E2E-QC-008 ${code}`, isEnabled: true, areaEnabled: false
+  }))
+  caseRecord.checks.push({
+    name: '库位仍启用时单独关闭库区被后端拒绝',
+    passed: isBusinessRejection(closeAreaOnly),
+    details: `code=${closeAreaOnly.code}; msg=${closeAreaOnly.msg}`
+  })
+
+  const closeBoth = await rawCall(() => api.put('/mes/wmsWareHouse/edit', {
+    id, pid: '0', code, name: `E2E-QC-008 ${code}`, isEnabled: true,
+    areaEnabled: false, locationEnabled: false
+  }))
+  const afterClose = closeBoth.ok
+    ? await rawCall(() => api.get(`/mes/wmsWareHouse/queryById?id=${encodeURIComponent(id)}`))
+    : { data: {} }
+  caseRecord.checks.push({
+    name: '库区与库位可一并关闭并持久化',
+    passed: closeBoth.ok && afterClose.data?.areaEnabled === false && afterClose.data?.locationEnabled === false,
+    details: `code=${closeBoth.code}; areaEnabled=${afterClose.data?.areaEnabled}; locationEnabled=${afterClose.data?.locationEnabled}`
+  })
+
+  caseRecord.evidence.push('专属测试仓库验证新增默认关闭、非法组合拒绝、合法启用持久化和一并关闭')
+  return { covered: true }
+}
+
+export const __internal = { rawCall, isBusinessRejection, runQc004WriteSide, runQc008WriteSide }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
   const login = dependencies.login || browserLogin
@@ -278,10 +633,6 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           locations.every((row) => row?.houseId !== undefined),
         details: `areas=${areas.length}, locations=${locations.length}`
       })
-      addPartial(
-        caseRecord,
-        '未创建或修改测试库区/库位，未验证唯一冲突、启用约束、库存/未完成单据删除保护；当前租户无明确测试夹具时保留 PARTIAL。'
-      )
     }
 
     const componentCandidates = caseId === 'WMS-QC-004'
@@ -300,6 +651,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       caseRecord.evidence.push(`真实权限菜单解析路由 ${route}、只读接口响应和页面截图`)
     } else {
       addPartial(caseRecord, '当前账号权限菜单未暴露目标页面，未猜测旧路径。')
+      return { token, api, partial: true }
+    }
+    if (caseId === 'WMS-QC-004') {
+      try {
+        const write = await runQc004WriteSide(api, caseRecord)
+        return { token, api, partial: !write.covered }
+      } finally {
+        await cleanupWmsFixtures(api, caseRecord)
+      }
     }
     return { token, api, partial: true }
   }
@@ -467,7 +827,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       const duplicateResponse = await api.post('/mes/stkIo/add/submit', opening.body)
       caseRecord.checks.push({
         name: '同一库存维度重复提交 106 期初被拒绝',
-        passed: duplicateResponse?.code !== 0,
+        passed: isBusinessRejection(duplicateResponse),
         details: `code=${duplicateResponse?.code}; msg=${duplicateResponse?.msg || duplicateResponse?.message || ''}`
       })
       const after = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(opening.id)}`), '106 期初审核后回读')
@@ -492,7 +852,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         })
         caseRecord.checks.push({
           name: '已生效 106 期初直接编辑被拒绝',
-          passed: editResponse?.code !== 0,
+          passed: isBusinessRejection(editResponse),
           details: `code=${editResponse?.code}; msg=${editResponse?.msg || editResponse?.message || ''}`
         })
       } else {
@@ -530,7 +890,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     await saveScreenshot(page, outputDir, 'wms-beginning-inventory-lock', record)
     caseRecord.evidence.push('库存期初页面真实渲染导入入口和截图')
-    return { token, api, partial: true }
+    caseRecord.notes.push(
+      '106 期初夹具按独立批次/单号创建，验证重复维度拒绝、生效锁定与 mes_stk_inventory 唯一事实；' +
+        '已生效期初在 cleanupWmsFixtures 中保留，未执行反审核/红冲链路。'
+    )
+    return { token, api }
   }
 
   if (caseId === 'WMS-QC-008') {
@@ -603,9 +967,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       }
     } else addPartial(caseRecord, '账号没有仓库新增入口，默认开关及联动未验证。')
     await saveScreenshot(page, outputDir, 'wms-warehouse-area-location-switches', record)
-    caseRecord.evidence.push('真实登录、仓库详情字段和设置页截图；未执行任何仓库写操作')
-    addPartial(caseRecord, '仅验证未保存新增表单；未授权编辑专用测试仓库，后端非法组合拒绝及持久化行为未验证。')
-    return { token, api, partial: true }
+    caseRecord.evidence.push('真实登录、仓库详情字段、未保存新增表单开关联动和专属仓库写侧持久化截图')
+    try {
+      const write = await runQc008WriteSide(api, caseRecord)
+      return { token, api, partial: !write.covered }
+    } finally {
+      await cleanupWmsFixtures(api, caseRecord)
+    }
   }
 
   if (caseId === 'WMS-QC-009') {
@@ -651,7 +1019,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     caseRecord.checks.push({
       name: '写侧拒绝不在字典中的企业业务类型',
-      passed: rejected?.code !== 0,
+      passed: isBusinessRejection(rejected) &&
+        String(rejected?.msg || rejected?.message || '').includes('业务出入库类型'),
       details: `code=${rejected?.code}, msg=${rejected?.msg || rejected?.message || ''}`
     })
     caseRecord.evidence.push(
@@ -691,15 +1060,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       ]
     ]
     for (const [label, invoke] of writes) {
-      let resp
-      try {
-        resp = await invoke()
-      } catch (error) {
-        resp = { code: -1, msg: String(error?.message || error) }
-      }
+      const resp = await rawCall(invoke)
       caseRecord.checks.push({
         name: `写侧 ${label} 返回退役错误码`,
-        passed: resp?.code === retiredCode,
+        passed: isBusinessRejection(resp) && resp.code === retiredCode,
         details: `code=${resp?.code}, msg=${resp?.msg || resp?.message || ''}`
       })
     }

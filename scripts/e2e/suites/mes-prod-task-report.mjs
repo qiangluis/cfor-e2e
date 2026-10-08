@@ -2,6 +2,7 @@ import { createApiClient } from '../lib/api.mjs'
 import { isBusinessSuccess } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { databaseConfigured, runReadOnlySql } from '../lib/db.mjs'
+import { ExecutionWorkflowFixture } from '../fixtures/mes-execution-write.mjs'
 
 export const cases = ['MES-TASK-REPORT-001', 'MES-TASK-REPORT-002']
 
@@ -101,74 +102,101 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
     await saveScreenshot(page, outputDir, 'mes-task-report-version', record)
     caseRecord.evidence.push('真实登录后调用生产工单任务分页接口校验 reportVersion（只读）')
-    return tasks.length > 0
-      ? { api }
-      : {
-          api,
-          partial: true,
-          note: '当前租户没有生产工单任务，reportVersion 实际字段待补业务前置后复测'
-        }
+    return { api }
   }
 
   if (caseId === 'MES-TASK-REPORT-002') {
-    const works = await loadWorkRows(api)
-    caseRecord.checks.push({
-      name: '生产工单真实分页可读取，空集不等于暂停业务闭环',
-      passed: true,
-      details: `works=${works.length}`
-    })
-
-    // Mandatory-field checks precede lookup; never send a real work ID to this write API.
-    const withoutReason = await api.request('POST', '/mes/prodWork/pause', {
-      id: '__not_exists__',
-      prodWorkOrderId: '__not_exists__'
-    })
-    caseRecord.checks.push({
-      name: '不填写暂停原因时暂停被拒绝',
-      passed: isPauseValidationRejection(withoutReason, '暂停原因不能为空'),
-      details: JSON.stringify({
-        code: withoutReason?.code,
-        msg: withoutReason?.msg ?? withoutReason?.message
-      })
-    })
-
-    const withoutResumeTime = await api.request('POST', '/mes/prodWork/pause', {
-      id: '__not_exists__',
-      prodWorkOrderId: '__not_exists__',
-      pauseReason: 'e2e 校验暂停原因必填'
-    })
-    caseRecord.checks.push({
-      name: '不填写预计恢复时间时暂停被拒绝',
-      passed: isPauseValidationRejection(withoutResumeTime, '预计恢复时间不能为空'),
-      details: JSON.stringify({
-        code: withoutResumeTime?.code,
-        msg: withoutResumeTime?.msg ?? withoutResumeTime?.message
-      })
-    })
-
-    const pausedWorks = pausedWorkRows(works)
-    if (pausedWorks.length > 0) {
+    const fixture = new ExecutionWorkflowFixture(api, record, caseId)
+    try {
+      await fixture.setup(caseRecord)
+      const started = await fixture.startWork()
+      const readWork = async () => {
+        const response = await api.getBusiness(
+          `/mes/prodWork/queryById?id=${encodeURIComponent(fixture.works[0].id)}`
+        )
+        return response?.data ?? response
+      }
       caseRecord.checks.push({
-        name: '暂停中的工单回读暂停原因与预计恢复时间',
-        passed: hasPausedWorkReadback(works),
-        details: `pausedWorks=${pausedWorks.length}`
+        name: '专属 AUTOTEST 工单已正式开工并回读为进行中',
+        passed: Number(started.status) === 2 && started.remark === fixture.marker,
+        details: JSON.stringify({
+          workId: fixture.works[0].id,
+          status: started.status,
+          marker: fixture.marker
+        })
       })
-    } else {
-      caseRecord.notes.push('当前租户没有正式暂停工单，必填负向验证不能替代暂停字段落库回读。')
-    }
 
-    await openRoute(page, '/mes/produce/work-order', {
-      readySelector: '.search-form input[placeholder="请输入工单编号"]'
-    })
-    await saveScreenshot(page, outputDir, 'mes-prod-work-pause', record)
-    caseRecord.evidence.push('真实生产工单页面、正式工单只读查询和不存在 ID 的暂停必填负向校验；未暂停正式工单')
-    return pausedWorks.length > 0
-      ? { api }
-      : {
-          api,
-          partial: true,
-          note: `${works.length === 0 ? '当前租户没有正式生产工单；' : ''}缺少正式暂停工单，原因/预计恢复时间落库回读未验证，不创建或暂停共享业务数据`
-        }
+      const withoutReason = await api.request('POST', '/mes/prodWork/pause', {
+        id: fixture.works[0].id,
+        prodWorkOrderId: fixture.works[0].id
+      })
+      caseRecord.checks.push({
+        name: '不填写暂停原因时专属工单暂停被拒绝，且状态仍为进行中',
+        passed:
+          isPauseValidationRejection(withoutReason, '暂停原因不能为空') &&
+          Number((await readWork())?.status) === 2,
+        details: JSON.stringify({
+          code: withoutReason?.code,
+          msg: withoutReason?.msg ?? withoutReason?.message
+        })
+      })
+
+      const withoutResumeTime = await api.request('POST', '/mes/prodWork/pause', {
+        id: fixture.works[0].id,
+        prodWorkOrderId: fixture.works[0].id,
+        pauseReason: fixture.marker
+      })
+      caseRecord.checks.push({
+        name: '不填写预计恢复时间时专属工单暂停被拒绝',
+        passed: isPauseValidationRejection(withoutResumeTime, '预计恢复时间不能为空'),
+        details: JSON.stringify({
+          code: withoutResumeTime?.code,
+          msg: withoutResumeTime?.msg ?? withoutResumeTime?.message
+        })
+      })
+
+      const expectedResumeTime = new Date(Date.now() + 3600000).toISOString()
+      const paused = await fixture.pauseWork(fixture.marker, expectedResumeTime)
+      caseRecord.checks.push({
+        name: '专属工单暂停后真实回读暂停原因与预计恢复时间',
+        passed:
+          Number(paused.status) === 3 &&
+          paused.pauseReason === fixture.marker &&
+          typeof paused.expectResumeTime === 'string' &&
+          Number.isFinite(Date.parse(paused.expectResumeTime)),
+        details: JSON.stringify({
+          workId: fixture.works[0].id,
+          status: paused.status,
+          pauseReason: paused.pauseReason,
+          expectResumeTime: paused.expectResumeTime
+        })
+      })
+
+      const resumed = await fixture.resumeWork()
+      caseRecord.checks.push({
+        name: '专属工单恢复后状态回读为进行中且保留暂停历史',
+        passed:
+          Number(resumed.status) === 2 &&
+          resumed.pauseReason === fixture.marker &&
+          resumed.resumeTime != null,
+        details: JSON.stringify({
+          status: resumed.status,
+          pauseReason: resumed.pauseReason,
+          resumeTime: resumed.resumeTime
+        })
+      })
+
+      await openRoute(page, '/mes/produce/work-order', {
+        readySelector: '.search-form input[placeholder="请输入工单编号"]'
+      })
+      await saveScreenshot(page, outputDir, 'mes-prod-work-pause', record)
+      caseRecord.evidence.push(
+        `真实创建 ${fixture.marker} 工单，开工后校验暂停必填、暂停落库回读并恢复`
+      )
+      return { api }
+    } finally {
+      await fixture.cleanup(caseRecord)
+    }
   }
 
   return { api }

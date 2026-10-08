@@ -230,7 +230,11 @@ function browserFixture ({
   const evaluations = []
   const caseRecord = { checks: [], notes: [], evidence: [] }
   let dialogVisible = false
+  // Tracks the active report-statistics selection so the mocked page can echo
+  // the same rows/period/scope that the real dialog would render.
+  const stats = { periodLabel: '本月', scopeLabel: '本人', batch: null }
   const emit = async (responses) => {
+    stats.batch = responses
     for (const listener of listeners.splice(0)) {
       try {
         let matched
@@ -266,8 +270,16 @@ function browserFixture ({
       assert.notEqual(name, '新增采购订单', 'Opening allocates a formal number')
       assert.notEqual(name, '保存', 'Shared user preference writes are forbidden')
       if (name === '.todo-body .work-list-row') dialogVisible = true
-      if (name === '统计') dialogVisible = true
+      if (name === '统计') {
+        dialogVisible = true
+        stats.periodLabel = '本月'
+        stats.scopeLabel = '本人'
+      }
       if (name === '关闭') dialogVisible = false
+      if (name === '本季度') stats.periodLabel = '本季度'
+      if (name === '本年度') stats.periodLabel = '本年度'
+      if (name === '团队（按数据权限）') stats.scopeLabel = '团队（按数据权限）'
+      if (name === '本人') stats.scopeLabel = '本人'
       if (['统计', '本季度', '本年度', '团队（按数据权限）', '本人'].includes(name)) {
         await emit(queue.shift() || reportBatch(name === '团队（按数据权限）' ? 'team' : 'self'))
       }
@@ -302,7 +314,28 @@ function browserFixture ({
     off: (event, handler) => { assert.equal(event, 'request'); requestListeners.delete(handler) },
     mainFrame: () => frame,
     waitForFunction: async (_predicate, args) => { evaluations.push(args); events.push('rendered') },
-    evaluate: async () => '2026-10-06'
+    waitForTimeout: async () => {},
+    evaluate: async (fn) => {
+      const source = typeof fn === 'function' ? fn.toString() : ''
+      if (source.includes('report-stats-dialog')) {
+        evaluations.push({ periodLabel: stats.periodLabel, scopeLabel: stats.scopeLabel })
+        const payloads = await Promise.all((stats.batch || []).map(async (row) => JSON.parse(await row.text())))
+        const pages = {}
+        queries.forEach((query, index) => {
+          pages[query.type] = {
+            list: payloads[index]?.data?.list || [],
+            total: payloads[index]?.data?.total || 0
+          }
+        })
+        const period = { 本月: 'month', 本季度: 'quarter', 本年度: 'year' }[stats.periodLabel]
+        return {
+          visible: true,
+          rows: summarizeWorkbenchReports(pages, period, '2026-10-06'),
+          selected: [stats.periodLabel, stats.scopeLabel]
+        }
+      }
+      return '2026-10-06'
+    }
   }
   const dependencies = {
     login: async () => 'unit-only-token',

@@ -132,6 +132,82 @@ const createMaintenanceDevice = async (api, fixtures, caseRecord, options = {}) 
   return device
 }
 
+const createDedicatedIotProduct = async (api, fixtures, options = {}) => {
+  const categories = requiredRows(
+    dataOf(await api.getBusiness('/iot/product-category/simple-list')),
+    'IoT 产品分类'
+  )
+  const category = categories.find((item) => item?.id != null)
+  if (!category) return null
+  const marker = options.marker || unique('E2E-IOT-PRODUCT')
+  const productId = fixtures.track(
+    await api.postBusiness('/iot/product/create', {
+      name: options.name || marker,
+      categoryId: category.id,
+      deviceType: options.deviceType ?? 0,
+      netType: options.netType ?? 2,
+      locationType: options.locationType ?? 3,
+      protocolType: options.protocolType || 'modbus_tcp_client',
+      serializeType: options.serializeType || 'json',
+      registerEnabled: false
+    }),
+    'E2E IoT 产品',
+    async (id) => {
+      const product = dataOf(await api.getBusiness(`/iot/product/get?id=${encodeURIComponent(id)}`))
+      if (!product) return
+      requireTrueResult(
+        await api.deleteBusiness(`/iot/product/delete?id=${encodeURIComponent(id)}`),
+        `E2E IoT 产品清理 id=${id}`
+      )
+      const deleted = dataOf(await api.getBusiness(`/iot/product/get?id=${encodeURIComponent(id)}`))
+      if (deleted) throw new Error(`E2E IoT 产品删除后仍可读取 id=${id}`)
+    }
+  )
+  const product = dataOf(await api.getBusiness(`/iot/product/get?id=${encodeURIComponent(productId)}`))
+  if (String(product?.id) !== String(productId) || product.protocolType !== (options.protocolType || 'modbus_tcp_client')) {
+    throw new Error(`E2E IoT 产品回读不一致 id=${productId}`)
+  }
+  return product
+}
+
+const createDedicatedIotDevice = async (api, fixtures, product, options = {}) => {
+  const marker = options.marker || unique('E2E-IOT-DEVICE')
+  const deviceId = fixtures.track(
+    await api.postBusiness('/iot/device/create', {
+      productId: product.id,
+      deviceName: marker
+    }),
+    'E2E IoT 设备',
+    async (id) => {
+      requireTrueResult(
+        await api.deleteBusiness(`/iot/device/delete?id=${encodeURIComponent(id)}`),
+        `E2E IoT 设备清理 id=${id}`
+      )
+    }
+  )
+  const device = dataOf(await api.getBusiness(`/iot/device/get?id=${encodeURIComponent(deviceId)}`))
+  if (String(device?.id) !== String(deviceId) || String(device.productId) !== String(product.id)) {
+    throw new Error(`E2E IoT 设备回读不一致 id=${deviceId}`)
+  }
+  return device
+}
+
+const createThingModel = async (api, fixtures, product, payload, label) =>
+  fixtures.track(
+    await api.postBusiness('/iot/thing-model/create', {
+      productId: product.id,
+      productKey: product.productKey,
+      ...payload
+    }),
+    label,
+    async (id) => {
+      requireTrueResult(
+        await api.deleteBusiness(`/iot/thing-model/delete?id=${encodeURIComponent(id)}`),
+        `${label}清理 id=${id}`
+      )
+    }
+  )
+
 export const trackOwnedStatusEvent = (fixtures, api, response, deviceId) =>
   fixtures.track(response, 'MAINT-006 状态事件历史', async (id) => {
     const path = `/mes/device-status-event/get?id=${encodeURIComponent(id)}`
@@ -576,35 +652,229 @@ const runAuthenticatedCase = async (
       passed: Array.isArray(modbus?.list),
       details: `点位总数=${modbus?.total ?? 'n/a'}`
     })
+
+    const modbusProduct = await createDedicatedIotProduct(api, fixtures, {
+      marker: unique('E2E-IOT-005-MODBUS'),
+      protocolType: 'modbus_tcp_client'
+    })
+    if (!modbusProduct) return { token, api, partial: true, note: '缺少 IoT 产品分类前置，无法创建专属协议夹具' }
+    const modbusDevice = await createDedicatedIotDevice(api, fixtures, modbusProduct, {
+      marker: unique('E2E-IOT-005-DEVICE')
+    })
+    const mqttProduct = await createDedicatedIotProduct(api, fixtures, {
+      marker: unique('E2E-IOT-005-MQTT'),
+      protocolType: 'mqtt'
+    })
+    if (!mqttProduct) return { token, api, partial: true, note: '缺少 IoT 产品分类前置，无法创建非 Modbus 协议反例' }
+    const mqttDevice = await createDedicatedIotDevice(api, fixtures, mqttProduct, {
+      marker: unique('E2E-IOT-005-MQTT-DEVICE')
+    })
+
+    const switchIdentifier = 'e2e_switch'
+    const temperatureIdentifier = 'e2e_temperature'
+    const pressureIdentifier = 'e2e_pressure'
+    const switchModelId = await createThingModel(api, fixtures, modbusProduct, {
+      identifier: switchIdentifier,
+      name: 'E2E 开关',
+      description: 'E2E Modbus 布尔量',
+      type: 1,
+      property: {
+        identifier: switchIdentifier,
+        name: 'E2E 开关',
+        accessMode: 'r',
+        required: false,
+        dataType: 'bool',
+        dataSpecsList: [
+          { dataType: 'bool', name: '关', value: 0 },
+          { dataType: 'bool', name: '开', value: 1 }
+        ]
+      }
+    }, 'E2E BOOL 物模型')
+    const temperatureModelId = await createThingModel(api, fixtures, modbusProduct, {
+      identifier: temperatureIdentifier,
+      name: 'E2E 温度',
+      description: 'E2E Modbus 16 位寄存器',
+      type: 1,
+      property: {
+        identifier: temperatureIdentifier,
+        name: 'E2E 温度',
+        accessMode: 'r',
+        required: false,
+        dataType: 'int',
+        dataSpecs: { dataType: 'int', min: '-100', max: '200', unit: 'C', unitName: '摄氏度' }
+      }
+    }, 'E2E INT16 物模型')
+    const pressureModelId = await createThingModel(api, fixtures, modbusProduct, {
+      identifier: pressureIdentifier,
+      name: 'E2E 压力',
+      description: 'E2E Modbus 32 位寄存器',
+      type: 1,
+      property: {
+        identifier: pressureIdentifier,
+        name: 'E2E 压力',
+        accessMode: 'r',
+        required: false,
+        dataType: 'int',
+        dataSpecs: { dataType: 'int', min: '0', max: '10000', unit: 'kPa', unitName: '千帕' }
+      }
+    }, 'E2E 第二寄存器物模型')
+    const eventModelId = await createThingModel(api, fixtures, modbusProduct, {
+      identifier: 'e2e_overheat',
+      name: 'E2E 过温事件',
+      description: 'E2E 事件物模型',
+      type: 3,
+      event: {
+        identifier: 'e2e_overheat',
+        name: 'E2E 过温事件',
+        required: false,
+        type: 'alert',
+        method: 'e2e.overheat'
+      }
+    }, 'E2E 事件物模型')
+    const serviceModelId = await createThingModel(api, fixtures, modbusProduct, {
+      identifier: 'e2e_calibrate',
+      name: 'E2E 校准服务',
+      description: 'E2E 服务物模型',
+      type: 2,
+      service: {
+        identifier: 'e2e_calibrate',
+        name: 'E2E 校准服务',
+        required: false,
+        callType: 'sync',
+        method: 'e2e.calibrate'
+      }
+    }, 'E2E 服务物模型')
+
+    const tsl = dataOf(await api.getBusiness(
+      `/iot/thing-model/get-tsl?productId=${encodeURIComponent(modbusProduct.id)}`
+    ))
+    caseRecord.checks.push({
+      name: '通用属性/事件/服务点位统一归 Thing Model 与 TSL',
+      passed:
+        (tsl?.properties || []).some((item) => item?.identifier === switchIdentifier) &&
+        (tsl?.properties || []).some((item) => item?.identifier === temperatureIdentifier) &&
+        (tsl?.events || []).some((item) => item?.identifier === 'e2e_overheat') &&
+        (tsl?.services || []).some((item) => item?.identifier === 'e2e_calibrate'),
+      details:
+        `modelIds=${switchModelId}/${temperatureModelId}/${pressureModelId}/${eventModelId}/${serviceModelId}`
+    })
+
+    const pointCount = async (deviceId) => {
+      const page = dataOf(await api.getBusiness(
+        `/iot/device-modbus-point/page?pageNo=1&pageSize=100&deviceId=${encodeURIComponent(deviceId)}`
+      ))
+      return Number(page?.total || 0)
+    }
+    const basePoint = (modelId, overrides = {}) => ({
+      deviceId: modbusDevice.id,
+      thingModelId: modelId,
+      functionCode: 3,
+      registerAddress: 0,
+      registerCount: 1,
+      byteOrder: 'AB',
+      rawDataType: 'INT16',
+      scale: 1,
+      status: 0,
+      ...overrides
+    })
+    const expectRejected = async (label, body, expectedCode, message) => {
+      const response = await api.post('/iot/device-modbus-point/import', body)
+      caseRecord.checks.push({
+        name: label,
+        passed: response?.code === expectedCode &&
+          String(response?.msg || response?.message || '').includes(message),
+        details: `code=${response?.code}, msg=${response?.msg || response?.message || ''}`
+      })
+      const remaining = await pointCount(body.deviceId)
+      if (remaining !== 0) throw new Error(`${label}失败后点位未整批回滚，remaining=${remaining}`)
+    }
+
     // PB-106：点位导入必须做重复地址、数据宽度、读写权限与协议兼容性校验
     const emptyImport = await api.post('/iot/device-modbus-point/import', { deviceId: 1, points: [] })
     caseRecord.checks.push({
       name: '点位导入空批次被拒绝（PB-106）',
-      passed: emptyImport?.code !== 0,
+      passed: isExpectedRejection(emptyImport, '导入点位不能为空'),
       details: `code=${emptyImport?.code}, msg=${emptyImport?.msg || ''}`
     })
+    const unknownDeviceId = 999999999
     const unknownDeviceImport = await api.post('/iot/device-modbus-point/import', {
-      deviceId: 999999999,
-      points: [
-        {
-          deviceId: 999999999,
-          thingModelId: 1,
-          functionCode: 3,
-          registerAddress: 0,
-          rawDataType: 'INT16',
-          byteOrder: 'AB',
-          status: 0
-        }
-      ]
+      deviceId: unknownDeviceId,
+      points: [basePoint(temperatureModelId, { deviceId: unknownDeviceId })]
     })
     caseRecord.checks.push({
       name: '点位导入校验设备存在性（PB-106）',
-      passed: unknownDeviceImport?.code !== 0,
+      passed: unknownDeviceImport?.code === 1050003000 &&
+        String(unknownDeviceImport?.msg || '').includes('设备不存在'),
       details: `code=${unknownDeviceImport?.code}, msg=${unknownDeviceImport?.msg || ''}`
     })
+    await expectRejected(
+      '非 Modbus 协议产品拒绝导入 Modbus 点位',
+      { deviceId: mqttDevice.id, points: [basePoint(temperatureModelId, { deviceId: mqttDevice.id })] },
+      1050007008,
+      '设备所属产品协议不是 Modbus'
+    )
+    await expectRejected(
+      '功能码仅允许读取线圈/离散输入/保持寄存器/输入寄存器',
+      { deviceId: modbusDevice.id, points: [basePoint(temperatureModelId, { functionCode: 5 })] },
+      1050007003,
+      'Modbus 功能码仅支持 1/2/3/4'
+    )
+    await expectRejected(
+      '布尔量使用寄存器功能码时被拒绝',
+      { deviceId: modbusDevice.id, points: [basePoint(switchModelId, { rawDataType: 'BOOLEAN' })] },
+      1050007004,
+      '布尔量只能使用线圈/离散输入功能码'
+    )
+    await expectRejected(
+      '固定宽度 INT32 寄存器数量不足时被拒绝',
+      {
+        deviceId: modbusDevice.id,
+        points: [basePoint(temperatureModelId, { rawDataType: 'INT32', registerCount: 1 })]
+      },
+      1050007005,
+      '寄存器数量不足'
+    )
+    await expectRejected(
+      '同一批次重复物模型属性时被拒绝',
+      {
+        deviceId: modbusDevice.id,
+        points: [
+          basePoint(temperatureModelId, { registerAddress: 100 }),
+          basePoint(temperatureModelId, { registerAddress: 200 })
+        ]
+      },
+      1050007007,
+      '同一批次存在重复的物模型属性'
+    )
+    await expectRejected(
+      '同一功能码地址区间重叠时整批拒绝',
+      {
+        deviceId: modbusDevice.id,
+        points: [
+          basePoint(pressureModelId, { rawDataType: 'INT32', registerCount: 2, registerAddress: 300 }),
+          basePoint(temperatureModelId, { registerAddress: 301 })
+        ]
+      },
+      1050007006,
+      '存在重复或重叠的寄存器地址'
+    )
+    const pointDbEvidence = await runReadOnlySql(`
+      SELECT COUNT(*) AS total
+      FROM iot_device_modbus_point
+      WHERE device_id = ${modbusDevice.id} AND deleted = 0
+    `)
+    caseRecord.database = [...(caseRecord.database || []), {
+      stage: 'iot-005-rejected-import-rollback', ...pointDbEvidence
+    }]
+    caseRecord.checks.push({
+      name: '所有拒绝批次均整批回滚，Modbus 专用点位表无残留',
+      passed: pointDbEvidence.available && Number(pointDbEvidence.rows?.[0]?.[0]) === 0,
+      details: JSON.stringify(pointDbEvidence.rows || [])
+    })
     caseRecord.evidence.push(
-      '能力目录、Modbus 点位分页与点位导入校验真实请求，通用点位边界保持 IoT Thing Model，' +
-        '导入校验覆盖空批次与设备存在性；本案例不落真实点位'
+      `专属产品 ${modbusProduct.id}/${mqttProduct.id}、设备 ${modbusDevice.id}/${mqttDevice.id} 与物模型 ` +
+        `${switchModelId}/${temperatureModelId}/${pressureModelId}/${eventModelId}/${serviceModelId}；` +
+        '覆盖协议、功能码、类型、宽度、重复属性和地址重叠拒绝，失败批次均零落库；本案例不落真实点位'
     )
     return { token, api }
   }
@@ -788,8 +1058,15 @@ const runAuthenticatedCase = async (
   }
 
   if (caseId === 'MAINT-004') {
-    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
-    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置' }
+    const product = await createDedicatedIotProduct(api, fixtures, {
+      marker: unique('E2E-MAINT-004-PRODUCT'),
+      deviceType: 0,
+      protocolType: 'mqtt'
+    })
+    if (!product) return { token, api, partial: true, note: '缺少 IoT 产品分类前置，无法创建三级分配专属产品' }
+    const device = await createDedicatedIotDevice(api, fixtures, product, {
+      marker: unique('E2E-MAINT-004-DEVICE')
+    })
     const fixture = await createPlanFixture(api, fixtures, caseRecord, 'REPAIR', 'E2E 分配方案')
     if (!fixture) return { token, api, partial: true, note: '缺少维修项目根分类前置' }
     const { planId } = fixture
@@ -818,20 +1095,66 @@ const runAuthenticatedCase = async (
       targetId: device.id,
       planId,
       planVersion: 1,
-      priority: 1,
+      priority: 30,
       status: 0
     }, '单设备方案分配')
+    const productAssignment = await trackAssignment({
+      targetType: 'PRODUCT',
+      targetId: product.id,
+      planId,
+      planVersion: 1,
+      priority: 20,
+      status: 0
+    }, '产品型号方案分配')
     const hit = dataOf(await api.getBusiness(
       `/mes/maintenance-plan-assignment/resolve?deviceId=${device.id}&productId=${device.productId}&deviceType=${deviceTypeKey}`
     ))
     caseRecord.checks.push({
-      name: '单设备分配优先于设备类型分配',
+      name: '单设备分配优先于产品型号和设备类型',
       passed: String(hit?.id) === String(deviceAssignment) &&
-        String(deviceAssignment) !== String(typeAssignment),
-      details: `hit=${hit?.id} device=${deviceAssignment} type=${typeAssignment}`
+        String(deviceAssignment) !== String(productAssignment) &&
+        String(productAssignment) !== String(typeAssignment),
+      details: `hit=${hit?.id} device=${deviceAssignment} product=${productAssignment} type=${typeAssignment}`
     })
-    caseRecord.notes.push('未向共享 IoT 产品或真实公共设备类型建立分配；产品型号中间层与类型回退仍需专属 E2E 产品前置。')
-    return { token, api, partial: true, note: '单设备优先于隔离类型分配已验证，三级回退缺少专属 E2E 产品前置' }
+    await api.putBusiness('/mes/maintenance-plan-assignment/update', {
+      id: deviceAssignment,
+      targetType: 'DEVICE',
+      targetId: device.id,
+      planId,
+      planVersion: 1,
+      priority: 30,
+      status: 1
+    })
+    const productHit = dataOf(await api.getBusiness(
+      `/mes/maintenance-plan-assignment/resolve?deviceId=${device.id}&productId=${device.productId}&deviceType=${deviceTypeKey}`
+    ))
+    caseRecord.checks.push({
+      name: '停用单设备分配后回退到产品型号分配',
+      passed: String(productHit?.id) === String(productAssignment),
+      details: `hit=${productHit?.id}, product=${productAssignment}`
+    })
+    await api.putBusiness('/mes/maintenance-plan-assignment/update', {
+      id: productAssignment,
+      targetType: 'PRODUCT',
+      targetId: product.id,
+      planId,
+      planVersion: 1,
+      priority: 20,
+      status: 1
+    })
+    const typeHit = dataOf(await api.getBusiness(
+      `/mes/maintenance-plan-assignment/resolve?deviceId=${device.id}&productId=${device.productId}&deviceType=${deviceTypeKey}`
+    ))
+    caseRecord.checks.push({
+      name: '停用单设备和产品型号分配后回退到设备类型分配',
+      passed: String(typeHit?.id) === String(typeAssignment),
+      details: `hit=${typeHit?.id}, type=${typeAssignment}`
+    })
+    caseRecord.evidence.push(
+      `专属产品 ${product.id}、设备 ${device.id} 与三个启用分配 ${deviceAssignment}/${productAssignment}/${typeAssignment} ` +
+        '依次验证 DEVICE、PRODUCT、DEVICE_TYPE 回退'
+    )
+    return { token, api }
   }
 
   if (caseId === 'MAINT-005') {
@@ -1593,10 +1916,67 @@ const runAuthenticatedCase = async (
       details: `status=${approvedDetail?.approvalStatus}, approver=${approvedDetail?.approverName}`
     })
 
-    return {
-      token, api, partial: true,
-      note: '独立点检记录的隐患登记与补检审批已验证；缺少正式 E2E 点检任务，转维修及漏检/代检审批完整链路未验证'
-    }
+    const missedRecord = dataOf(await api.postBusiness('/mes/system/record/add', {
+      ...taskFields,
+      inspectionMode: 'MISSED',
+      inspectionReason: 'E2E 计划时间未执行，登记漏检',
+      abnormalFlag: '0',
+      inspectionRemark: 'E2E 漏检登记',
+      inspectionStatus: '1'
+    }))
+    if (!missedRecord?.id) throw new Error('漏检创建成功响应未返回记录 ID')
+    trackInspectionRecord(fixtures, api, missedRecord.id)
+    const missedPending = dataOf(await api.getBusiness(`/mes/system/record/${missedRecord.id}`))
+    await api.postBusiness(`/mes/system/record/${missedRecord.id}/approve`, {
+      approved: true,
+      opinion: 'E2E 同意漏检登记'
+    })
+    const missedApproved = dataOf(await api.getBusiness(`/mes/system/record/${missedRecord.id}`))
+    caseRecord.checks.push({
+      name: '漏检记录保留原因并进入审批，审批通过写入快照',
+      passed:
+        missedPending?.inspectionMode === 'MISSED' &&
+        missedPending?.inspectionReason === 'E2E 计划时间未执行，登记漏检' &&
+        missedPending?.approvalStatus === 'PENDING' &&
+        missedApproved?.approvalStatus === 'APPROVED' &&
+        Boolean(missedApproved?.approveTime) &&
+        Boolean(missedApproved?.approverName),
+      details: `id=${missedRecord.id}, pending=${missedPending?.approvalStatus}, approved=${missedApproved?.approvalStatus}`
+    })
+
+    const substituteRecord = dataOf(await api.postBusiness('/mes/system/record/add', {
+      ...taskFields,
+      inspectionMode: 'SUBSTITUTE',
+      inspectionReason: 'E2E 原责任人临时缺岗，由授权人员代检',
+      abnormalFlag: '0',
+      inspectionRemark: 'E2E 代检结果正常',
+      inspectionStatus: '1'
+    }))
+    if (!substituteRecord?.id) throw new Error('代检创建成功响应未返回记录 ID')
+    trackInspectionRecord(fixtures, api, substituteRecord.id)
+    const substitutePending = dataOf(await api.getBusiness(`/mes/system/record/${substituteRecord.id}`))
+    await api.postBusiness(`/mes/system/record/${substituteRecord.id}/approve`, {
+      approved: true,
+      opinion: 'E2E 同意代检'
+    })
+    const substituteApproved = dataOf(await api.getBusiness(`/mes/system/record/${substituteRecord.id}`))
+    caseRecord.checks.push({
+      name: '代检记录保留原因并进入审批，审批通过写入快照',
+      passed:
+        substitutePending?.inspectionMode === 'SUBSTITUTE' &&
+        substitutePending?.inspectionReason === 'E2E 原责任人临时缺岗，由授权人员代检' &&
+        substitutePending?.approvalStatus === 'PENDING' &&
+        substituteApproved?.approvalStatus === 'APPROVED' &&
+        Boolean(substituteApproved?.approveTime) &&
+        Boolean(substituteApproved?.approverName),
+      details:
+        `id=${substituteRecord.id}, pending=${substitutePending?.approvalStatus}, ` +
+        `approved=${substituteApproved?.approvalStatus}`
+    })
+    caseRecord.evidence.push(
+      `专属点检任务 ${task.id} 完成异常转隐患、异常转维修、补检/漏检/代检原因校验与审批闭环`
+    )
+    return { token, api }
   }
 
   if (caseId === 'MAINT-010') {
@@ -1613,8 +1993,21 @@ const runAuthenticatedCase = async (
       name: '设备回写补偿页展示待补偿列表',
       screenshot: 'maint-010-device-compensation'
     })
-    const deviceId = await isolatedDeviceId(api, ['RUNTIME'])
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord, {
+      deviceName: unique('E2E-MAINT-010-DEVICE')
+    })
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置，无法创建履历专属设备' }
+    const deviceId = device.id
     const marker = unique('LIFECYCLE')
+    const statusEventId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
+      deviceId,
+      deviceName: device.deviceName,
+      coreLayer: 'RUNTIME',
+      statusCode: 'RUNNING',
+      statusName: '运行',
+      sourceType: 'MANUAL',
+      reason: `E2E 履历状态事件 ${marker}`
+    }))
     const eventId = dataOf(await api.postBusiness('/mes/device-lifecycle/event', {
       deviceId,
       eventType: 'MANUAL',
@@ -1638,6 +2031,65 @@ const runAuthenticatedCase = async (
         timelineList.some((item) => String(item.title || '').includes(marker)),
       details: `total=${timeline?.total ?? 'n/a'}`
     })
+    caseRecord.checks.push({
+      name: '状态事件自动进入设备履历时间线且来源为 STATUS_EVENT',
+      passed: timelineList.some((item) =>
+        item.eventType === 'STATUS' &&
+        item.sourceType === 'STATUS_EVENT' &&
+        String(item.sourceId) === String(statusEventId)
+      ),
+      details: `statusEventId=${statusEventId}`
+    })
+
+    const repairMarker = unique('E2E-MAINT-010-REPAIR')
+    const repair = dataOf(await api.postBusiness('/mes/system/order/add', {
+      orderNo: repairMarker,
+      orderContent: `E2E 履历维修工单 ${repairMarker}`,
+      projectName: 'E2E 履历项目',
+      deviceId,
+      priority: '中',
+      faultLevel: '一般',
+      faultCauseCategory: 'mechanical'
+    }))
+    if (!repair?.id) throw new Error('履历维修工单创建未返回 ID')
+    trackRepairOrder(fixtures, api, repair.id, caseRecord)
+    const timelineWithRepair = dataOf(await api.getBusiness(
+      `/mes/device-lifecycle/timeline?deviceId=${deviceId}&pageNo=1&pageSize=100`
+    ))
+    const repairTimelineRows = timelineWithRepair?.list || timelineWithRepair?.records || []
+    caseRecord.checks.push({
+      name: '维修工单自动进入设备履历且来源为 REPAIR_ORDER',
+      passed: repairTimelineRows.some((item) =>
+        item.eventType === 'REPAIR' &&
+        item.sourceType === 'REPAIR_ORDER' &&
+        String(item.sourceId) === String(repair.id)
+      ),
+      details: `repairOrderId=${repair.id}`
+    })
+
+    const changeReason = `E2E 履历参数变更 ${marker}`
+    await api.putBusiness('/iot/device/update', {
+      id: deviceId,
+      nickname: `E2E 履历设备 ${marker}`,
+      changeReason,
+      changeApprovalRequired: false
+    })
+    const timelineWithParam = dataOf(await api.getBusiness(
+      `/mes/device-lifecycle/timeline?deviceId=${deviceId}&pageNo=1&pageSize=100`
+    ))
+    const paramTimelineRows = timelineWithParam?.list || timelineWithParam?.records || []
+    caseRecord.checks.push({
+      name: '关键参数变化自动进入设备履历且来源为 PARAM_CHANGE',
+      passed: paramTimelineRows.some((item) =>
+        item.eventType === 'PARAM' &&
+        item.sourceType === 'PARAM_CHANGE' &&
+        String(item.content || '').includes(changeReason)
+      ),
+      details: `reason=${changeReason}`
+    })
+    caseRecord.notes.push(
+      `设备参数变更审计 ${changeReason} 按产品设计保留为不可删除审计事实，履历夹具设备 ${deviceId} 随后清理。`
+    )
 
     const deleteResult = await api.delete(`/mes/device-lifecycle/${eventId}`)
     const hasDelete = deleteResult?.code === 0
@@ -1695,40 +2147,82 @@ const runAuthenticatedCase = async (
       passed: (handledPage?.list || []).some((item) => String(item.id) === String(taskId)),
       details: `total=${handledPage?.total ?? 'n/a'}`
     })
+    caseRecord.evidence.push(
+      `专属设备 ${deviceId} 合并手工履历、STATUS_EVENT、REPAIR_ORDER 与 PARAM_CHANGE；补偿任务 ${taskId} 完成幂等登记与处理`
+    )
 
     return { token, api }
   }
 
   if (caseId === 'MAINT-011') {
     // PB-326：设备统计指标从状态事件、工单与保养任务正式数据计算，支持钻取。
-    const devicePage = dataOf(await api.getBusiness('/iot/device/page?pageNo=1&pageSize=1'))
-    const deviceId = devicePage?.list?.[0]?.id
-    const endTime = formatLocalDateTime(new Date())
-    const startTime = formatLocalDateTime(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
-    if (!deviceId) {
-      caseRecord.notes.push('当前租户没有 IoT 设备，设备指标接口待补设备前置后复测；不使用固定设备编号。')
-      await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, {
-        readySelector: '.statistics-metrics'
-      })
-      await page.waitForTimeout(1200)
-      const pageText = await page.locator('body').innerText()
-      caseRecord.checks.push({
-        name: '设备状态页展示 MTBF/MTTR/维修费用/保养达成率指标',
-        passed:
-          pageText.includes('MTBF') &&
-          pageText.includes('MTTR') &&
-          pageText.includes('维修费用') &&
-          pageText.includes('保养达成率'),
-        details: '设备状态与统计页指标卡'
-      })
-      await saveScreenshot(page, outputDir, 'maint-011-device-metrics', record)
-      return {
-        token,
-        api,
-        partial: true,
-        note: '当前租户没有 IoT 设备，设备指标数据链路待补前置后复测'
-      }
-    }
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord, {
+      deviceName: unique('E2E-MAINT-011-DEVICE')
+    })
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置，无法创建指标专属设备' }
+    const deviceId = device.id
+    const permission = dataOf(await api.get('/system/auth/get-permission-info'))
+    const assigneeUserId = permission?.user?.id
+    if (assigneeUserId == null) throw new Error('BLOCKED: 权限信息未返回当前用户 ID')
+
+    const startTime = formatLocalDateTime(new Date(Date.now() - 2 * 60 * 60 * 1000))
+    const endTime = formatLocalDateTime(new Date(Date.now() + 5 * 60 * 1000))
+    const initialRunningEventId = trackEvent(fixtures, api, await api.postBusiness('/mes/device-status-event/start', {
+      deviceId,
+      deviceName: device.deviceName,
+      coreLayer: 'RUNTIME',
+      statusCode: 'RUNNING',
+      statusName: '运行',
+      startTime: formatLocalDateTime(new Date(Date.now() - 60 * 60 * 1000)),
+      sourceType: 'MANUAL',
+      reason: 'E2E 指标统计运行基线'
+    }))
+
+    const orderMarker = unique('E2E-MAINT-011-REPAIR')
+    const created = dataOf(await api.postBusiness('/mes/system/order/add', {
+      orderNo: orderMarker,
+      orderContent: `E2E 指标统计维修 ${orderMarker}`,
+      projectName: 'E2E 指标统计项目',
+      deviceId,
+      priority: '中',
+      faultLevel: '一般',
+      faultCauseCategory: 'mechanical'
+    }))
+    const orderId = created?.id
+    if (!orderId) throw new Error('指标维修工单创建未返回 ID')
+    trackRepairOrder(fixtures, api, orderId, caseRecord)
+    const dispatched = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/dispatch`, {
+      assigneeUserId,
+      assigneeName: permission?.user?.nickname || 'E2E 指标维修员',
+      actionTime: formatLocalDateTime(new Date()),
+      remark: 'E2E 指标派工'
+    }))
+    const accepted = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/accept`, {
+      workflowVersion: dispatched?.workflowVersion,
+      remark: 'E2E 指标接单'
+    }))
+    const repairing = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/start-repair`, {
+      workflowVersion: accepted?.workflowVersion,
+      remark: 'E2E 指标开工'
+    }))
+    const completed = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/complete-repair`, {
+      workflowVersion: repairing?.workflowVersion,
+      repairResult: 'E2E 指标工单维修完成',
+      workHours: 2.5,
+      laborCost: 120,
+      remark: 'E2E 指标完工'
+    }))
+    const closed = dataOf(await api.postBusiness(`/mes/system/order/${orderId}/close`, {
+      workflowVersion: completed?.workflowVersion,
+      finalStatusCode: 'RUNNING',
+      remark: 'E2E 指标验收关闭'
+    }))
+    caseRecord.checks.push({
+      name: '指标专属维修工单完成真实状态机并进入 CLOSED',
+      passed: closed?.orderStatus === 'CLOSED' && Boolean(closed?.closeTime),
+      details: `orderId=${orderId}, status=${closed?.orderStatus}`
+    })
+
     const metrics = dataOf(await api.getBusiness(
       `/mes/device-status-event/metrics?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
     ))
@@ -1749,37 +2243,56 @@ const runAuthenticatedCase = async (
         Boolean(metrics?.endTime),
       details: `deviceId=${metrics?.deviceId}`
     })
+    caseRecord.checks.push({
+      name: '指标从 CLOSED 维修工单计算失败次数、修复次数、费用、MTBF 与 MTTR',
+      passed:
+        Number(metrics?.failureCount) === 1 &&
+        Number(metrics?.repairCount) === 1 &&
+        Number(metrics?.repairCost) === 120 &&
+        metrics?.mtbfHours != null &&
+        metrics?.mttrHours != null,
+      details:
+        `failure=${metrics?.failureCount}, repair=${metrics?.repairCount}, cost=${metrics?.repairCost}, ` +
+        `mtbf=${metrics?.mtbfHours}, mttr=${metrics?.mttrHours}`
+    })
 
     const drilldown = dataOf(await api.getBusiness(
       `/mes/device-status-event/metrics/repair-orders?deviceId=${deviceId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}`
     ))
+    const drilldownRows = Array.isArray(drilldown) ? drilldown : []
     caseRecord.checks.push({
-      name: '指标异常可钻取到工单明细',
-      passed: Array.isArray(drilldown),
-      details: `rows=${Array.isArray(drilldown) ? drilldown.length : 'n/a'}`
+      name: '指标工单钻取只命中专属 CLOSED 工单并保留成本',
+      passed:
+        drilldownRows.length === 1 &&
+        String(drilldownRows[0]?.orderId) === String(orderId) &&
+        drilldownRows[0]?.orderStatus === 'CLOSED' &&
+        Number(drilldownRows[0]?.totalCost) === 120,
+      details: JSON.stringify(drilldownRows)
     })
 
     const statusEvents = dataOf(await api.getBusiness(
-      `/mes/device-status-event/page?deviceId=${deviceId}&pageNo=1&pageSize=10`
+      `/mes/device-status-event/page?deviceId=${deviceId}&pageNo=1&pageSize=100`
     ))
+    const statusEventRows = Array.isArray(statusEvents?.list) ? statusEvents.list : []
     caseRecord.checks.push({
-      name: '指标可下钻到状态事件',
-      passed: Array.isArray(statusEvents?.list),
+      name: '指标可下钻到专属设备的维修中状态事件',
+      passed:
+        statusEventRows.some((item) =>
+          item.sourceType === 'REPAIR_ORDER' &&
+          item.statusCode === 'REPAIRING' &&
+          String(item.deviceId) === String(deviceId)
+        ),
       details: `total=${statusEvents?.total ?? 'n/a'}`
     })
 
-    const statusEventRows = Array.isArray(statusEvents?.list) ? statusEvents.list : []
-    const drilldownRows = Array.isArray(drilldown) ? drilldown : []
     const hasFormalEvidence = hasFormalMetricEvidence({
       statusEvents: statusEventRows,
       drilldown: drilldownRows
     })
     caseRecord.checks.push({
-      name: '正式事实样本数量已记录，缺少任一类事实时保留 PARTIAL',
-      passed: Array.isArray(statusEvents?.list) && Array.isArray(drilldown),
-      details: hasFormalEvidence
-        ? `statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`
-        : `当前正式事实不足，保留为部分通过：statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`
+      name: '指标同时存在正式状态事件与维修工单事实',
+      passed: hasFormalEvidence,
+      details: `statusEvents=${statusEventRows.length}, repairOrders=${drilldownRows.length}`
     })
 
     await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, {
@@ -1797,20 +2310,31 @@ const runAuthenticatedCase = async (
       details: '设备状态与统计页指标卡'
     })
     await saveScreenshot(page, outputDir, 'maint-011-device-metrics', record)
-    return {
-      token,
-      api,
-      partial: !hasFormalEvidence,
-      note: hasFormalEvidence
-        ? ''
-        : '接口协议和页面已验证，但当前租户没有同时存在的正式状态事件与维修工单事实，未将空集升级为完整 PASS'
+    const finalActive = dataOf(await api.getBusiness(
+      `/mes/device-status-event/active?deviceId=${deviceId}&coreLayer=RUNTIME`
+    ))
+    if (finalActive?.id) {
+      await endFixtureEvent(api, finalActive.id, 'E2E MAINT-011 fixture cleanup')
     }
+    caseRecord.evidence.push(
+      `专属设备 ${device.id} 与 CLOSED 工单 ${orderId} 生成正式指标；初始状态事件 ${initialRunningEventId}`
+    )
+    return { token, api }
   }
 
   if (caseId === 'MAINT-012') {
     const token = await login(page)
     const api = createApiClient({ token, record })
     // PB-101：旧设备引用对账，equipment_info/mes_wms_site_equipment -> iot_device
+    const sourceSnapshotSql = `
+      SELECT
+        (SELECT COUNT(*) FROM equipment_info) AS equipment_total,
+        (SELECT COUNT(*) FROM mes_wms_site_equipment WHERE deleted = 0) AS site_equipment_total,
+        (SELECT COUNT(*) FROM iot_device WHERE deleted = 0) AS iot_device_total,
+        (SELECT COUNT(*) FROM mes_device_legacy_mapping WHERE deleted = 0) AS mapping_total
+    `
+    const sourceBefore = await runReadOnlySql(sourceSnapshotSql)
+    if (!sourceBefore.available) throw new Error(`BLOCKED: ${sourceBefore.reason}`)
     const summaryBefore = dataOf(await api.getBusiness('/mes/device-legacy-mapping/summary'))
     caseRecord.checks.push({
       name: '对账汇总接口返回命中/多义/未命中口径',
@@ -1830,6 +2354,24 @@ const runAuthenticatedCase = async (
       details: JSON.stringify(summaryBefore)
     })
 
+    const reconciled = dataOf(await api.postBusiness('/mes/device-legacy-mapping/reconcile'))
+    caseRecord.checks.push({
+      name: '重跑对账返回全量重建后的守恒汇总',
+      passed:
+        reconciled != null &&
+        Number(reconciled.total) ===
+          Number(reconciled.matched) + Number(reconciled.ambiguous) + Number(reconciled.unmatched),
+      details: JSON.stringify(reconciled)
+    })
+    const reconciledAgain = dataOf(await api.postBusiness('/mes/device-legacy-mapping/reconcile'))
+    caseRecord.checks.push({
+      name: '重复重跑对账结果稳定幂等',
+      passed:
+        JSON.stringify(reconciled) === JSON.stringify(reconciledAgain) &&
+        JSON.stringify(summaryBefore) === JSON.stringify(reconciledAgain),
+      details: `first=${JSON.stringify(reconciled)}, second=${JSON.stringify(reconciledAgain)}`
+    })
+
     const pageResp = dataOf(await api.getBusiness('/mes/device-legacy-mapping/page?pageNo=1&pageSize=100'))
     const rows = Array.isArray(pageResp?.list) ? pageResp.list : pageResp?.records || []
     const validStatuses = ['MATCHED', 'AMBIGUOUS', 'UNMATCHED']
@@ -1847,6 +2389,25 @@ const runAuthenticatedCase = async (
       ),
       details: `rows=${rows.length}`
     })
+    caseRecord.checks.push({
+      name: '重建清单行数与守恒汇总一致',
+      passed: rows.length === Math.min(Number(reconciled?.total || 0), 100),
+      details: `rows=${rows.length}, total=${reconciled?.total ?? 'n/a'}`
+    })
+
+    const sourceAfter = await runReadOnlySql(sourceSnapshotSql)
+    if (!sourceAfter.available) throw new Error(`BLOCKED: ${sourceAfter.reason}`)
+    const sourceUnchanged = JSON.stringify(sourceBefore.rows) === JSON.stringify(sourceAfter.rows)
+    caseRecord.database = [...(caseRecord.database || []), {
+      stage: 'legacy-mapping-source-before', ...sourceBefore
+    }, {
+      stage: 'legacy-mapping-source-after', ...sourceAfter
+    }]
+    caseRecord.checks.push({
+      name: '重跑对账只重建派生映射表，旧来源表和 iot_device 计数不变',
+      passed: sourceUnchanged,
+      details: `before=${JSON.stringify(sourceBefore.rows)}, after=${JSON.stringify(sourceAfter.rows)}`
+    })
 
     await checkMaintenancePage({ page, record, caseRecord, outputDir }, {
       route: '/settings/iot/device-legacy-mapping',
@@ -1855,13 +2416,15 @@ const runAuthenticatedCase = async (
       screenshot: 'maint-012-device-legacy-mapping'
     })
     caseRecord.evidence.push(
-      '真实登录读取旧设备引用对账汇总与清单并打开对账页；本次不调用全租户 reconcile 写侧，避免改动共享主数据'
+      '真实执行两次 reconcile 并比对前后来源快照；当前来源表为空，仅证明派生表全量重建、守恒和幂等，无法证明 CODE/NAME/AMBIGUOUS/UNMATCHED 样本'
     )
     return {
       token,
       api,
       partial: true,
-      note: '旧设备对账 reconcile 会重建共享租户映射，本次禁止写侧；需专属 E2E 对账夹具后复测'
+      note:
+        '已真实执行 reconcile 且证明来源表不被改写、重复执行稳定；但 equipment_info 与 mes_wms_site_equipment 当前均为 0 行，' +
+        '禁止向废弃来源表写入夹具，无法验证编码/SN 精确命中、名称命中、AMBIGUOUS 与 UNMATCHED 分支'
     }
   }
 

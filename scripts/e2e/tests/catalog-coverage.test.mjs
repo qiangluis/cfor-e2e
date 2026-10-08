@@ -7,7 +7,7 @@ import {
 } from '../suites/init.mjs'
 import { DESIGNED_MES_BASE_ENABLE_CASES } from '../suites/mes-base.mjs'
 import { crmReadOnlyCases } from '../suites/crm.mjs'
-import { procurementReadOnlyViews } from '../suites/procurement.mjs'
+import { procurementPartialReadOnlyCases } from '../suites/procurement.mjs'
 import { cases as iotFoundationReadonlyCases } from '../suites/iot-foundation-readonly.mjs'
 import { ownedInitCases } from '../owned-init/fixtures.mjs'
 import { cases as initGapCases } from '../fixtures/init-gaps.mjs'
@@ -21,7 +21,7 @@ const definitions = new Map(catalog.suites.flatMap((suite) =>
 
 test('implemented read-only cases are executable but retain incomplete acceptance', () => {
   for (const id of [...DESIGNED_INIT_ENABLE_CASES, ...DESIGNED_MES_BASE_ENABLE_CASES,
-    ...crmReadOnlyCases, ...Object.keys(procurementReadOnlyViews), ...iotFoundationReadonlyCases]) {
+    ...crmReadOnlyCases, ...procurementPartialReadOnlyCases, ...iotFoundationReadonlyCases]) {
     if (ownedInitCases.includes(id)) {
       assert.ok(['PARTIAL', 'READY'].includes(definitions.get(id)?.status), id)
     } else {

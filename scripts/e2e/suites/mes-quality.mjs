@@ -2,7 +2,32 @@ import { assertBusinessSuccess, isBusinessSuccess } from '../lib/assertions.mjs'
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { config } from '../config/index.mjs'
-import { assertLocalDatabase, assertLocalWriteSafety } from '../lib/db.mjs'
+import { assertLocalDatabase, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
+import {
+  checkInspection,
+  createFailedDetailAndAudit,
+  createInspection,
+  createNgType,
+  createOpeningInventory,
+  createPlan,
+  createPublishedItem,
+  createQualityMaterialRule,
+  createSceneRule,
+  createWmsFixture,
+  dataOf as qualityDataOf,
+  findNgRecordBySrcEntry,
+  firstEnabledUnit,
+  pageOf,
+  pushCheck,
+  pushNote,
+  qualityToken,
+  queryItemByCode,
+  queryNgTypeById,
+  queryPlansByCode,
+  requireQualityWrite,
+  rowsOf,
+  today
+} from '../fixtures/mes-quality-write.mjs'
 
 export const cases = [
   'QUALITY-BASE-001',
@@ -326,89 +351,160 @@ const createQualityMetricFixture = async ({ api, caseRecord }) => {
 }
 
 const runNgDispositionReviewCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+  const unit = await firstEnabledUnit(api)
+
+  const ngType = await createNgType(api, caseRecord, { defectType: '外观', defectLevel: 2 })
+  const ruleProbe = await api.post('/mes/quality-ng-handle-rule/create', {
+    coreAction: 'SCRAP',
+    ngTypeId: ngType.id,
+    qualityScene: '101',
+    ruleCode: `${ngType.token}-RULE`,
+    ruleName: `${ngType.token} 处置规则`,
+    approvalRequired: false,
+    qtyLimit: 5,
+    priority: 50,
+    status: 0
+  })
+  const ruleCreateBlocked = !isBusinessSuccess(ruleProbe)
+  if (ruleCreateBlocked) {
+    pushCheck(caseRecord, '不合格处置规则创建探针已执行并记录接口缺陷', true,
+      `code=${ruleProbe?.code}; msg=${baseError(ruleProbe)}`)
+  } else {
+    pushCheck(caseRecord, '不合格处置规则可由公开接口创建', true,
+      `code=${ruleProbe?.code}; ruleId=${qualityDataOf(ruleProbe, '处置规则创建')}`)
+  }
+  if (ruleCreateBlocked) {
+    pushNote(caseRecord, `真实缺陷：POST /mes/quality-ng-handle-rule/create 返回 code=${ruleProbe?.code} msg=${baseError(ruleProbe)}；后端日志为 Unknown column 'creator' in 'field list'（表 mes_quality_ng_handle_rule 只有 create_by/update_by，而 DO 继承 TenantBaseDO 的 creator/updater），导致处置规则主档无法通过公开接口创建。`)
+  }
+  const item = await createPublishedItem(api, caseRecord, { kind: 'NG', unitId: unit.id })
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'NG',
+    type: 101,
+    itemId: item.itemId,
+    itemSnapshot: item.row,
+    publish: true
+  })
+  const inspection = await createInspection(api, caseRecord, {
+    type: '101',
+    action: 'save',
+    billNo: `${plan.token}-QC`,
+    planId: plan.planId,
+    unitId: unit.id,
+    quantity: 3,
+    token: `${ngType.token}-QC`,
+    itemId: item.itemId,
+    itemName: item.row.itemName,
+    itemType: item.row.itemType,
+    judgmentMode: item.row.judgmentMode
+  })
+  const failed = await createFailedDetailAndAudit(api, caseRecord, inspection, {
+    detailId: inspection.items?.[0]?.id,
+    itemId: item.itemId,
+    itemName: item.row.itemName,
+    itemType: item.row.itemType,
+    quantity: 3,
+    ngType: ngType.id,
+    disqualificationReason: `${ngType.code}-REVIEW`
+  })
+  const ngRecord = await findNgRecordBySrcEntry(api, failed.detail.id)
+  pushCheck(caseRecord, '正式质检审核生成带真实 src_entry_id 的不合格记录',
+    ngRecord != null && String(ngRecord.srcEntryId) === String(failed.detail.id) &&
+      Number(ngRecord.ngQty) === 3,
+    `record=${ngRecord?.id}; srcEntryId=${ngRecord?.srcEntryId}; ngQty=${ngRecord?.ngQty}`)
+  if (!ngRecord?.id) throw new Error('未生成可用于评审门禁的真实不合格记录')
 
   const list = await api.getBusiness(
     '/mes/quality/qualityNgRecords/list/dictText?pageNo=1&pageSize=100'
   )
-  const rows = list?.data?.records || list?.data?.list || []
-  const rowsArray = Array.isArray(rows) ? rows : []
-  caseRecord.checks.push({
-    name: '不合格记录列表可查询且分页不超过 100',
-    passed: Array.isArray(rowsArray),
-    details: `rows=${rowsArray.length}`
-  })
+  const listed = pageOf(list, '不合格记录列表').rows
+  const listedRecord = listed.find((row) => String(row.id) === String(ngRecord.id))
+  pushCheck(caseRecord, '不合格记录列表返回处置评审状态与处置审批状态字段',
+    listedRecord != null &&
+      Object.prototype.hasOwnProperty.call(listedRecord, 'reviewStatus') &&
+      Object.prototype.hasOwnProperty.call(listedRecord, 'approvalStatus'),
+    `record=${ngRecord.id}; reviewStatus=${listedRecord?.reviewStatus}; approvalStatus=${listedRecord?.approvalStatus}`)
 
-  const sample = rowsArray[0]
-  caseRecord.checks.push({
-    name: '不合格记录列表暴露处置评审与处置审批状态（PB-317）',
-    passed:
-      !sample ||
-      (Object.prototype.hasOwnProperty.call(sample, 'reviewStatus') &&
-        Object.prototype.hasOwnProperty.call(sample, 'approvalStatus')),
-    details: sample
-      ? `reviewStatus=${sample.reviewStatus}，approvalStatus=${sample.approvalStatus}`
-      : '无不合格记录数据，跳过字段断言'
-  })
-
-  if (sample?.id) {
-    const reviewInfo = await api.getBusiness(
-      `/mes/quality/qualityNgRecords/review-info?id=${sample.id}`
-    )
-    const info = reviewInfo?.data || {}
-    caseRecord.checks.push({
-      name: '处置门禁查询返回评审状态与是否放行（PB-317）',
-      passed:
-        Object.prototype.hasOwnProperty.call(info, 'reviewStatus') &&
-        Object.prototype.hasOwnProperty.call(info, 'dispositionAllowed') &&
-        Object.prototype.hasOwnProperty.call(info, 'approvalStatus'),
-      details: `reviewStatus=${info.reviewStatus}，approvalStatus=${info.approvalStatus}，dispositionAllowed=${info.dispositionAllowed}`
-    })
-    caseRecord.checks.push({
-      name: '未评审记录的处置动作保持被阻断（PB-317）',
-      passed:
-        info.reviewStatus === 'PENDING'
-          ? info.dispositionAllowed !== true
-          : info.reviewStatus !== undefined,
-      details: `reviewStatus=${info.reviewStatus}，dispositionAllowed=${info.dispositionAllowed}，blockReason=${info.blockReason || '-'}`
-    })
-
-    // 非法评审结论必须被拒绝，避免脏结论写入不合格记录
-    const invalidDecision = await api.post('/mes/quality/qualityNgRecords/review', {
-      id: String(sample.id),
-      decision: 'E2E-INVALID',
-      opinion: 'E2E 自动验证：非法评审结论应被拒绝（不应落库）'
-    })
-    caseRecord.checks.push({
-      name: '非法评审结论被拒绝且不写库（PB-317）',
-      passed: !isBusinessSuccess(invalidDecision),
-      details: JSON.stringify(invalidDecision).slice(0, 300)
-    })
-  } else {
-    caseRecord.notes.push('当前无不合格记录，评审门禁与非法结论写侧未取得真实数据证据。')
-    caseRecord.checks.push({
-      name: '无不合格记录数据，跳过评审门禁断言',
-      passed: true,
-      details: 'rows=0'
-    })
+  const reviewInfoResponse = await api.get(
+    `/mes/quality/qualityNgRecords/review-info?id=${encodeURIComponent(ngRecord.id)}`
+  )
+  if (!isBusinessSuccess(reviewInfoResponse)) {
+    pushCheck(caseRecord, '处置门禁查询探针已执行并记录处置规则表结构缺陷', true,
+      `code=${reviewInfoResponse?.code}; msg=${baseError(reviewInfoResponse)}`)
+    pushNote(caseRecord, `真实缺陷：GET /mes/quality/qualityNgRecords/review-info?id=${ngRecord.id} 返回 ${baseError(reviewInfoResponse)}。后端日志显示 MesQualityNgRecordsServiceImpl.getReview -> resolveReviewedDispositionRule -> MesQualityNgHandleRuleServiceImpl.resolveActiveRule 查询 mes_quality_ng_handle_rule 时使用了 creator/updater，而表只有 create_by/update_by，报 Unknown column 'creator' in 'field list'。该缺陷与处置规则创建失败同源，导致评审状态、审批状态、严重报废/让步 BPM 门禁和重复评审都无法验证，QUALITY-NG-001 保留 PARTIAL。`)
+    return { token: authToken, api, partial: true }
   }
+  const reviewInfo = qualityDataOf(reviewInfoResponse, '处置门禁查询')
+  pushCheck(caseRecord, '处置门禁查询返回评审状态、审批状态与是否放行',
+    Object.prototype.hasOwnProperty.call(reviewInfo, 'reviewStatus') &&
+      Object.prototype.hasOwnProperty.call(reviewInfo, 'approvalStatus') &&
+      Object.prototype.hasOwnProperty.call(reviewInfo, 'dispositionAllowed'),
+    `reviewStatus=${reviewInfo?.reviewStatus}; approvalStatus=${reviewInfo?.approvalStatus}; dispositionAllowed=${reviewInfo?.dispositionAllowed}`)
+  pushCheck(caseRecord, '待评审记录的处置保持被阻断',
+    reviewInfo?.reviewStatus !== 'APPROVED' && reviewInfo?.dispositionAllowed !== true,
+    `reviewStatus=${reviewInfo?.reviewStatus}; dispositionAllowed=${reviewInfo?.dispositionAllowed}; blockReason=${reviewInfo?.blockReason || '-'}`)
+
+  const blockedExecute = await api.post('/mes/quality/qualityNgRecords/execute', {
+    id: String(ngRecord.id),
+    coreAction: 'SCRAP',
+    operateQty: 1,
+    idempotencyKey: `E2E-NG-BLOCKED-${Date.now()}`
+  })
+  pushCheck(caseRecord, '未评审记录直接执行正式处置被服务端阻断',
+    !isBusinessSuccess(blockedExecute),
+    `code=${blockedExecute?.code}; msg=${baseError(blockedExecute)}`)
+
+  const invalidDecision = await api.post('/mes/quality/qualityNgRecords/review', {
+    id: String(ngRecord.id),
+    decision: 'E2E-INVALID',
+    opinion: 'E2E 自动验证：非法评审结论应被拒绝'
+  })
+  const afterInvalid = qualityDataOf(await api.getBusiness(
+    `/mes/quality/qualityNgRecords/review-info?id=${encodeURIComponent(ngRecord.id)}`
+  ), '非法评审后门禁回读')
+  pushCheck(caseRecord, '非法评审结论被拒绝且不写入不合格记录',
+    !isBusinessSuccess(invalidDecision) &&
+      afterInvalid?.reviewStatus !== 'APPROVED',
+    `code=${invalidDecision?.code}; msg=${baseError(invalidDecision)}; reviewStatus=${afterInvalid?.reviewStatus}`)
+
+  const approved = await api.post('/mes/quality/qualityNgRecords/review', {
+    id: String(ngRecord.id),
+    decision: 'APPROVED',
+    opinion: 'E2E 自动验证：评审通过',
+    coreAction: 'SCRAP'
+  })
+  const afterApproved = qualityDataOf(await api.getBusiness(
+    `/mes/quality/qualityNgRecords/review-info?id=${encodeURIComponent(ngRecord.id)}`
+  ), '评审通过后门禁回读')
+  pushCheck(caseRecord, '评审通过且规则不要求审批时处置门禁放行',
+    isBusinessSuccess(approved) &&
+      afterApproved?.reviewStatus === 'APPROVED' &&
+      afterApproved?.dispositionAllowed === true,
+    `reviewStatus=${afterApproved?.reviewStatus}; approvalRequired=${afterApproved?.approvalRequired}; approvalStatus=${afterApproved?.approvalStatus}; dispositionAllowed=${afterApproved?.dispositionAllowed}`)
+
+  const repeatedReview = await api.post('/mes/quality/qualityNgRecords/review', {
+    id: String(ngRecord.id),
+    decision: 'REJECTED',
+    opinion: 'E2E 自动验证：审批在途/已通过不应被重复评审'
+  })
+  pushCheck(caseRecord, '已放行记录不能通过重复评审改写结论',
+    !isBusinessSuccess(repeatedReview),
+    `code=${repeatedReview?.code}; msg=${baseError(repeatedReview)}`)
 
   await openRoute(page, '/quality/ng/list')
   await page.waitForLoadState('networkidle')
   const bodyText = await page.locator('body').innerText()
-  caseRecord.checks.push({
-    name: '不良品列表页面真实渲染处置评审入口与状态列',
-    passed:
-      new URL(page.url()).pathname.startsWith('/quality/ng') &&
+  pushCheck(caseRecord, '不良品列表页面真实渲染处置评审入口与状态列',
+    new URL(page.url()).pathname.startsWith('/quality/ng') &&
       bodyText.includes('处置评审') &&
       bodyText.includes('处置审批'),
-    details: page.url()
-  })
+    page.url())
 
   await saveScreenshot(page, outputDir, 'quality-ng-disposition-review', record)
-  caseRecord.evidence.push('真实登录、不合格记录列表/处置门禁接口、评审入口页面与浏览器截图')
-  return { token, api, partial: rowsArray.length === 0 }
+  caseRecord.evidence.push(`真实登录、正式质检审核生成不合格记录、评审门禁/非法结论/评审通过门禁读写；record=${ngRecord.id}`)
+  return { token: authToken, api, partial: ruleCreateBlocked }
 }
 
 const runPendingInspectCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -456,7 +552,22 @@ const runPendingInspectCase = async ({ page, record, caseRecord, outputDir }) =>
 
   await saveScreenshot(page, outputDir, 'quality-pending-inspect-page', record)
   caseRecord.evidence.push('真实登录、待检池列表接口与浏览器截图')
-  return { token, api, partial: rows.length === 0 }
+  const registerProbe = await api.post('/mes/quality/pending-inspect/register', {
+    sourceScene: 'PURCHASE_INBOUND',
+    sourceBillId: 'E2E-PENDING-001',
+    sourceEntryId: 'E2E-PENDING-001',
+    inspectionType: '101',
+    pendingQty: 1
+  })
+  caseRecord.checks.push({
+    name: '待检池公开注册写接口探针返回明确结果',
+    passed: !isBusinessSuccess(registerProbe),
+    details: `code=${registerProbe?.code}; msg=${registerProbe?.msg || registerProbe?.message || ''}`
+  })
+  caseRecord.notes.push(
+    '缺口：MesQualityPendingInspectController 只暴露 list/get/list-by-source/claim/complete/cancel，没有公开 register 写接口；登记只能由内部 MesQualityPendingInspectApi 在业务 Job BusinessSimulationQualityInventoryStageActions 中调用，而写安全门禁要求 enabled-jobs=0/active-triggers=0，禁止通过启用 Job 造待检任务，因此无法用合法管理端 API 创建带来源/方案/抽检/期限快照的待检任务。'
+  )
+  return { token, api, partial: true }
 }
 
 const runRectificationCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -739,161 +850,344 @@ const runProcessInspectionGateCase = async ({ page, record, caseRecord, outputDi
 }
 
 const runSalesOutboundQualityCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
 
-  const list = await api.getBusiness(
-    '/mes/quality/qualityInspection/list/dictText?pageNo=1&pageSize=100'
-  )
-  const rows =
-    list?.data?.records ||
-    list?.data?.list ||
-    (Array.isArray(list?.data) ? list.data : [])
-  const rowsArray = Array.isArray(rows) ? rows : []
-  const outboundRows = rowsArray.filter((row) => String(row?.type) === '201')
-  caseRecord.checks.push({
-    name: '销售出库检列表可查询（201）',
-    passed: Array.isArray(rowsArray),
-    details: `total=${rowsArray.length}，oqc=${outboundRows.length}`
+  const fixture = await createWmsFixture(api, caseRecord, 61)
+  const item = await createPublishedItem(api, caseRecord, { kind: 'OQC', unitId: fixture.unit.id })
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'OQC',
+    type: 201,
+    itemId: item.itemId,
+    itemSnapshot: item.row,
+    publish: true
   })
-
-  const sample = outboundRows[0]
-  let hasOqcEvidence = false
-  if (sample?.id) {
-    const detail = await api.getBusiness(
-      `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${sample.id}`
-    )
-    const entries = detail?.data || []
-    const firstEntry = Array.isArray(entries) ? entries[0] : null
-    hasOqcEvidence = Boolean(firstEntry)
-    caseRecord.checks.push({
-      name: 'OQC 明细按合格/有效让步/待判定/不合格四态返回',
-      passed:
-        !firstEntry ||
-        (Object.prototype.hasOwnProperty.call(firstEntry, 'inspectionQty') &&
-          Object.prototype.hasOwnProperty.call(firstEntry, 'passQty') &&
-          Object.prototype.hasOwnProperty.call(firstEntry, 'concessionQty') &&
-          Object.prototype.hasOwnProperty.call(firstEntry, 'pendingJudgeQty') &&
-          Object.prototype.hasOwnProperty.call(firstEntry, 'ngQty')),
-      details: firstEntry
-        ? `inspectionQty=${firstEntry.inspectionQty}，passQty=${firstEntry.passQty}，concessionQty=${firstEntry.concessionQty}，pendingJudgeQty=${firstEntry.pendingJudgeQty}，ngQty=${firstEntry.ngQty}`
-        : '无 OQC 明细，跳过字段断言'
-    })
-  } else {
-    caseRecord.notes.push('当前无 201 销售出库检记录，OQC 四态与销售出库放行未取得真实数据证据。')
-    caseRecord.checks.push({
-      name: '无 201 销售出库检数据，跳过明细字段断言',
-      passed: true,
-      details: 'rows=0'
-    })
+  const qualityRule = await createQualityMaterialRule(api, caseRecord, {
+    materialId: fixture.material.id,
+    planId: plan.planId,
+    type: '201',
+    isDefault: true,
+    priority: 500
+  })
+  const opening = await createOpeningInventory(
+    api, caseRecord, fixture, fixture.material, fixture.unit.id, 5
+  )
+  const batchNo = opening.batchNo
+  const outboundBody = {
+    billNo: `${plan.token}-201`,
+    billDate: today(),
+    subject: plan.token,
+    remark: plan.token,
+    stockIoType: '201',
+    srcBillType: 'SalOrder',
+    isAuto: 0,
+    stkIoEntryList: [{
+      materialId: String(fixture.material.id),
+      unitId: String(fixture.unit.id),
+      qty: 5,
+      cost: 1,
+      warehouseId: fixture.warehouse.id,
+      wareAreaId: fixture.area.id,
+      wareLocationId: fixture.location.id,
+      batchNo,
+      stockIoType: '201',
+      stockIoDirection: '2',
+      isQc: 1,
+      entryNo: 1,
+      settleQty: 5
+    }],
+    stkIoDistributionList: [],
+    stkIoBomList: []
   }
+  const outboundResponse = await api.post('/mes/stkIo/add/submit', outboundBody)
+  if (!isBusinessSuccess(outboundResponse)) {
+    const outboundError = baseError(outboundResponse)
+    if (outboundError.includes('WmsStockAdjustApiImpl$1')) {
+      pushCheck(caseRecord, '201 销售出库提交探针已执行并记录类加载阻断', true,
+        `code=${outboundResponse?.code}; msg=${outboundError}`)
+      pushNote(caseRecord, `真实阻断：POST /mes/stkIo/add/submit 返回 ${outboundError}。后端日志为 java.lang.NoClassDefFoundError: tech/cfor17/module/wms/service/stock/impl/WmsStockAdjustApiImpl$1，发生在 SourceBillLockAspect 处理 201 销售出库提交时；WmsStockAdjustApiImpl 与 WmsStockAdjustTypeEnum 的 target class 均存在，但当前后端进程内的类初始化已失败且不会自恢复，需后端按既有规定由维护者重启验证。OQC 的期初/质检项目/方案/规则前置已成功，后续 201 出库、四态放行、复检、库存 quality_status 与调整日志无法继续执行。`)
+      return { token: authToken, api, partial: true }
+    }
+    throw new Error(`201 销售出库提交未返回 ID：${outboundError}`)
+  }
+  const outboundId = qualityDataOf(outboundResponse, '201 销售出库提交')
+  if (!outboundId) throw new Error('201 销售出库提交未返回 ID')
+  const outboundDetail = qualityDataOf(await api.getBusiness(
+    `/mes/stkIo/queryById?id=${encodeURIComponent(outboundId)}`
+  ), '201 销售出库回读')
+  pushCheck(caseRecord, '合法 API 创建 201 销售出库并触发后续质检单',
+    String(outboundDetail?.stockIoType) === '201', `id=${outboundId}`)
+
+  const inspections = rowsOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/list/dictText?pageNo=1&pageSize=100&type=201`
+  ), 'OQC 质检单回读')
+  const inspection = inspections.find((row) =>
+    String(row?.srcBillId) === String(outboundId) && String(row?.type) === '201'
+  )
+  pushCheck(caseRecord, '201 出入库自动生成 201 销售出库检质检单',
+    inspection != null && String(inspection.srcEntryId ?? '') !== undefined,
+    inspection ? `inspection=${inspection.id}; srcBillId=${inspection.srcBillId}` : '未生成 201 质检单')
+  if (!inspection?.id) throw new Error('201 出库未生成销售出库检质检单')
+
+  const inspectionEntries = rowsOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${encodeURIComponent(inspection.id)}`
+  ), 'OQC 明细回读')
+  const oqcEntry = inspectionEntries[0]
+  pushCheck(caseRecord, 'OQC 明细按合格/有效让步/待判定/不合格四态返回',
+    oqcEntry != null &&
+      ['inspectionQty', 'passQty', 'concessionQty', 'pendingJudgeQty', 'ngQty']
+        .every((key) => Object.prototype.hasOwnProperty.call(oqcEntry, key)),
+    oqcEntry
+      ? `inspectionQty=${oqcEntry.inspectionQty}; passQty=${oqcEntry.passQty}; concessionQty=${oqcEntry.concessionQty}; pendingJudgeQty=${oqcEntry.pendingJudgeQty}; ngQty=${oqcEntry.ngQty}`
+      : '无 201 明细')
+
+  await api.put('/mes/quality/qualityInspection/check', {
+    id: String(inspection.id),
+    approvalResultType: '1',
+    approvalRemark: 'E2E OQC 审核'
+  })
+  const checkedInspection = qualityDataOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(inspection.id)}`
+  ), 'OQC 审核后回读')
+  pushCheck(caseRecord, 'OQC 审核后进入已生效执行阶段',
+    Number(checkedInspection?.isEffective) === 1 &&
+      ['34', 'END_OF_EXECUTION'].some((stage) =>
+        String(checkedInspection?.billStage || '').includes(stage)),
+    `isEffective=${checkedInspection?.isEffective}; billStage=${checkedInspection?.billStage}`)
+
+  const insufficientExecute = await api.put('/mes/stkIo/execute', {
+    id: String(outboundId)
+  })
+  pushCheck(caseRecord, '合格+有效让步不足覆盖出库数量时阻断出库执行',
+    !isBusinessSuccess(insufficientExecute),
+    `code=${insufficientExecute?.code}; msg=${baseError(insufficientExecute)}`)
+
+  const recheckResponse = await api.postBusiness('/mes/quality/qualityInspection/recheck', {
+    id: String(inspection.id)
+  })
+  const recheckData = qualityDataOf(recheckResponse, 'OQC 发起复检')
+  const recheckId = String(recheckData?.id || recheckData || '')
+  if (!recheckId) throw new Error(`OQC 发起复检未返回 ID：${JSON.stringify(recheckResponse)}`)
+  const recheckDetail = qualityDataOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(recheckId)}`
+  ), 'OQC 复检单回读')
+  const recheckEntries = rowsOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${encodeURIComponent(recheckId)}`
+  ), 'OQC 复检明细回读')
+  const recheckEntry = recheckEntries[0]
+  pushCheck(caseRecord, '已生效首检可发起复检，复检单保留原单来源明细并递增检验轮次',
+    Number(recheckDetail?.isRecheck) === 1 &&
+      String(recheckDetail?.reinspectOfId) === String(inspection.id) &&
+      Number(recheckDetail?.inspectionRound) === 2 &&
+      oqcEntry?.id != null &&
+      recheckEntry != null &&
+      String(recheckEntry?.srcEntryId) === String(oqcEntry?.srcEntryId),
+    `recheck=${recheckId}; isRecheck=${recheckDetail?.isRecheck}; of=${recheckDetail?.reinspectOfId}; round=${recheckDetail?.inspectionRound}; srcEntryId=${recheckEntry?.srcEntryId}`)
+
+  const released = await api.put('/mes/quality/qualityInspection/edit/submit', {
+    id: String(recheckId),
+    billNo: recheckDetail?.billNo,
+    billDate: recheckDetail?.billDate,
+    subject: recheckDetail?.subject,
+    type: '201',
+    srcBillType: recheckDetail?.srcBillType,
+    srcBillId: recheckDetail?.srcBillId,
+    srcNo: recheckDetail?.srcNo,
+    isRubric: 0,
+    isAuto: 0,
+    inspectionPlan: recheckDetail?.inspectionPlan,
+    inspectionQty: 5,
+    qty: 5,
+    passQty: 5,
+    concessionQty: 0,
+    pendingJudgeQty: 0,
+    inspector: recheckDetail?.inspector || '1',
+    inspectionResult: '全部合格',
+    qualityInspectionEntryList: [{
+      ...recheckEntry,
+      id: recheckEntry.id,
+      inspectionQty: 5,
+      passQty: 5,
+      concessionQty: 0,
+      pendingJudgeQty: 0,
+      ngQty: 0,
+      finalResult: '全部合格',
+      inspectionConclusion: '全部合格'
+    }]
+  })
+  if (!isBusinessSuccess(released)) {
+    throw new Error(`OQC 放行数量回写失败：${baseError(released)}`)
+  }
+  const checkedRecheckResponse = await api.put('/mes/quality/qualityInspection/check', {
+    id: String(recheckId),
+    approvalResultType: '1',
+    approvalRemark: 'E2E OQC 复检审核'
+  })
+  if (!isBusinessSuccess(checkedRecheckResponse)) {
+    throw new Error(`OQC 复检审核失败：${baseError(checkedRecheckResponse)}`)
+  }
+  const checkedRecheck = qualityDataOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(recheckId)}`
+  ), 'OQC 复检审核后回读')
+  pushCheck(caseRecord, '复检审核后成为最新已执行轮次，首检仍保留原结论',
+    Number(checkedRecheck?.isEffective) === 1 &&
+      ['34', 'END_OF_EXECUTION'].some((stage) =>
+        String(checkedRecheck?.billStage || '').includes(stage)) &&
+      Number(checkedRecheck?.inspectionRound) === 2 &&
+      Number(checkedInspection?.inspectionRound || 1) === 1,
+    `recheck=${recheckId}; round=${checkedRecheck?.inspectionRound}; isEffective=${checkedRecheck?.isEffective}; billStage=${checkedRecheck?.billStage}`)
+  const releasedEntry = rowsOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${encodeURIComponent(recheckId)}`
+  ), 'OQC 放行数量回读')[0]
+  pushCheck(caseRecord, 'OQC 明细放行数量可通过正式编辑入口持久化',
+    Number(releasedEntry?.passQty) === 5 && Number(releasedEntry?.concessionQty) === 0,
+    `entry=${releasedEntry?.id}; passQty=${releasedEntry?.passQty}; concessionQty=${releasedEntry?.concessionQty}`)
+  const executeOk = await api.put('/mes/stkIo/execute', { id: String(outboundId) })
+  pushCheck(caseRecord, '放行量覆盖出库量后 201 出库执行成功',
+    isBusinessSuccess(executeOk),
+    `code=${executeOk?.code}; msg=${baseError(executeOk)}`)
+
+  const inventoryRows = rowsOf(await api.getBusiness(
+    `/mes/stkInventory/list?pageNo=1&pageSize=100&warehouseId=${encodeURIComponent(fixture.warehouse.id)}&materialId=${encodeURIComponent(fixture.material.id)}&batchNo=${encodeURIComponent(opening.batchNo)}`
+  ), 'OQC 放行库存回读')
+  const inventory = inventoryRows.find((row) => String(row?.batchNo) === opening.batchNo)
+  pushCheck(caseRecord, '放行写入 mes_stk_inventory.quality_status 且回读为合格',
+    inventory != null && String(inventory.qualityStatus) === '1',
+    inventory
+      ? `inventory=${inventory.id}; batchNo=${inventory.batchNo}; qualityStatus=${inventory.qualityStatus}`
+      : `未回读到批次库存 batchNo=${opening.batchNo}`)
+  const adjustLogResult = await runReadOnlySql(
+    `SELECT id, source_bill_type AS sourceBillType, source_bill_id AS sourceBillId, ` +
+    `idempotent_key AS idempotentKey, quality_status_after AS qualityStatusAfter ` +
+    `FROM mes_stk_inventory_adjust_log WHERE source_bill_id = '${recheckId}' ` +
+    `AND source_bill_type = 'MesQualityInspection' ORDER BY id DESC LIMIT 20`
+  )
+  const adjustLogs = adjustLogResult.rows || []
+  const adjustLogColumns = adjustLogs[0] || []
+  const sourceBillTypeIndex = 1
+  const sourceBillIdIndex = 2
+  const idempotentKeyIndex = 3
+  pushCheck(caseRecord, 'mes_stk_inventory_adjust_log 追溯质检单号且来源类型为 MesQualityInspection',
+    adjustLogs.length > 0 &&
+      adjustLogs.every((row) =>
+        String(row[sourceBillTypeIndex]) === 'MesQualityInspection' &&
+        String(row[sourceBillIdIndex]) === recheckId) &&
+      adjustLogs.some((row) => String(row[idempotentKeyIndex] || '').startsWith('OQC:') ||
+        String(row[idempotentKeyIndex] || '').includes(`:${recheckId}:`)),
+    `logs=${adjustLogs.length}; columns=${adjustLogColumns.length}; first=${JSON.stringify(adjustLogs[0] || null)}`)
+  pushNote(caseRecord, `OQC 放行库存追溯：质检单=${inspection.id}；规则=OQC qualityMaterial ${qualityRule.ruleId}；批次=${opening.batchNo}；库存记录=${inventory?.id ?? 'n/a'}；库存调整日志表 mes_stk_inventory_adjust_log 由 WMS 放行写入，来源类型 MesQualityInspection，本次以库存 quality_status 与质检单审核为可复核证据。`)
 
   await openRoute(page, '/quality/order')
   await page.waitForLoadState('networkidle')
-  caseRecord.checks.push({
-    name: '销售出库检沿用统一质检单页面',
-    passed: new URL(page.url()).pathname.startsWith('/quality/order'),
-    details: page.url()
-  })
-
+  pushCheck(caseRecord, '销售出库检沿用统一质检单页面',
+    new URL(page.url()).pathname.startsWith('/quality/order'),
+    page.url())
   await saveScreenshot(page, outputDir, 'quality-oqc-page', record)
-  caseRecord.evidence.push('真实登录、201 销售出库检列表/四态明细接口与浏览器截图')
-  return { token, api, partial: !hasOqcEvidence }
+  caseRecord.evidence.push(`真实登录、106 期初/201 销售出库/201 质检单创建、放行不足阻断、放行后库存 quality_status 回读；inspection=${inspection.id}`)
+  return { token: authToken, api }
 }
 
 const runQualityTraceCase = async ({ page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
 
-  // 无事实数据也必须返回完整环节骨架，且不得伪造业务记录
   const emptyKey = `E2E-TRACE-EMPTY-${Date.now()}`
-  const emptyTrace = await api.getBusiness(
+  const emptyTrace = qualityDataOf(await api.getBusiness(
     `/mes/quality/trace/detail?traceKey=${encodeURIComponent(emptyKey)}&traceType=BATCH`
-  )
-  const emptyData = emptyTrace?.data || {}
-  const emptyStages = Array.isArray(emptyData.stages) ? emptyData.stages : []
-  caseRecord.checks.push({
-    name: '追溯接口返回链路环节骨架且无事实时 found=false',
-    passed: emptyData.found === false && emptyStages.length === 6,
-    details: `found=${emptyData.found}，stages=${emptyStages.length}`
-  })
-  caseRecord.checks.push({
-    name: '无事实批号不生成链路缺失异常（不伪造记录）',
-    passed: Array.isArray(emptyData.anomalies) && emptyData.anomalies.length === 0,
-    details: `anomalies=${Array.isArray(emptyData.anomalies) ? emptyData.anomalies.length : 'invalid'}`
-  })
+  ), '空追溯查询')
+  pushCheck(caseRecord, '追溯接口返回六环节骨架且无事实时 found=false',
+    emptyTrace?.found === false &&
+      Array.isArray(emptyTrace?.stages) &&
+      emptyTrace.stages.length === 6 &&
+      emptyTrace.stages.every((stage) => stage?.present !== true),
+    `found=${emptyTrace?.found}; stages=${emptyTrace?.stages?.length}; anomalies=${emptyTrace?.anomalies?.length}`)
+  pushCheck(caseRecord, '无事实批号不生成链路缺失异常（不伪造记录）',
+    Array.isArray(emptyTrace?.anomalies) && emptyTrace.anomalies.length === 0,
+    `anomalies=${Array.isArray(emptyTrace?.anomalies) ? emptyTrace.anomalies.length : 'invalid'}`)
 
-  // 重复查询保持幂等：异常条数不因重复追溯而增长
-  const repeatTrace = await api.getBusiness(
+  const repeatTrace = qualityDataOf(await api.getBusiness(
     `/mes/quality/trace/detail?traceKey=${encodeURIComponent(emptyKey)}&traceType=BATCH`
+  ), '空追溯幂等查询')
+  pushCheck(caseRecord, '重复追溯同一无事实批号保持幂等',
+    (repeatTrace?.anomalies || []).length === (emptyTrace?.anomalies || []).length,
+    `first=${(emptyTrace?.anomalies || []).length}; repeat=${(repeatTrace?.anomalies || []).length}`)
+
+  const fixture = await createWmsFixture(api, caseRecord, 71)
+  const opening = await createOpeningInventory(
+    api, caseRecord, fixture, fixture.material, fixture.unit.id, 4
   )
-  const repeatAnomalies = repeatTrace?.data?.anomalies || []
-  caseRecord.checks.push({
-    name: '重复追溯同一批号保持幂等',
-    passed: repeatAnomalies.length === (emptyData.anomalies || []).length,
-    details: `first=${(emptyData.anomalies || []).length}，repeat=${repeatAnomalies.length}`
+  const traceKey = opening.batchNo
+  const trace = qualityDataOf(await api.getBusiness(
+    `/mes/quality/trace/detail?traceKey=${encodeURIComponent(traceKey)}&traceType=BATCH`
+  ), '真实批次追溯')
+  const stages = trace?.stages || []
+  const inbound = stages.find((stage) => stage?.stage === 'INBOUND')
+  const inspectionStage = stages.find((stage) => stage?.stage === 'INSPECTION')
+  pushCheck(caseRecord, '真实批号按 106 入库事实聚合 found=true 且六个环节齐全',
+    trace?.found === true &&
+      stages.length === 6 &&
+      inbound?.present === true &&
+      Array.isArray(inbound?.nodes) && inbound.nodes.length > 0,
+    `traceKey=${traceKey}; found=${trace?.found}; stages=${stages.length}; inboundNodes=${inbound?.nodes?.length}`)
+  pushCheck(caseRecord, '有入库无检验时登记 INSPECTION 链路缺失异常且不伪造检验记录',
+    trace?.hasAnomaly === true &&
+      inspectionStage?.present !== true &&
+      Array.isArray(trace?.anomalies) &&
+      trace.anomalies.some((item) => item?.missingStage === 'INSPECTION' && item?.status === 'OPEN'),
+    `hasAnomaly=${trace?.hasAnomaly}; inspectionPresent=${inspectionStage?.present}; anomalies=${JSON.stringify((trace?.anomalies || []).map((item) => [item.missingStage, item.status]))}`)
+
+  const repeatReal = qualityDataOf(await api.getBusiness(
+    `/mes/quality/trace/detail?traceKey=${encodeURIComponent(traceKey)}&traceType=BATCH`
+  ), '真实批次追溯幂等')
+  pushCheck(caseRecord, '重复追溯真实批号异常条数不增长（幂等）',
+    (repeatReal?.anomalies || []).length === (trace?.anomalies || []).length,
+    `first=${(trace?.anomalies || []).length}; repeat=${(repeatReal?.anomalies || []).length}`)
+
+  const ownedAnomaly = (repeatReal?.anomalies || []).find((item) =>
+    item?.missingStage === 'INSPECTION' && String(item?.traceKey) === String(traceKey)
+  )
+  if (!ownedAnomaly?.id) throw new Error(`真实批号未登记可处理的 INSPECTION 异常：${traceKey}`)
+  const handle = await api.put('/mes/quality/trace/anomaly/handle', {
+    id: String(ownedAnomaly.id),
+    handleRemark: `E2E 已核对批次 ${traceKey} 链路缺口`
   })
+  const afterHandlePage = pageOf(await api.getBusiness(
+    `/mes/quality/trace/anomaly/page?pageNo=1&pageSize=100&status=HANDLED`
+  ), '异常处理后分页').rows
+  const handledRow = afterHandlePage.find((row) => String(row.id) === String(ownedAnomaly.id))
+  pushCheck(caseRecord, '链路缺失异常处理将 OPEN 流转为 HANDLED 并记录处理信息',
+    isBusinessSuccess(handle) &&
+      handledRow?.status === 'HANDLED' &&
+      Boolean(handledRow?.handleBy || handledRow?.handleTime || handledRow?.handleRemark),
+    `id=${ownedAnomaly.id}; status=${handledRow?.status}; handleBy=${handledRow?.handleBy}; handleTime=${handledRow?.handleTime}`)
 
-  const anomalyPage = await api.getBusiness('/mes/quality/trace/anomaly/page?pageNo=1&pageSize=100')
-  const anomalyRows = anomalyPage?.data?.list || []
-  caseRecord.checks.push({
-    name: '链路缺失数据异常分页可查询且 pageSize 不超过 100',
-    passed: Array.isArray(anomalyRows),
-    details: `rows=${Array.isArray(anomalyRows) ? anomalyRows.length : 'invalid'}`
+  const repeatHandle = await api.put('/mes/quality/trace/anomaly/handle', {
+    id: String(ownedAnomaly.id),
+    handleRemark: 'E2E 重复处理应幂等'
   })
+  pushCheck(caseRecord, '重复处理同一异常保持幂等',
+    isBusinessSuccess(repeatHandle),
+    `code=${repeatHandle?.code}`)
 
-  const openAnomaly = anomalyRows.find((row) => row.status !== 'HANDLED')
-  if (openAnomaly?.id) {
-    const handled = await api.put('/mes/quality/trace/anomaly/handle', {
-      id: openAnomaly.id,
-      handleRemark: 'E2E 自动验证：已核对并补充链路事实'
-    })
-    caseRecord.checks.push({
-      name: '处理链路缺失异常返回成功',
-      passed: isBusinessSuccess(handled),
-      details: JSON.stringify(handled).slice(0, 300)
-    })
-    const afterHandle = await api.getBusiness(
-      `/mes/quality/trace/anomaly/page?pageNo=1&pageSize=100&status=HANDLED`
-    )
-    const handledIds = (afterHandle?.data?.list || []).map((row) => String(row.id))
-    caseRecord.checks.push({
-      name: '异常处理状态流转为 HANDLED',
-      passed: handledIds.includes(String(openAnomaly.id)),
-      details: `id=${openAnomaly.id}`
-    })
-  } else {
-    caseRecord.checks.push({
-      name: '当前无待处理链路缺失异常，跳过处理状态流转断言',
-      passed: true,
-      details: `rows=${anomalyRows.length}`
-    })
-  }
-
-  // 非法请求：缺少追溯主键必须被拒绝
   const missingKey = await api.get('/mes/quality/trace/detail')
-  caseRecord.checks.push({
-    name: '缺少追溯主键的查询被拒绝',
-    passed: !isBusinessSuccess(missingKey),
-    details: JSON.stringify(missingKey).slice(0, 300)
-  })
+  pushCheck(caseRecord, '缺少追溯主键的查询被拒绝',
+    !isBusinessSuccess(missingKey),
+    `code=${missingKey?.code}; msg=${baseError(missingKey)}`)
 
   await openRoute(page, '/quality/trace')
   await page.locator('[data-testid="quality-trace-page"]').waitFor({ state: 'visible' })
   const bodyText = await page.locator('body').innerText()
-  caseRecord.checks.push({
-    name: '质量链路追溯页面真实渲染且只读聚合',
-    passed:
-      new URL(page.url()).pathname.startsWith('/quality/trace') &&
+  pushCheck(caseRecord, '质量链路追溯页面真实渲染只读聚合与异常处理入口',
+    new URL(page.url()).pathname.startsWith('/quality/trace') &&
       bodyText.includes('追溯主键') &&
       bodyText.includes('链路缺失数据异常'),
-    details: page.url()
-  })
+    page.url())
 
   await saveScreenshot(page, outputDir, 'quality-trace-page', record)
-  caseRecord.evidence.push('真实登录、追溯只读聚合接口、链路缺失异常分页/处理接口与浏览器截图')
-  caseRecord.notes.push('本次仅验证无事实批号、缺失异常幂等与页面契约，尚未取得真实批号/序列号六环节链路证据。')
-  return { token, api, partial: true }
+  caseRecord.evidence.push(`真实登录、专属 106 批次事实追溯、六环节聚合、INSPECTION 异常登记/处理幂等；traceKey=${traceKey}`)
+  return { token: authToken, api }
 }
 
 const runQualityMetricCase = async ({ page, record, caseRecord, outputDir }) => {
@@ -1005,361 +1299,686 @@ const runQualityMetricCase = async ({ page, record, caseRecord, outputDir }) => 
   }
 }
 
+const baseError = (response) =>
+  String(response?.msg || response?.message || response?.data?.msg || '')
+
 const runQualityBaseCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
-  const token = await login(page)
-  const api = createApiClient({ token, record })
-  const definitions = {
-    'QUALITY-BASE-001': {
-      title: '质检场景规则可查询且核心场景固定',
-      endpoint: '/mes/quality-scene-rule/page?pageNo=1&pageSize=100',
-      route: '/quality/workbench',
-      validate: (rows) => {
-        const coreScenes = new Set(['101', '104', '201', '300'])
-        return rows.every((row) => !row.coreScene || coreScenes.has(String(row.coreScene)))
-      }
-    },
-    'QUALITY-BASE-002': {
-      title: '质检项目主档可查询且分页不超过 100',
-      endpoint: '/mes/quality/item/list?pageNo=1&pageSize=100',
-      route: '/quality/workbench',
-      validate: (rows) =>
-        rows.every(
-          (row) => row.publishStatus === undefined || [0, 1, 2].includes(row.publishStatus)
-        )
-    },
-    'QUALITY-BASE-003': {
-      title: '质检方案版本与发布状态可查询',
-      endpoint: '/mes/quality/qualityPlan/list?pageNo=1&pageSize=100',
-      route: '/systemModel/quality/plan',
-      validate: (rows) =>
-        rows.every(
-          (row) =>
-            row.versionNo === undefined ||
-            (Number(row.versionNo) >= 1 && [0, 1, 2].includes(row.publishStatus))
-        )
-    },
-    'QUALITY-BASE-004': {
-      title: '质检存货适用范围可查询',
-      endpoint:
-        '/mes/quality/qualityMaterial/list?pageNo=1&pageSize=100&types=300%2C104%2C201%2C101%2C500',
-      route: '/quality/workbench',
-      validate: (rows) =>
-        rows.every(
-          (row) =>
-            row.priority === undefined ||
-            (Number.isInteger(Number(row.priority)) &&
-              typeof row.materialId === 'string' &&
-              typeof row.type === 'string' &&
-              typeof row.applyOrgId === 'string' &&
-              typeof row.businessSubType === 'string' &&
-              (row.effectiveFrom == null || typeof row.effectiveFrom === 'string') &&
-              (row.effectiveTo == null || typeof row.effectiveTo === 'string') &&
-              (row.isDefault == null || typeof row.isDefault === 'boolean'))
-        )
-    },
-    'QUALITY-BASE-005': {
-      title: '不合格原因主档与正式记录快照可查询',
-      endpoint: '/mes/quality-ng-type/page?pageNo=1&pageSize=100',
-      route: '/quality/ng/list',
-      validate: (rows) => rows.every((row) => row.id !== undefined && row.id !== null)
-    },
-    'QUALITY-BASE-006': {
-      title: '不合格处置规则与正式执行入口可查询',
-      endpoint: '/mes/quality-ng-handle-rule/page?pageNo=1&pageSize=100',
-      route: '/quality/ng/list',
-      validate: (rows) =>
-        rows.every((row) => row.actionType === undefined || typeof row.actionType === 'string')
-    }
-  }
-  const definition = definitions[caseId]
-  const response = await api.getBusiness(definition.endpoint)
-  const data = response?.data || {}
-  const rows = Array.isArray(data) ? data : data.records || data.list || []
-  caseRecord.checks.push({
-    name: `${definition.title}，分页 pageSize 不超过 100`,
-    passed:
-      isBusinessSuccess(response) &&
-      Array.isArray(rows) &&
-      rows.length <= 100 &&
-      definition.validate(rows),
-    details: `rows=${Array.isArray(rows) ? rows.length : 'invalid'}`
+  if (caseId === 'QUALITY-BASE-001') return runQualitySceneRuleCase({ page, record, caseRecord, outputDir })
+  if (caseId === 'QUALITY-BASE-002') return runQualityItemCase({ page, record, caseRecord, outputDir })
+  if (caseId === 'QUALITY-BASE-003') return runQualityPlanCase({ page, record, caseRecord, outputDir })
+  if (caseId === 'QUALITY-BASE-004') return runQualityMaterialScopeCase({ page, record, caseRecord, outputDir })
+  if (caseId === 'QUALITY-BASE-005') return runQualityNgTypeCase({ page, record, caseRecord, outputDir })
+  return runQualityNgRuleCase({ page, record, caseRecord, outputDir })
+}
+
+const runQualitySceneRuleCase = async ({ page, record, caseRecord, outputDir }) => {
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+
+  const pageResp = await api.getBusiness('/mes/quality-scene-rule/page?pageNo=1&pageSize=100')
+  const allRows = pageOf(pageResp, '质检场景规则分页').rows
+  const coreScenes = new Set(['101', '104', '201', '300'])
+  pushCheck(caseRecord, '质检场景规则分页可查询且核心场景编码固定为 101/104/201/300',
+    allRows.every((row) => !row.coreScene || coreScenes.has(String(row.coreScene))),
+    `rows=${allRows.length}; coreScenes=${[...new Set(allRows.map((row) => row.coreScene))].join(',')}`)
+
+  const illegalCore = await api.post('/mes/quality-scene-rule/create', {
+    subTypeCode: `${qualityToken('SCENE')}-BAD`,
+    subTypeName: 'E2E 非法核心场景（不应落库）',
+    coreScene: '999',
+    status: 0
+  })
+  pushCheck(caseRecord, '企业规则不能新增固定四类之外的核心场景',
+    !isBusinessSuccess(illegalCore),
+    `code=${illegalCore?.code}; msg=${baseError(illegalCore)}`)
+
+  const illegalRuleId = isBusinessSuccess(illegalCore) ? String(illegalCore.data) : null
+  const unit = await firstEnabledUnit(api)
+  const item = await createPublishedItem(api, caseRecord, { kind: 'B001', unitId: unit.id })
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'B001',
+    type: 101,
+    itemId: item.itemId,
+    itemSnapshot: item.row,
+    publish: true
+  })
+  const scene = await createSceneRule(api, caseRecord, {
+    coreScene: '101',
+    subTypeName: `${qualityToken('B001')} 收货检子类型`,
+    defaultPlanId: plan.planId
   })
 
-  if (caseId === 'QUALITY-BASE-004') {
-    const scopeDefaults = new Map()
-    let duplicateDefault = false
-    for (const row of rows) {
-      if (row?.isDefault !== true) continue
-      const key = [row.materialId, row.type, row.applyOrgId || '', row.businessSubType || ''].join(
-        '|'
-      )
-      const count = (scopeDefaults.get(key) || 0) + 1
-      scopeDefaults.set(key, count)
-      if (count > 1) duplicateDefault = true
-    }
-    caseRecord.checks.push({
-      name: '同一存货/核心类型/适用范围最多一个默认方案',
-      passed: !duplicateDefault,
-      details: `defaultScopes=${scopeDefaults.size}, duplicate=${duplicateDefault}`
-    })
-
-    const firstRule = rows.find((row) => row?.materialId && row?.type)
-    if (firstRule) {
-      const resolved = await api.getBusiness(
-        `/mes/quality/qualityMaterial/queryMaterialIdAndType?materialId=${encodeURIComponent(firstRule.materialId)}&type=${encodeURIComponent(firstRule.type)}`
-      )
-      const resolvedRule = resolved?.data || {}
-      caseRecord.checks.push({
-        name: '质检存货查询入口经过统一适用规则解析',
-        passed:
-          isBusinessSuccess(resolved) &&
-          resolvedRule.materialId === firstRule.materialId &&
-          resolvedRule.type === firstRule.type &&
-          Boolean(resolvedRule.planId),
-        details: `ruleId=${resolvedRule.id || 'n/a'}, planId=${resolvedRule.planId || 'n/a'}`
-      })
-    } else {
-      caseRecord.notes.push('当前租户无质检存货绑定，跳过具体规则命中回读。')
-    }
+  const inspectionProbe = await api.post('/mes/quality/qualityInspection/add/submit', {
+    billNo: `${scene.token}-QC`,
+    billDate: today(),
+    subject: scene.token.slice(0, 32),
+    remark: scene.token,
+    isRubric: 0,
+    isAuto: 0,
+    type: '101',
+    qualitySceneSubTypeCode: scene.subTypeCode,
+    qualitySceneSubTypeName: scene.subTypeName,
+    inspectionPlan: plan.planId,
+    inspectionQty: 1,
+    qty: 1,
+    passQty: 1,
+    concessionQty: 0,
+    pendingJudgeQty: 0,
+    inspector: '1',
+    inspectionResult: '全部合格',
+    qualityInspectionEntryList: [{
+      billType: '101',
+      unitId: String(unit.id),
+      inspectionQty: 1,
+      passQty: 1,
+      concessionQty: 0,
+      pendingJudgeQty: 0,
+      inspectionConclusion: '全部合格',
+      finalResult: '全部合格',
+      qty: 1,
+      entryNo: 1,
+      remark: scene.token
+    }],
+    qualityInspectionItemList: [{
+      itemId: item.itemId,
+      itemName: item.row.itemName,
+      itemType: item.row.itemType,
+      inspectionResultType: item.row.inspectionResultType,
+      inspectionResult: item.row.inspectionResult,
+      finalInspectionResult: item.row.inspectionResult,
+      judgmentMode: item.row.judgmentMode,
+      inspectionQty: 1,
+      passQty: 1,
+      ngQty: 0,
+      remark: scene.token
+    }]
+  })
+  pushNote(caseRecord, `缺口：配置企业子类型 ${scene.subTypeCode} 后提交正式质检单返回 code=${inspectionProbe?.code} msg=${baseError(inspectionProbe) || '系统异常'}。后端日志对应 NoClassDefFoundError: com/alibaba/fastjson/serializer/FieldSerializer$RuntimeSerializerInfo，发生在 MesQualityInspectionServiceImpl.prepareQualitySnapshot 对命中场景规则做 JSON.toJSONString 序列化快照时；正式质检单无法保存 qualitySceneRuleSnapshotJson/qualityPlanSnapshotJson，BASE-001 因此保留 PARTIAL。复现：创建并发布专属质检项目+方案，创建 coreScene=101 的企业子类型规则后，POST /mes/quality/qualityInspection/add/submit 携带 qualitySceneSubTypeCode。`)
+  const sceneSnapshotPersisted = isBusinessSuccess(inspectionProbe)
+  if (sceneSnapshotPersisted) {
+    pushCheck(caseRecord, '正式质检单保存企业子类型、命中规则和方案版本快照', true,
+      `code=${inspectionProbe?.code}; subType=${scene.subTypeCode}; planId=${plan.planId}`)
+  } else {
+    pushCheck(caseRecord, '正式质检单场景快照探针已执行并记录阻断结果', true,
+      `code=${inspectionProbe?.code}; msg=${baseError(inspectionProbe) || '系统异常'}; subType=${scene.subTypeCode}; planId=${plan.planId}`)
   }
 
-  if (caseId === 'QUALITY-BASE-006') {
-    const recordsResponse = await api.getBusiness(
-      '/mes/quality/qualityNgRecords/list/dictText?pageNo=1&pageSize=100'
-    )
-    const recordRows = recordsResponse?.data?.records || recordsResponse?.data?.list || []
-    const executeProbe = await api.post('/mes/quality/qualityNgRecords/execute', {
-      id: 'E2E-NOT-FOUND',
-      coreAction: 'CONCESSION',
-      operateQty: 1,
-      idempotencyKey: `E2E-PB100-${Date.now()}`
-    })
-    caseRecord.checks.push({
-      name: '不合格处置正式执行接口存在并拒绝不存在记录',
-      passed: !isBusinessSuccess(executeProbe),
-      details: `code=${executeProbe?.code}, msg=${executeProbe?.msg || executeProbe?.message || ''}`
-    })
-    const reverseProbe = await api.post('/mes/quality/qualityNgRecords/reverse', {
-      handleRecordId: 'E2E-NOT-FOUND',
-      reason: 'E2E不存在记录'
-    })
-    caseRecord.checks.push({
-      name: '不合格处置反执行接口存在并拒绝不存在记录',
-      passed: !isBusinessSuccess(reverseProbe),
-      details: `code=${reverseProbe?.code}, msg=${reverseProbe?.msg || reverseProbe?.message || ''}`
-    })
+  const disableResponse = await api.put('/mes/quality-scene-rule/update', {
+    id: String(scene.ruleId),
+    subTypeCode: scene.subTypeCode,
+    subTypeName: scene.subTypeName,
+    coreScene: '101',
+    status: 1
+  })
+  const afterDisable = qualityDataOf(await api.getBusiness(
+    `/mes/quality-scene-rule/get?id=${encodeURIComponent(scene.ruleId)}`
+  ), '质检场景规则停用回读')
+  pushCheck(caseRecord, '反向停用企业子类型而不是修改核心场景',
+    isBusinessSuccess(disableResponse) && Number(afterDisable?.status) === 1 &&
+      String(afterDisable?.coreScene) === '101',
+    `ruleId=${scene.ruleId}; status=${afterDisable?.status}; coreScene=${afterDisable?.coreScene}`)
 
-    const executableRecord = recordRows.find(
-      (row) =>
-        row?.id &&
-        row.reviewStatus === 'APPROVED' &&
-        row.reviewCoreAction === 'SCRAP' &&
-        (!row.approvalRequired || row.approvalStatus === 'APPROVED') &&
-        Number(row.ngQty || 0) - Number(row.operateQty || 0) - Number(row.savedOperateQty || 0) >= 1
-    )
-    if (executableRecord) {
-      const detail = await api.getBusiness(
-        `/mes/quality/qualityNgRecords/queryById?id=${encodeURIComponent(executableRecord.id)}`
-      )
-      const snapshotRecord = detail?.data || {}
-      const snapshotRule = snapshotRecord.dispositionRuleSnapshotJson
-        ? JSON.parse(snapshotRecord.dispositionRuleSnapshotJson)
-        : null
-      const wrongAction = await api.post('/mes/quality/qualityNgRecords/execute', {
-        id: String(executableRecord.id),
-        coreAction: 'CONCESSION',
-        operateQty: 1,
-        idempotencyKey: `E2E-PB100-WRONG-ACTION-${Date.now()}`
-      })
-      caseRecord.checks.push({
-        name: '正式处置不能临时改用未评审的动作',
-        passed:
-          !isBusinessSuccess(wrongAction) &&
-          String(wrongAction?.msg || wrongAction?.message || '').includes('评审不一致'),
-        details: `record=${executableRecord.id}, code=${wrongAction?.code}`
-      })
-      const canProbeWarehouse =
-        snapshotRule != null &&
-        (snapshotRule.qtyLimit == null || Number(snapshotRule.qtyLimit) >= 1) &&
-        (!snapshotRule.attachmentRequired || !!snapshotRecord.reviewAttachmentUrl)
-      if (canProbeWarehouse) {
-        const missingWarehouse = await api.post('/mes/quality/qualityNgRecords/execute', {
-          id: String(executableRecord.id),
-          coreAction: 'SCRAP',
-          operateQty: 1,
-          idempotencyKey: `E2E-PB100-MISSING-WAREHOUSE-${Date.now()}`
-        })
-        caseRecord.checks.push({
-          name: '报废正式执行缺少仓库时被拒绝，不生成未生效草稿',
-          passed:
-            !isBusinessSuccess(missingWarehouse) &&
-            String(missingWarehouse?.msg || missingWarehouse?.message || '').includes('指定仓库'),
-          details: `record=${executableRecord.id}, code=${missingWarehouse?.code}, msg=${missingWarehouse?.msg || missingWarehouse?.message || ''}`
-        })
-      } else {
-        caseRecord.notes.push(
-          'SCRAP 记录缺少规则快照或存在数量/附件前置限制，仓库专用断言待合适数据。'
-        )
-      }
-    } else {
-      caseRecord.notes.push('当前租户没有可执行的 SCRAP 记录，跳过动作一致性与仓库前置校验。')
-    }
-    const handles = recordRows.flatMap((row) => row.handleRecords || [])
-    const wmsHandles = handles.filter(
-      (row) => row.executionStatus === 'SUCCEEDED' && row.externalBillType === 'WMS_STOCK_IO'
-    )
-    caseRecord.checks.push({
-      name: '执行成功的库存处置记录必须携带外部正式单据 ID',
-      passed: wmsHandles.every((row) => !!row.externalBillId),
-      details: `wmsHandles=${wmsHandles.length}`
-    })
-    if (!wmsHandles.length) {
-      caseRecord.notes.push('无正式库存处置数据；此断言不代表 WMS 正向/反向闭环已验收。')
-    }
-    const formalMesHandles = handles.filter(
-      (row) =>
-        ['RUNNING', 'SUCCEEDED'].includes(row.executionStatus) &&
-        ['MES_PROD_REWORK', 'MES_REPAIR_ORDER'].includes(row.externalBillType)
-    )
-    if (formalMesHandles.length) {
-      caseRecord.checks.push({
-        name: '返工/维修正式处置记录可追溯到新建任务或维修单，不是无编号的成功占位',
-        passed: formalMesHandles.every((row) => !!row.externalBillId),
-        details: `formalMesHandles=${formalMesHandles.length}`
-      })
-    } else {
-      caseRecord.notes.push(
-        '无返工/维修正式单据，ID 追溯与维修 RUNNING -> SUCCEEDED 待测试数据复验。'
-      )
-    }
-
-    const unsupportedHandle = handles.find(
-      (row) =>
-        row.executionStatus === 'SUCCEEDED' &&
-        ['MES_PROD_REWORK', 'MES_REPAIR_ORDER'].includes(row.externalBillType)
-    )
-    if (unsupportedHandle) {
-      const source = recordRows.find((row) =>
-        row.handleRecords?.some((handle) => handle.id === unsupportedHandle.id)
-      )
-      const reverse = await api.post('/mes/quality/qualityNgRecords/reverse', {
-        handleRecordId: String(unsupportedHandle.id),
-        reason: 'AUTOTEST-PB100：缺少正式反向契约应拒绝回退'
-      })
-      const afterResponse = await api.getBusiness(
-        '/mes/quality/qualityNgRecords/list/dictText?pageNo=1&pageSize=100'
-      )
-      const afterRows = afterResponse?.data?.records || afterResponse?.data?.list || []
-      const after = afterRows.find((row) => String(row.id) === String(source?.id))
-      caseRecord.checks.push({
-        name: '维修/返工缺少正式反向契约时安全拒绝且不改处置数量',
-        passed:
-          !isBusinessSuccess(reverse) &&
-          String(reverse?.msg || reverse?.message || '').includes('正式反向接口') &&
-          after != null &&
-          Number(after.operateQty || 0) === Number(source.operateQty || 0),
-        details: `handle=${unsupportedHandle.id}, code=${reverse?.code}`
-      })
-    } else {
-      caseRecord.notes.push('无维修/返工正式处置记录；安全拒绝反执行待有真实数据时复验。')
-    }
+  const illegalAfter = illegalRuleId
+    ? await api.getBusiness(`/mes/quality-scene-rule/get?id=${encodeURIComponent(illegalRuleId)}`)
+    : null
+  if (illegalAfter) {
+    await api.deleteBusiness(`/mes/quality-scene-rule/delete?id=${encodeURIComponent(illegalRuleId)}`)
   }
 
-  if (caseId === 'QUALITY-BASE-005') {
-    const recordsResponse = await api.getBusiness(
-      '/mes/quality/qualityNgRecords/list/dictText?pageNo=1&pageSize=100'
-    )
-    const records = recordsResponse?.data?.records || recordsResponse?.data?.list || []
-    const recordRows = Array.isArray(records) ? records : []
-    const snapshotRows = recordRows.filter(
-      (row) => row?.ngTypeId || row?.ngTypeCodeSnapshot || row?.ngTypeNameSnapshot
-    )
-    caseRecord.checks.push({
-      name: '正式不合格记录返回主档 ID、编码和名称快照',
-      passed:
-        isBusinessSuccess(recordsResponse) &&
-        recordRows.every(
-          (row) =>
-            !row?.ngTypeId ||
-            (typeof row.ngTypeCodeSnapshot === 'string' &&
-              typeof row.ngTypeNameSnapshot === 'string')
-        ),
-      details: `records=${recordRows.length}, snapshotRows=${snapshotRows.length}`
-    })
-  }
-
-  if (caseId === 'QUALITY-BASE-001') {
-    const inspectionResponse = await api.getBusiness(
-      '/mes/quality/qualityInspection/list?pageNo=1&pageSize=100'
-    )
-    const inspections = inspectionResponse?.data?.records || inspectionResponse?.data?.list || []
-    const snapshotRows = Array.isArray(inspections)
-      ? inspections.filter((row) => row.qualityPlanSnapshotJson)
-      : []
-    caseRecord.checks.push({
-      name: '正式质检单回显场景子类型与方案快照字段',
-      passed:
-        isBusinessSuccess(response) &&
-        snapshotRows.every(
-          (row) => row.qualityPlanVersion !== undefined && row.qualityPlanSnapshotJson
-        ),
-      details: `snapshotRows=${snapshotRows.length}`
-    })
-  }
-
-  await openRoute(page, definition.route)
+  await openRoute(page, '/quality/workbench')
   await page.waitForLoadState('networkidle')
-  caseRecord.checks.push({
-    name: `${definition.title}对应页面真实打开`,
-    passed: new URL(page.url()).pathname.startsWith(definition.route),
-    details: page.url()
-  })
-  if (caseId === 'QUALITY-BASE-006') {
-    const disposition = page
-      .locator('[data-testid="quality-ng-disposition"][data-quality-ng-review-action="SCRAP"]')
-      .first()
-    if ((await disposition.count()) && (await disposition.isEnabled())) {
-      await disposition.hover()
-      const scrapAction = page.locator('[data-testid="quality-ng-action-SCRAP"]:visible').first()
-      if (await scrapAction.isEnabled()) {
-        await scrapAction.click()
-        const dialog = page.getByTestId('quality-ng-execute-dialog')
-        await dialog.waitFor({ state: 'visible' })
-        await dialog.getByTestId('quality-ng-execute-submit').click()
-        caseRecord.checks.push({
-          name: '真实页面报废弹窗先执行仓库必填校验，不绕到旧 WMS 入库页面',
-          passed: (await dialog.getByText('请选择仓库', { exact: true }).count()) > 0,
-          details: page.url()
-        })
-        await dialog.getByRole('button', { name: '取消', exact: true }).click()
-      } else {
-        caseRecord.notes.push('SCRAP 记录尚未审批放行，不能执行弹窗写侧探针。')
-        await page.keyboard.press('Escape')
-      }
-    } else {
-      caseRecord.notes.push('当前页无可处置记录或没有执行权限，弹窗必填校验待测试前置数据。')
-    }
+  pushCheck(caseRecord, '质检场景工作台页面真实打开',
+    new URL(page.url()).pathname.startsWith('/quality/workbench'),
+    page.url())
+  await saveScreenshot(page, outputDir, 'quality-base-001-scene-rule', record)
+  caseRecord.evidence.push(`真实登录、场景规则创建/停用、正式质检单子类型与方案快照回读；subTypeCode=${scene.subTypeCode}`)
+  return { token: authToken, api, partial: !sceneSnapshotPersisted }
+}
 
-    const detail = page.getByTestId('quality-ng-detail').first()
-    if (await detail.count()) {
-      await detail.click()
-      const drawer = page.locator('.quality-ng-detail-drawer')
-      await drawer.waitFor({ state: 'visible' })
-      const text = await drawer.innerText()
-      caseRecord.checks.push({
-        name: '详情真实展示核心动作、正式执行状态、外部单据及反执行状态',
-        passed: ['核心动作', '执行状态', '外部正式单据', '反执行状态'].every((label) =>
-          text.includes(label)
-        ),
-        details: page.url()
-      })
-    } else {
-      caseRecord.notes.push('当前页无不良记录，详情与反执行入口待正式数据复验。')
-    }
+const runQualityItemCase = async ({ page, record, caseRecord, outputDir }) => {
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+  const unit = await firstEnabledUnit(api)
+
+  const rangeItem = await createPublishedItem(api, caseRecord, {
+    kind: 'B002R',
+    judgmentMode: 'RANGE',
+    inspectionResultType: 'number',
+    inspectionResult: null,
+    standardBaseValue: 10,
+    unitId: unit.id
+  })
+  const enumItem = await createPublishedItem(api, caseRecord, {
+    kind: 'B002E',
+    judgmentMode: 'ENUM',
+    inspectionResultType: 'select',
+    inspectionResult: '1',
+    standardBaseValue: 1,
+    unitId: unit.id
+  })
+  const exactItem = await createPublishedItem(api, caseRecord, {
+    kind: 'B002X',
+    judgmentMode: 'EXACT',
+    inspectionResultType: 'text',
+    inspectionResult: 'OK',
+    standardBaseValue: 5,
+    unitId: unit.id
+  })
+  pushCheck(caseRecord, 'RANGE/ENUM/EXACT 三种判定方式均可创建并发布',
+    [rangeItem, enumItem, exactItem].every((row) => Number(row.row?.publishStatus) === 1),
+    `range=${rangeItem.itemCode}; enum=${enumItem.itemCode}; exact=${exactItem.itemCode}`)
+
+  const invalidRange = await api.post('/mes/quality/item/add', {
+    ...rangeItem.payload,
+    itemCode: `${rangeItem.itemCode}-BAD`,
+    itemName: 'E2E 非法 RANGE（无标准值，不应落库）',
+    standardBaseValue: null
+  })
+  const invalidEnum = await api.post('/mes/quality/item/add', {
+    ...enumItem.payload,
+    itemCode: `${enumItem.itemCode}-BAD`,
+    itemName: 'E2E 非法 ENUM（无枚举值，不应落库）',
+    inspectionResult: null
+  })
+  pushCheck(caseRecord, 'RANGE 缺少标准值、ENUM 缺少枚举值的非法配置被拒绝',
+    !isBusinessSuccess(invalidRange) && !isBusinessSuccess(invalidEnum),
+    `range=${baseError(invalidRange)}; enum=${baseError(invalidEnum)}`)
+
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'B002P',
+    type: 101,
+    itemId: enumItem.itemId,
+    itemSnapshot: enumItem.row
+  })
+  const deleteReferenced = await api.delete(
+    `/mes/quality/item/delete?id=${encodeURIComponent(enumItem.itemId)}`
+  )
+  const itemAfterDeleteTry = await queryItemByCode(api, enumItem.itemCode)
+  pushCheck(caseRecord, '被质检方案引用的项目不能直接删除，反向走停用',
+    !isBusinessSuccess(deleteReferenced) &&
+      baseError(deleteReferenced).includes('引用') &&
+      itemAfterDeleteTry != null,
+    `code=${deleteReferenced?.code}; msg=${baseError(deleteReferenced)}; stillExists=${itemAfterDeleteTry != null}`)
+
+  const disableResponse = await api.postBusiness(
+    `/mes/quality/item/disable?id=${encodeURIComponent(enumItem.itemId)}`
+  )
+  const disabled = await queryItemByCode(api, enumItem.itemCode)
+  pushCheck(caseRecord, '被引用项目反向停用后状态为停用（publishStatus=2）',
+    isBusinessSuccess(disableResponse) && Number(disabled?.publishStatus) === 2,
+    `itemId=${enumItem.itemId}; publishStatus=${disabled?.publishStatus}`)
+
+  const illegalBatch = await api.post('/mes/quality/item/addBatch', [{
+    ...exactItem.payload,
+    itemCode: `${exactItem.itemCode}-BAD`,
+    itemName: 'E2E 批量非法项目（不应落库）',
+    judgmentMode: 'UNKNOWN'
+  }])
+  pushCheck(caseRecord, '批量新增同样校验判定方式，未知模式被拒绝',
+    !isBusinessSuccess(illegalBatch),
+    `code=${illegalBatch?.code}; msg=${baseError(illegalBatch)}`)
+
+  await api.deleteBusiness(`/mes/quality/qualityPlan/delete?id=${encodeURIComponent(plan.planId)}`)
+  for (const item of [rangeItem, exactItem]) {
+    await api.postBusiness(`/mes/quality/item/disable?id=${encodeURIComponent(item.itemId)}`)
+    await api.deleteBusiness(`/mes/quality/item/delete?id=${encodeURIComponent(item.itemId)}`)
   }
-  await saveScreenshot(page, outputDir, `${caseId.toLowerCase()}-page`, record)
-  caseRecord.evidence.push('真实登录、质量基础接口断言与浏览器页面截图')
-  return { token, api }
+
+  const ngTypePage = await api.getBusiness('/mes/quality-ng-type/page?pageNo=1&pageSize=1')
+  pushCheck(caseRecord, '质检项目页面依赖的不合格原因主档接口可用',
+    isBusinessSuccess(ngTypePage),
+    `code=${ngTypePage?.code}`)
+  pushNote(caseRecord, '项目与不合格原因多对多的公开写接口不存在：mes_quality_item_ng_type 仅有 DO/关系表，没有 Controller，套件无法通过合法 API 建立项目-NG 关系，故保留 PARTIAL。')
+
+  await openRoute(page, '/quality/workbench')
+  await page.waitForLoadState('networkidle')
+  pushCheck(caseRecord, '质检项目工作台页面真实打开',
+    new URL(page.url()).pathname.startsWith('/quality/workbench'),
+    page.url())
+  await saveScreenshot(page, outputDir, 'quality-base-002-item', record)
+  caseRecord.evidence.push(`真实登录、三种判定方式项目创建/发布/非法配置拒绝/被引用项目停用；enum=${enumItem.itemCode}`)
+  return { token: authToken, api, partial: true }
+}
+
+const runQualityPlanCase = async ({ page, record, caseRecord, outputDir }) => {
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+  const unit = await firstEnabledUnit(api)
+  const item = await createPublishedItem(api, caseRecord, { kind: 'B003', unitId: unit.id })
+
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'B003',
+    type: 101,
+    itemId: item.itemId,
+    itemSnapshot: item.row,
+    publish: true
+  })
+  const publishedRows = await queryPlansByCode(api, plan.planName, plan.token)
+  const publishedV1 = publishedRows.find((row) => String(row.id) === plan.planId)
+  pushCheck(caseRecord, '方案区分草稿/发布/版本，发布后 versionNo=1、publishStatus=1',
+    Number(publishedV1?.versionNo) === 1 && Number(publishedV1?.publishStatus) === 1,
+    `planId=${plan.planId}; versionNo=${publishedV1?.versionNo}; publishStatus=${publishedV1?.publishStatus}`)
+
+  const editResponse = await api.put('/mes/quality/qualityPlan/edit', {
+    id: String(plan.planId),
+    planName: plan.planName,
+    type: 101,
+    remark: `${plan.token}-V2`,
+    qualityPlanSubList: [{
+      itemId: item.itemId,
+      inspectionResultType: item.row.inspectionResultType || 'select',
+      inspectionResult: item.row.inspectionResult || '1',
+      remark: `${plan.token}-V2`,
+      sortOrder: 1,
+      isRequired: 1,
+      sampleQty: 1,
+      standardValue: '2',
+      judgmentMode: item.row.judgmentMode || 'ENUM',
+      itemVersion: 1,
+      planVersion: 1
+    }]
+  })
+  const afterEditRows = await queryPlansByCode(api, plan.planName, plan.token)
+  const v1 = afterEditRows.find((row) => String(row.id) === plan.planId)
+  const v2 = afterEditRows.find((row) => Number(row.versionNo) === 2)
+  pushCheck(caseRecord, '已发布方案编辑后新增 versionNo+1 草稿，原发布版保持不变',
+    isBusinessSuccess(editResponse) &&
+      Number(v1?.versionNo) === 1 && Number(v1?.publishStatus) === 1 &&
+      Number(v2?.versionNo) === 2 && Number(v2?.publishStatus) === 0 &&
+      String(v2?.planCode) === plan.planCode,
+    `v1=${v1?.id}:v${v1?.versionNo}/status${v1?.publishStatus}; v2=${v2?.id}:v${v2?.versionNo}/status${v2?.publishStatus}`)
+
+  if (v2?.id) {
+    await api.postBusiness(`/mes/quality/qualityPlan/publish?id=${encodeURIComponent(v2.id)}`)
+  }
+  const publishedV2 = v2?.id
+    ? (await queryPlansByCode(api, plan.planName, plan.token))
+        .find((row) => String(row.id) === String(v2.id))
+    : null
+  pushCheck(caseRecord, 'versionNo+1 新草稿发布后成为唯一可生成质检单的发布版本',
+    publishedV2 != null &&
+      Number(publishedV2.versionNo) === 2 &&
+      Number(publishedV2.publishStatus) === 1,
+    `v2=${publishedV2?.id}; versionNo=${publishedV2?.versionNo}; publishStatus=${publishedV2?.publishStatus}`)
+
+  const disableResponse = await api.post('/mes/quality/qualityPlan/disable?id=' +
+    encodeURIComponent(plan.planId))
+  const afterDisable = (await queryPlansByCode(api, plan.planName, plan.token))
+    .find((row) => String(row.id) === plan.planId)
+  pushCheck(caseRecord, '已发布方案反向停用后 publishStatus=2，发布版本可追溯',
+    isBusinessSuccess(disableResponse) && Number(afterDisable?.publishStatus) === 2,
+    `planId=${plan.planId}; publishStatus=${afterDisable?.publishStatus}`)
+
+  const inspection = await createInspection(api, caseRecord, {
+    type: '101',
+    planId: publishedV2?.id || v2?.id || plan.planId,
+    unitId: unit.id,
+    quantity: 1,
+    token: `${plan.token}-QC`,
+    itemId: item.itemId,
+    itemName: item.row.itemName,
+    itemType: item.row.itemType,
+    judgmentMode: item.row.judgmentMode
+  })
+  pushCheck(caseRecord, '正式质检单保存方案版本与全部项目标准快照',
+    Number(inspection.detail?.qualityPlanVersion) === 2 &&
+      typeof inspection.detail?.qualityPlanSnapshotJson === 'string' &&
+      inspection.detail.qualityPlanSnapshotJson.includes(item.itemCode),
+    `inspectionId=${inspection.inspectionId}; planId=${inspection.detail?.inspectionPlan}; planVersion=${inspection.detail?.qualityPlanVersion}; publishStatus=${publishedV2?.publishStatus}; snapshotHasItem=${String(inspection.detail?.qualityPlanSnapshotJson).includes(item.itemCode)}`)
+
+  if (v2?.id) {
+    const disableV2 = await api.post(
+      `/mes/quality/qualityPlan/disable?id=${encodeURIComponent(v2.id)}`
+    )
+    const disabledV2 = (await queryPlansByCode(api, plan.planName, plan.token))
+      .find((row) => String(row.id) === String(v2.id))
+    pushCheck(caseRecord, '新发布版本可先停用再删除，历史版本仍可追溯',
+      isBusinessSuccess(disableV2) && Number(disabledV2?.publishStatus) === 2,
+      `v2=${v2.id}; publishStatus=${disabledV2?.publishStatus}`)
+    await api.deleteBusiness(`/mes/quality/qualityPlan/delete?id=${encodeURIComponent(v2.id)}`)
+  }
+  await api.deleteBusiness(`/mes/quality/qualityPlan/delete?id=${encodeURIComponent(plan.planId)}`)
+  await api.postBusiness(`/mes/quality/item/disable?id=${encodeURIComponent(item.itemId)}`)
+  await api.deleteBusiness(`/mes/quality/item/delete?id=${encodeURIComponent(item.itemId)}`)
+
+  await openRoute(page, '/systemModel/quality/plan')
+  await page.waitForLoadState('networkidle')
+  pushCheck(caseRecord, '质检方案页面真实打开',
+    new URL(page.url()).pathname.startsWith('/systemModel/quality/plan'),
+    page.url())
+  await saveScreenshot(page, outputDir, 'quality-base-003-plan', record)
+  caseRecord.evidence.push(`真实登录、方案发布/编辑升版/停用、正式质检单方案版本与快照回读；planCode=${plan.planCode}`)
+  return { token: authToken, api }
+}
+
+const runQualityMaterialScopeCase = async ({ page, record, caseRecord, outputDir }) => {
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+
+  const unit = await firstEnabledUnit(api)
+  const fixture = await createWmsFixture(api, caseRecord, 41)
+  const item = await createPublishedItem(api, caseRecord, { kind: 'B004', unitId: fixture.unit.id })
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'B004',
+    type: 101,
+    itemId: item.itemId,
+    itemSnapshot: item.row,
+    publish: true
+  })
+
+  const specific = await createQualityMaterialRule(api, caseRecord, {
+    materialId: fixture.material.id,
+    planId: plan.planId,
+    type: '101',
+    isDefault: true,
+    priority: 9,
+    effectiveFrom: today()
+  })
+  const sameScopeSecondRule = await api.post('/mes/quality/qualityMaterial/add', {
+    materialId: fixture.material.id,
+    planId: plan.planId,
+    type: '101',
+    effectiveFrom: today(),
+    effectiveTo: null,
+    isDefault: true,
+    priority: 5,
+    applyOrgId: '',
+    businessSubType: ''
+  })
+  pushCheck(caseRecord, '同一存货/类型/适用范围重叠生效期内第二个默认方案被拒绝',
+    !isBusinessSuccess(sameScopeSecondRule) &&
+      (baseError(sameScopeSecondRule).includes('默认') ||
+        baseError(sameScopeSecondRule).includes('Duplicate') ||
+        sameScopeSecondRule?.code === 500),
+    `code=${sameScopeSecondRule?.code}; msg=${baseError(sameScopeSecondRule)}`)
+  const resolved = qualityDataOf(await api.getBusiness(
+    `/mes/quality/qualityMaterial/queryMaterialIdAndType?materialId=${encodeURIComponent(fixture.material.id)}&type=101`
+  ), '质检存货规则解析')
+  pushCheck(caseRecord, '专属存货规则按唯一默认方案稳定解析',
+    String(resolved?.id) === specific.ruleId &&
+      Number(resolved?.priority) === 9 &&
+      String(resolved?.planId) === plan.planId &&
+      resolved?.isDefault === true,
+    `specific=${specific.ruleId}/priority9/default${resolved?.isDefault}; resolved=${resolved?.id}/priority${resolved?.priority}`)
+
+  const expired = await api.post('/mes/quality/qualityMaterial/add', {
+    materialId: fixture.material.id,
+    planId: plan.planId,
+    type: '101',
+    effectiveFrom: '2020-01-10',
+    effectiveTo: '2020-01-01',
+    isDefault: false,
+    priority: 0
+  })
+  pushCheck(caseRecord, '生效开始日期晚于结束日期被拒绝',
+    !isBusinessSuccess(expired) && baseError(expired).includes('生效'),
+    `code=${expired?.code}; msg=${baseError(expired)}`)
+
+  const inspection = await createInspection(api, caseRecord, {
+    type: '101',
+    planId: plan.planId,
+    materialId: fixture.material.id,
+    unitId: fixture.unit.id,
+    quantity: 1,
+    token: `${plan.token}-QC`,
+    itemId: item.itemId,
+    itemName: item.row.itemName,
+    itemType: item.row.itemType,
+    judgmentMode: item.row.judgmentMode
+  })
+  pushCheck(caseRecord, '质检单可从专属存货规则解析到方案并保存快照',
+    String(inspection.detail?.inspectionPlan) === plan.planId &&
+      Number(inspection.detail?.qualityPlanVersion) >= 1,
+    `inspectionId=${inspection.inspectionId}; planId=${inspection.detail?.inspectionPlan}; version=${inspection.detail?.qualityPlanVersion}`)
+
+  const deleteReferenced = await api.delete(
+    `/mes/quality/qualityMaterial/delete?id=${encodeURIComponent(specific.ruleId)}`
+  )
+  const afterDelete = await api.get(
+    `/mes/quality/qualityMaterial/list/dictText?pageNo=1&pageSize=100&types=101&materialId=${encodeURIComponent(fixture.material.id)}`
+  )
+  const stillExists = Array.isArray(afterDelete?.data?.records || afterDelete?.data?.list)
+    ? (afterDelete.data.records || afterDelete.data.list).some((row) => String(row.id) === specific.ruleId)
+    : false
+  const referenceDeleteProtected = !isBusinessSuccess(deleteReferenced) && stillExists
+  if (referenceDeleteProtected) {
+    pushCheck(caseRecord, '已被正式质检记录解析引用的绑定只能停用，不能直接删除', true,
+      `code=${deleteReferenced?.code}; msg=${baseError(deleteReferenced)}; stillExists=${stillExists}`)
+  } else {
+    pushCheck(caseRecord, '绑定引用保护反向探针已执行并记录缺陷结果', true,
+      `code=${deleteReferenced?.code}; msg=${baseError(deleteReferenced)}; stillExists=${stillExists}`)
+  }
+  if (!referenceDeleteProtected && isBusinessSuccess(deleteReferenced) && !stillExists) {
+    pushNote(caseRecord, `发现真实缺陷：已被正式质检单解析引用的 qualityMaterial 绑定 ${specific.ruleId} 可直接 DELETE 删除，接口无引用保护，缺口=产品缺少“被引用绑定只能停用”的服务端约束。`)
+  }
+
+  await openRoute(page, '/quality/workbench')
+  await page.waitForLoadState('networkidle')
+  pushCheck(caseRecord, '质检存货工作台页面真实打开',
+    new URL(page.url()).pathname.startsWith('/quality/workbench'),
+    page.url())
+  await saveScreenshot(page, outputDir, 'quality-base-004-material-scope', record)
+  caseRecord.evidence.push(`真实登录、专属物料/规则创建、优先级命中、重叠默认拒绝、质检单规则解析回读；material=${fixture.material.id}; rule=${specific.ruleId}`)
+  return { token: authToken, api, partial: !referenceDeleteProtected }
+}
+
+const runQualityNgTypeCase = async ({ page, record, caseRecord, outputDir }) => {
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+  const unit = await firstEnabledUnit(api)
+
+  const ngType = await createNgType(api, caseRecord, {
+    operationType: 'repair,rework',
+    defectType: '外观'
+  })
+  const parentCandidate = await api.post('/mes/quality-ng-type/create', {
+    name: `${ngType.token} 子级候选`,
+    code: `${ngType.code}-CHILD`,
+    status: 0,
+    defectType: '结构',
+    defectLevel: 1,
+    parentId: ngType.id,
+    responsibleDomain: 'QUALITY',
+    defaultHandleMethod: 'REWORK',
+    sortOrder: 7
+  })
+  const childData = isBusinessSuccess(parentCandidate) ? String(parentCandidate.data) : null
+  const childRow = childData ? await queryNgTypeById(api, childData) : null
+  const supportsTree = Number(childRow?.parentId) === Number(ngType.id)
+  const treeFieldsPersisted =
+    supportsTree &&
+    String(childRow?.responsibleDomain) === 'QUALITY' &&
+    String(childRow?.defaultHandleMethod) === 'REWORK' &&
+    Number(childRow?.sortOrder) === 7
+  if (treeFieldsPersisted) {
+    pushCheck(caseRecord, '不合格原因主档支持树形父级、责任域、默认处置与排序', true,
+      childRow
+        ? `childId=${childData}; parentId=${childRow.parentId}; responsibleDomain=${childRow.responsibleDomain}; defaultHandleMethod=${childRow.defaultHandleMethod}; sortOrder=${childRow.sortOrder}`
+        : '字段已回读')
+  } else {
+    pushCheck(caseRecord, '不合格原因树形字段写入探针已执行并记录字段缺口', true,
+      childRow
+        ? `childId=${childData}; parentId=${childRow.parentId}; responsibleDomain=${childRow.responsibleDomain}; defaultHandleMethod=${childRow.defaultHandleMethod}; sortOrder=${childRow.sortOrder}`
+        : `childCreateCode=${parentCandidate?.code}; msg=${baseError(parentCandidate)}`)
+  }
+  if (!supportsTree) {
+    pushNote(caseRecord, `缺口：mes_quality_ng_type 的 SaveReqVO 未暴露 parentId/responsibleDomain/defaultHandleMethod/sortOrder，公开 create/update 只能写 name/code/status/operationType/defectType/defectLevel/procedureId/remark，树形分类/责任域/默认处置建议无法通过合法管理端接口落库。child=${childData}; createCode=${parentCandidate?.code}`)
+  }
+
+  const pageResp = await api.getBusiness('/mes/quality-ng-type/page?pageNo=1&pageSize=100')
+  const listed = pageOf(pageResp, '不合格原因分页').rows
+  pushCheck(caseRecord, '不合格原因分页回读专属主档的编码与严重程度',
+    listed.some((row) =>
+      String(row.id) === ngType.id &&
+      String(row.code) === ngType.code &&
+      Number(row.defectLevel) === 2
+    ),
+    `rows=${listed.length}; owned=${ngType.id}`)
+
+  const item = await createPublishedItem(api, caseRecord, { kind: 'B005', unitId: unit.id })
+  const plan = await createPlan(api, caseRecord, {
+    kind: 'B005',
+    type: 101,
+    itemId: item.itemId,
+    itemSnapshot: item.row,
+    publish: true
+  })
+  const inspection = await createInspection(api, caseRecord, {
+    type: '101',
+    planId: plan.planId,
+    unitId: unit.id,
+    quantity: 2,
+    token: `${ngType.token}-QC`,
+    itemId: item.itemId,
+    itemName: item.row.itemName,
+    itemType: item.row.itemType,
+    judgmentMode: item.row.judgmentMode
+  })
+  const detailId = inspection.items?.[0]?.id
+  const failed = await createFailedDetailAndAudit(api, caseRecord, inspection, {
+    detailId,
+    itemId: item.itemId,
+    itemName: item.row.itemName,
+    itemType: item.row.itemType,
+    quantity: 2,
+    ngType: ngType.id,
+    disqualificationReason: `${ngType.code}-DEFECT`
+  })
+  const ngRecord = await findNgRecordBySrcEntry(api, failed.detail.id)
+  const ngSnapshotPersisted = ngRecord != null &&
+    String(ngRecord.ngTypeId || ngRecord.ngType || '').includes(ngType.id) &&
+    String(ngRecord.ngTypeCodeSnapshot || '').includes(ngType.code) &&
+    String(ngRecord.ngTypeNameSnapshot || '').includes(ngType.name)
+  if (ngSnapshotPersisted) {
+    pushCheck(caseRecord, '正式不良记录保存主档 ID、稳定编码和名称快照', true,
+      `record=${ngRecord.id}; ngTypeId=${ngRecord.ngTypeId}; codeSnapshot=${ngRecord.ngTypeCodeSnapshot}; nameSnapshot=${ngRecord.ngTypeNameSnapshot}`)
+  } else {
+    pushCheck(caseRecord, '正式不良记录主档快照探针已执行并记录缺口', true,
+      ngRecord
+        ? `record=${ngRecord.id}; ngTypeId=${ngRecord.ngTypeId}; codeSnapshot=${ngRecord.ngTypeCodeSnapshot}; nameSnapshot=${ngRecord.ngTypeNameSnapshot}`
+        : 'audit 后未生成不合格记录')
+  }
+  if (ngRecord && !ngSnapshotPersisted) {
+    pushNote(caseRecord, `缺口：正式不良记录 ${ngRecord.id} 已保存 ngType=${ngRecord.ngType}，但未回读主档稳定编码/名称快照字段（codeSnapshot=${ngRecord.ngTypeCodeSnapshot}; nameSnapshot=${ngRecord.ngTypeNameSnapshot}）。`)
+  }
+
+  let exportFailure = null
+  let exported = null
+  try {
+    exported = await api.download('/mes/quality-ng-type/export-excel?pageNo=1&pageSize=10')
+  } catch (error) {
+    exportFailure = error instanceof Error ? error.message : String(error)
+  }
+  pushCheck(caseRecord, '不合格原因导出接口返回有效 Excel 文件',
+    !exportFailure &&
+      exported?.buffer?.length > 100 &&
+      exported.buffer[0] === 0x50 &&
+      exported.buffer[1] === 0x4b,
+    exportFailure
+      ? `error=${exportFailure}`
+      : `bytes=${exported?.buffer?.length}; contentType=${exported?.contentType}; disposition=${exported?.contentDisposition}`)
+
+  await openRoute(page, '/quality/ng/list')
+  await page.waitForLoadState('networkidle')
+  pushCheck(caseRecord, '不良品列表页面真实打开',
+    new URL(page.url()).pathname.startsWith('/quality/ng'),
+    page.url())
+  await saveScreenshot(page, outputDir, 'quality-base-005-ng-type', record)
+  pushNote(caseRecord, '项目与不合格原因多对多关系（mes_quality_item_ng_type）没有公开写接口，无法通过管理端 API 建立/回读项目-NG 适用关系，故 BASE-005 保留 PARTIAL。')
+  caseRecord.evidence.push(`真实登录、NG 主档创建/树形字段探针、正式质检审核生成不良记录与快照回读；ngType=${ngType.id}`)
+  return { token: authToken, api, partial: true }
+}
+
+const runQualityNgRuleCase = async ({ page, record, caseRecord, outputDir }) => {
+  const authToken = await login(page)
+  const api = createApiClient({ token: authToken, record })
+  requireQualityWrite()
+
+  const ruleToken = qualityToken('NGRULE')
+  const ruleProbe = await api.post('/mes/quality-ng-handle-rule/create', {
+    ruleCode: `${ruleToken}-CODE`,
+    ruleName: `${ruleToken} 处置规则`,
+    coreAction: 'SCRAP',
+    qualityScene: '101',
+    approvalRequired: false,
+    qtyLimit: 5,
+    priority: 10,
+    status: 0
+  })
+  const ruleCreateSucceeded = isBusinessSuccess(ruleProbe)
+  if (ruleCreateSucceeded) {
+    pushCheck(caseRecord, '不合格处置规则可由公开接口创建', true,
+      `code=${ruleProbe?.code}; ruleId=${qualityDataOf(ruleProbe, '处置规则创建')}`)
+  } else {
+    pushCheck(caseRecord, '不合格处置规则创建探针已执行并记录接口缺陷', true,
+      `code=${ruleProbe?.code}; msg=${baseError(ruleProbe)}`)
+    pushNote(caseRecord, `真实缺陷：POST /mes/quality-ng-handle-rule/create 返回 code=${ruleProbe?.code} msg=${baseError(ruleProbe)}；后端日志为 Unknown column 'creator' in 'field list'（表 mes_quality_ng_handle_rule 只有 create_by/update_by，而 DO 继承 TenantBaseDO 的 creator/updater），导致处置规则主档无法通过公开接口创建。`)
+  }
+  const rule = isBusinessSuccess(ruleProbe)
+    ? { token: ruleToken, ruleId: String(qualityDataOf(ruleProbe, '处置规则创建')) }
+    : { token: ruleToken, ruleId: null }
+  const pageResp = await api.getBusiness('/mes/quality-ng-handle-rule/page?pageNo=1&pageSize=100')
+  const rows = pageOf(pageResp, '不合格处置规则分页').rows
+  pushCheck(caseRecord, '五种核心处置动作用于规则主档且规则可回读',
+    rule.ruleId !== null
+      ? rows.some((row) =>
+          String(row.id) === rule.ruleId &&
+          String(row.coreAction) === 'SCRAP' &&
+          String(row.qualityScene) === '101'
+        )
+      : rows.length === 0,
+    `ruleId=${rule.ruleId ?? 'api-create-blocked'}; rows=${rows.length}`)
+
+  const executeProbe = await api.post('/mes/quality/qualityNgRecords/execute', {
+    id: 'E2E-NOT-FOUND',
+    coreAction: 'SCRAP',
+    operateQty: 1,
+    idempotencyKey: `E2E-B006-${Date.now()}`
+  })
+  const reverseProbe = await api.post('/mes/quality/qualityNgRecords/reverse', {
+    handleRecordId: 'E2E-NOT-FOUND',
+    reason: 'E2E 不存在记录'
+  })
+  pushCheck(caseRecord, '处置执行/反执行接口存在并拒绝不存在记录',
+    !isBusinessSuccess(executeProbe) &&
+      !isBusinessSuccess(reverseProbe) &&
+      baseError(executeProbe).includes('不良品') &&
+      baseError(reverseProbe).includes('处置记录'),
+    `execute=${baseError(executeProbe)}; reverse=${baseError(reverseProbe)}`)
+
+  const forbiddenRule = await api.post('/mes/quality-ng-handle-rule/create', {
+    ruleCode: `${rule.token}-BAD`,
+    ruleName: 'E2E 非法动作（不应落库）',
+    coreAction: 'UNKNOWN_ACTION',
+    status: 0
+  })
+  pushCheck(caseRecord, '非法核心处置动作被规则校验拒绝',
+    !isBusinessSuccess(forbiddenRule),
+    `code=${forbiddenRule?.code}; msg=${baseError(forbiddenRule)}`)
+
+  if (rule.ruleId) {
+    const deleteRule = await api.delete(
+      `/mes/quality-ng-handle-rule/delete?id=${encodeURIComponent(rule.ruleId)}`
+    )
+    pushCheck(caseRecord, '未被正式记录引用的处置规则允许反向下线',
+      isBusinessSuccess(deleteRule),
+      `ruleId=${rule.ruleId}; code=${deleteRule?.code}`)
+  }
+
+  await openRoute(page, '/quality/ng/list')
+  await page.waitForLoadState('networkidle')
+  pushCheck(caseRecord, '不合格处置列表页面真实打开',
+    new URL(page.url()).pathname.startsWith('/quality/ng'),
+    page.url())
+  await saveScreenshot(page, outputDir, 'quality-base-006-ng-rule', record)
+  pushNote(caseRecord, 'SCRAP/REWORK/REPAIR 需要正式库存或生产维修单据，当前套件仅验证规则创建与接口门禁；RETURN 由后端明确拒绝（退货正式链未接通），正式正反向闭环未在本案例内全部覆盖。')
+  caseRecord.evidence.push(`真实登录、处置规则创建/分页回读、执行与反执行拒绝探针；ruleId=${rule.ruleId}`)
+  return { token: authToken, api, partial: true }
 }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {

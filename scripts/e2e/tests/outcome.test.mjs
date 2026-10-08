@@ -53,7 +53,8 @@ test('read-only procurement probes cannot be declared complete workflows', () =>
     new URL('../cases/catalog.json', import.meta.url), 'utf8'
   ))
   const procurement = catalog.suites.find((suite) => suite.id === 'procurement')
-  for (const id of ['PROC-014', 'PROC-015', 'PROC-016', 'PROC-017']) {
+  // PROC-015 已完成写侧闭环并升级为 READY，不再是只读探针案例。
+  for (const id of ['PROC-014', 'PROC-016', 'PROC-017']) {
     const definition = procurement.cases.find((item) => item.id === id)
     assert.equal(definition.status, 'PARTIAL', id)
     assert.equal(caseOutcome({

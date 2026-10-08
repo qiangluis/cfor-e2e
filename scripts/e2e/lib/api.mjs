@@ -22,6 +22,13 @@ function payloadFromText (text, response) {
   }
 }
 
+export const serverApiFailures = (entries = []) => entries.filter((entry) =>
+  entry.networkError ||
+  entry.responseError ||
+  Number(entry.status) >= 500 ||
+  (Number(entry.code) >= 500 && Number(entry.code) < 600)
+)
+
 export const createApiClient = ({ token = '', tenantId = config.tenantId, check, record } = {}) => {
   const headers = () => ({
     'content-type': 'application/json',
@@ -47,20 +54,29 @@ export const createApiClient = ({ token = '', tenantId = config.tenantId, check,
       }
     }
 
-    const response = await fetch(endpoint(pathname), {
-      method,
-      headers: requestHeaders,
-      body: requestBody,
-      signal: AbortSignal.timeout(options.timeoutMs || config.requestTimeoutMs)
-    })
-    const text = await response.text()
-    const payload = payloadFromText(text, response)
+    let response, payload
+    try {
+      response = await fetch(endpoint(pathname), {
+        method,
+        headers: requestHeaders,
+        body: requestBody,
+        signal: AbortSignal.timeout(options.timeoutMs || config.requestTimeoutMs)
+      })
+      payload = payloadFromText(await response.text(), response)
+    } catch (error) {
+      record?.api?.push({
+        method, pathname, status: response?.status ?? null,
+        ...(response ? { responseError: true } : { networkError: true }),
+        bodySummary: String(redact(error.message || error)).slice(0, 500)
+      })
+      throw error
+    }
     const entry = {
       method,
       pathname,
       status: response.status,
       code: payload?.code,
-      bodySummary: JSON.stringify(redact(payload)).slice(0, 1000)
+      bodySummary: (JSON.stringify(redact(payload)) ?? '<empty>').slice(0, 1000)
     }
     record?.api?.push(entry)
     check?.step('api', `${method} ${pathname} -> ${response.status}`, response.ok, entry.bodySummary)
@@ -92,14 +108,25 @@ export const createApiClient = ({ token = '', tenantId = config.tenantId, check,
       return assertBusinessSuccess(await this.upload(pathname, formData, options), pathname)
     },
     async download (pathname, options = {}) {
-      const response = await fetch(endpoint(pathname), {
-        method: 'GET',
-        headers: {
-          ...headers(),
-          ...(options.headers || {})
-        },
-        signal: AbortSignal.timeout(options.timeoutMs || config.requestTimeoutMs)
-      })
+      let response, buffer
+      try {
+        response = await fetch(endpoint(pathname), {
+          method: 'GET',
+          headers: {
+            ...headers(),
+            ...(options.headers || {})
+          },
+          signal: AbortSignal.timeout(options.timeoutMs || config.requestTimeoutMs)
+        })
+        buffer = Buffer.from(await response.arrayBuffer())
+      } catch (error) {
+        record?.api?.push({
+          method: 'GET', pathname, status: response?.status ?? null,
+          ...(response ? { responseError: true } : { networkError: true }),
+          bodySummary: String(redact(error.message || error)).slice(0, 500)
+        })
+        throw error
+      }
       record?.api?.push({
         method: 'GET',
         pathname,
@@ -109,7 +136,7 @@ export const createApiClient = ({ token = '', tenantId = config.tenantId, check,
       })
       if (!response.ok) throw new Error(`HTTP ${response.status} GET ${pathname}`)
       return {
-        buffer: Buffer.from(await response.arrayBuffer()),
+        buffer,
         contentType: response.headers.get('content-type'),
         contentDisposition: response.headers.get('content-disposition')
       }

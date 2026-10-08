@@ -5,6 +5,7 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { config } from './config/index.mjs'
 import { launchBrowser, saveScreenshot } from './lib/browser.mjs'
+import { serverApiFailures } from './lib/api.mjs'
 import { checklist } from './lib/assert.mjs'
 import {
   checkpointScope,
@@ -157,11 +158,21 @@ function clearCheckpoint () {
 function filterAllowedRuntimeErrors (runtimeErrors, allowRuntimeErrors = {}) {
   return Object.fromEntries(
     Object.entries(runtimeErrors).map(([type, errors]) => {
-      const allow = allowRuntimeErrors[type]
+      const allow = type === 'nodeApi' ? undefined : allowRuntimeErrors[type]
       if (typeof allow !== 'function') return [type, errors]
       return [type, errors.filter((error) => !allow(error))]
     })
   )
+}
+
+export function caseRuntimeErrors (record, before) {
+  return {
+    console: record.consoleErrors.slice(before.console),
+    page: record.pageErrors.slice(before.page),
+    api: record.failedApiResponses.slice(before.api),
+    request: record.requestFailures.slice(before.request),
+    nodeApi: serverApiFailures(record.api.slice(before.apiRequests))
+  }
 }
 
 async function loadSuite (suiteId) {
@@ -305,6 +316,7 @@ async function main () {
         if (!selectedCases.has(definition.id)) continue
         const caseDefinition = { ...definition, suite: suite.id }
         let caseRecord = createCaseRecord(caseDefinition)
+        for (const gap of definition.acceptanceGaps || []) caseRecord.notes.push(`GAP: ${gap}`)
         const caseRecordIndex = record.cases.length
         record.cases.push(caseRecord)
         const declaredStatus = definition.status || 'READY'
@@ -348,7 +360,8 @@ async function main () {
         const startedAt = Date.now()
         const errorsBefore = {
           console: record.consoleErrors.length, page: record.pageErrors.length,
-          api: record.failedApiResponses.length, request: record.requestFailures.length
+          api: record.failedApiResponses.length, request: record.requestFailures.length,
+          apiRequests: record.api.length
         }
         console.log(`[RUN ] ${definition.id} ${definition.title}`)
         try {
@@ -392,24 +405,20 @@ async function main () {
             5000
           )
           const hasAssertions = caseRecord.checks.length + check.steps.length > 0
-          const runtimeErrors = {
-            console: record.consoleErrors.slice(errorsBefore.console),
-            page: record.pageErrors.slice(errorsBefore.page),
-            api: record.failedApiResponses.slice(errorsBefore.api),
-            request: record.requestFailures.slice(errorsBefore.request)
-          }
+          const runtimeErrors = caseRuntimeErrors(record, errorsBefore)
           caseRecord.runtimeErrors = filterAllowedRuntimeErrors(
             runtimeErrors,
             result?.allowRuntimeErrors
           )
           caseRecord.checks.push({
-            name: '本用例无控制台错误、页面异常、浏览器业务 API 错误或请求失败',
+            name: '本用例无控制台错误、页面异常、浏览器业务 API 错误、Node API 服务异常或请求失败',
             passed: Object.values(caseRecord.runtimeErrors).every((items) => items.length === 0),
             details: JSON.stringify(caseRecord.runtimeErrors).slice(0, 1000)
           })
           caseRecord.checks.push(...check.steps)
           const failedChecks = caseRecord.checks.filter((item) => item.passed === false)
-          const partial = declaredStatus === 'PARTIAL' || result?.notImplemented || result?.designed || result?.partial
+          const partial = declaredStatus === 'PARTIAL' || Boolean(definition.acceptanceGaps?.length) ||
+            result?.notImplemented || result?.designed || result?.partial
           const outcome = caseOutcome({ failedChecks, partial, hasAssertions, result })
           finishCase(caseRecord, outcome.status, outcome.note)
           if (outcome.status === 'PASS') saveCheckpoint(definition.id)
@@ -423,12 +432,7 @@ async function main () {
               5000
             )
           }
-          caseRecord.runtimeErrors = {
-            console: record.consoleErrors.slice(errorsBefore.console),
-            page: record.pageErrors.slice(errorsBefore.page),
-            api: record.failedApiResponses.slice(errorsBefore.api),
-            request: record.requestFailures.slice(errorsBefore.request)
-          }
+          caseRecord.runtimeErrors = caseRuntimeErrors(record, errorsBefore)
           caseRecord.checks.push({
             name: '失败现场的控制台、页面、业务 API 与请求错误',
             passed: Object.values(caseRecord.runtimeErrors).every((items) => items.length === 0),

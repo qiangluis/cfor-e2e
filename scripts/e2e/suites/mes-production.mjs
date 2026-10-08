@@ -45,8 +45,12 @@ export const productionPageRows = (result, label) => {
   return rows
 }
 
-export const isMissingProductionWork = (result) =>
-  result?.code === 500 && (result?.msg ?? result?.message) === '工单不存在'
+export const isMissingProductionWork = (result) => {
+  if (result?.code !== 500) return false
+  const message = String(result?.msg ?? result?.message ?? '')
+  // Deployment errors cannot stand in for an explicit business rejection.
+  return message === '工单不存在'
+}
 
 const loadOrderRows = async (api) => {
   const pageResult = await api.getBusiness('/mes/prodOrder/list/dictText?pageNo=1&pageSize=100')

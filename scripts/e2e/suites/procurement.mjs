@@ -1,9 +1,14 @@
+import { randomBytes } from 'node:crypto'
 import { createApiClient } from '../lib/api.mjs'
 import { launchBrowser, login, loginWithCredentials, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { config } from '../config/index.mjs'
 import { decryptResponse, ENCRYPT_HEADER } from '../lib/crypto.mjs'
 import { createPurchaseRequest, snapshotPurchaseRequest } from '../fixtures/purchase-request.mjs'
 import { createProcurementSettlementFixture } from '../fixtures/procurement-settlement.mjs'
+import { createPurchasePriceSnapshotFixture } from '../fixtures/procurement-price-snapshot.mjs'
+import { createPurchaseOrderChangeFixture } from '../fixtures/procurement-order-change.mjs'
+import { createSettleRuleWriteFixture } from '../fixtures/procurement-settle-rule-write.mjs'
+import { createProcurementPermissionReader } from '../fixtures/procurement-permission-reader.mjs'
 import { runSupplierAuth } from '../fixtures/supplier-auth.mjs'
 import { databaseConfigured, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 import { createPurchaseReader } from '../fixtures/purchase-reader.mjs'
@@ -27,6 +32,8 @@ export const procurementReadOnlyViews = Object.freeze({
     headers: ['单据类型', '适用组织', '统计口径', '审批流程', '版本']
   }
 })
+// PROC-006 已完成写侧闭环，不再是必须保持 PARTIAL 的只读门禁案例；仅 PROC-008 仍受只读门禁约束。
+export const procurementPartialReadOnlyCases = Object.freeze(['PROC-008'])
 
 const readonlyFact = (record, name, passed, details = '') => {
   record.checks.push({ name, passed: Boolean(passed), details })
@@ -37,6 +44,7 @@ const missingReadonlyFact = (record, detail) =>
 const ruleText = (value) => typeof value === 'string' && value.trim().length > 0
 
 const readonlyData = (payload, label) => assertBusinessSuccess(payload, label).data
+const dataOf = readonlyData
 const readonlyArray = (payload, label) => {
   const rows = readonlyData(payload, label)
   if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
@@ -539,12 +547,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.notes.push(
       'PROC-005 专属写侧已验证：供应商/客户角色、x_settle_method 字典项、采购订单版本1、销售订单版本2、规则更新及历史快照不回溯、专属字典停用拒绝新销售单；专属实体全部 retained'
     )
-    return {
-      token,
-      api,
-      partial: true,
-      note: 'PROC-005 专属采购/销售结算快照及专属字典停用拒绝新单已完成；其他销售规则场景仍未验证'
-    }
+    return { token, api }
   }
   if (procurementFoundationReadonlyCases.includes(caseId)) {
     const token = await (dependencies.login || login)(page)
@@ -579,6 +582,141 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const screenshot = await (dependencies.saveScreenshot || saveScreenshot)(
       page, outputDir, `${caseId}-readonly-settings`, record)
     caseRecord.evidence.push(screenshot)
+    if (caseId === 'PROC-006') {
+      const env = dependencies.env || process.env
+      if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') return { token, api, ...result }
+      if (config.target !== 'local') {
+        throw new Error('BLOCKED: PROC-006 写侧验收仅允许本地 local target')
+      }
+      if (!databaseConfigured()) {
+        throw new Error('BLOCKED: PROC-006 写侧验收需要配置本地数据库只读证据，尚未创建规则')
+      }
+      await assertLocalWriteSafety(caseRecord)
+      const write = await createSettleRuleWriteFixture(api, caseRecord)
+      caseRecord.checks.push({
+        name: '专属结算方式字典与规则版本1真实创建并回读',
+        passed:
+          Boolean(write.dictionaryId) &&
+          write.createdRule?.settleMethodCode === write.code &&
+          Number(write.createdRule?.version) === 1 &&
+          Number(write.createdRule?.status) === 1 &&
+          write.createdRule?.settleMethodName === `E2E结算规则-${write.tag}`,
+        details: `ruleId=${write.ruleId}, code=${write.code}, version=${write.createdRule?.version}`
+      })
+      caseRecord.checks.push({
+        name: '规则更新版本自增且版本列表按同一规则回读新版本',
+        passed:
+          Number(write.ruleV2?.version) === 2 &&
+          Array.isArray(write.versions) &&
+          write.versions.length >= 1 &&
+          write.versions.every((item) => String(item.id) === write.ruleId) &&
+          write.versions.some((item) => Number(item.version) === 2),
+        details: `ruleId=${write.ruleId}, versions=${write.versions?.map((item) => item.version).join(',')}`
+      })
+      caseRecord.checks.push({
+        name: '采购订单按业务日期命中并快照当前规则版本，历史订单不回溯',
+        passed:
+          write.orderV1?.detail?.settleMethodCode === write.code &&
+          Number(write.orderV1?.detail?.settleMethodRuleVersion) === 1 &&
+          write.orderV2?.detail?.settleMethodCode === write.code &&
+          Number(write.orderV2?.detail?.settleMethodRuleVersion) === 2 &&
+          Number(write.orderV1After?.settleMethodRuleVersion) === 1 &&
+          Number(write.orderV1After?.status) === 20,
+        details: `orderV1=${write.orderV1?.orderId}(v${write.orderV1?.detail?.settleMethodRuleVersion}), ` +
+          `orderV2=${write.orderV2?.orderId}(v${write.orderV2?.detail?.settleMethodRuleVersion}), ` +
+          `orderV1After=${write.orderV1After?.settleMethodRuleVersion}`
+      })
+      caseRecord.checks.push({
+        name: '规则可停用保存且停用后详情回读为停用状态，不删除平台模板',
+        passed:
+          Number(write.finalRule?.status) === 0 &&
+          Number(write.finalRule?.version) >= 3 &&
+          String(write.finalRule?.id) === write.ruleId,
+        details: `ruleId=${write.ruleId}, status=${write.finalRule?.status}, version=${write.finalRule?.version}`
+      })
+      let readerPageVerified = false
+      const reader = await createProcurementPermissionReader(api, caseRecord, {
+        permission: 'erp:settle-method-rule:query',
+        label: 'PROC006'
+      })
+      let readerBrowser
+      try {
+        readerBrowser = await (dependencies.launchBrowser || launchBrowser)({ record })
+        const readerToken = await (dependencies.loginWithCredentials || loginWithCredentials)(
+          readerBrowser.page, reader.credentials)
+        const readerApi = (dependencies.createApiClient || createApiClient)({ token: readerToken, record })
+        const readerPermission = (await readerApi.getBusiness(
+          '/system/auth/get-permission-info')).data
+        caseRecord.checks.push({
+          name: '隔离只读账号仅拥有结算规则查询权限',
+          passed:
+            readerPermission.user?.username === reader.username &&
+            readerPermission.permissions.includes('erp:settle-method-rule:query') &&
+            !readerPermission.permissions.includes('erp:settle-method-rule:update') &&
+            !readerPermission.permissions.includes('*:*:*'),
+          details: `username=${reader.username}, permissions=${JSON.stringify(readerPermission.permissions)}`
+        })
+        let readerPageRendered = true
+        try {
+          await (dependencies.openRoute || openRoute)(readerBrowser.page, route, {
+            readySelector: view.readySelector
+          })
+        } catch {
+          readerPageRendered = false
+        }
+        const readerBody = await readerBrowser.page.locator('body').innerText().catch(() => '')
+        const writeEntryVisible = /新\s*增|编\s*辑|更\s*新/.test(readerBody)
+        if (readerPageRendered) {
+          readerPageVerified = !writeEntryVisible
+          caseRecord.checks.push({
+            name: '只读账号可打开规则页但不提供维护写入口',
+            passed: !writeEntryVisible,
+            details: `username=${reader.username}, writeEntryVisible=${writeEntryVisible}`
+          })
+        } else {
+          caseRecord.notes.push(
+            `GAP: PROC-006 只读账号 ${reader.username} 页面未渲染完成；后端 403 不能替代页面无写入口验收`
+          )
+        }
+        await (dependencies.saveScreenshot || saveScreenshot)(
+          readerBrowser.page, outputDir, 'erp-settle-method-rule-readonly-account', record)
+        const forbiddenUpdate = await readerApi.put('/erp/settle-method-rule/update', {
+          ...write.ruleBase,
+          id: write.ruleId,
+          status: 0
+        }).catch((error) => ({ code: 'throw', msg: String(error.message || error) }))
+        const finalRuleAfter = (await api.getBusiness(
+          `/erp/settle-method-rule/get?id=${encodeURIComponent(write.ruleId)}`)).data
+        caseRecord.checks.push({
+          name: '只读账号直接请求维护接口被后端 403 拒绝且规则未被改写',
+          passed:
+            forbiddenUpdate?.code === 403 &&
+            Number(finalRuleAfter?.status) === Number(write.finalRule?.status) &&
+            Number(finalRuleAfter?.version) === Number(write.finalRule?.version),
+          details: `code=${forbiddenUpdate?.code}, msg=${forbiddenUpdate?.msg || ''}, ` +
+            `status=${finalRuleAfter?.status}, version=${finalRuleAfter?.version}`
+        })
+        caseRecord.evidence.push(
+          `关联只读账号 ${reader.username} 隔离 Chrome 登录、页面无写入口、维护接口 403 取证`
+        )
+      } finally {
+        try {
+          await reader.deactivate()
+          caseRecord.notes.push(`PROC-006 已停用本轮关联只读账号 ${reader.username}，保留角色与审计证据`)
+        } finally {
+          await readerBrowser?.browser.close()
+        }
+      }
+      await saveScreenshot(page, outputDir, 'erp-settle-method-rule-write-side', record)
+      caseRecord.evidence.push(
+        `专属结算方式 ${write.code}、规则 ${write.ruleId} 创建/更新版本1→2/停用、` +
+        `采购订单 ${write.orderV1?.orderId}/${write.orderV2?.orderId} 版本快照、只读账号权限矩阵`
+      )
+      return {
+        token, api, partial: !readerPageVerified,
+        note: readerPageVerified ? undefined : '只读账号页面无维护入口尚未验证'
+      }
+    }
     return { token, api, ...result }
   }
   caseRecord.notes.push(
@@ -631,6 +769,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'PROC-009') {
+    if (!databaseConfigured()) {
+      throw new Error('BLOCKED: PROC-009 写侧验收需要配置本地数据库只读证据，尚未创建账号')
+    }
+    await assertLocalWriteSafety(caseRecord)
     const token = await login(page)
     const api = createApiClient({ token, record })
     const accountPage = await api.getBusiness(
@@ -724,11 +866,162 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     else missingReadonlyFact(caseRecord, '没有邀请中或停用账号，未验证邮件邀请入口')
     await saveScreenshot(page, outputDir, 'supplier-portal-account-settings', record)
+
+    const tag = `${Date.now().toString(36).toUpperCase()}_${randomBytes(3).toString('hex')}`
+    const partnerId = dataOf(await api.postBusiness('/base/partner/create', {
+      name: `E2E-PROC009-SUPPLIER-${tag}`,
+      shortName: 'E2E-PROC009',
+      partnerKind: 'ORGANIZATION',
+      status: 'ACTIVE',
+      customerEnabled: false,
+      supplierEnabled: true,
+      carrierEnabled: false,
+      remark: `PROC-009 isolated supplier portal account ${tag}`
+    }), 'PROC-009 专属供应商')
+    const primaryLogin = `e2e_proc009_${tag.toLowerCase()}`
+    const primaryAccountId = dataOf(await api.postBusiness(
+      '/erp/supplier-portal/account/create',
+      {
+        basePartnerId: String(partnerId),
+        loginName: primaryLogin,
+        password: `P9-${randomBytes(10).toString('base64url')}-x8`,
+        contactName: 'PROC-009 primary',
+        contactMobile: '13800000009',
+        contactEmail: 'proc009-primary@example.invalid',
+        status: 'ENABLED'
+      }
+    ), 'PROC-009 专属账号')
+    const primary = dataOf(await api.getBusiness(
+      `/erp/supplier-portal/account/get?id=${encodeURIComponent(primaryAccountId)}`
+    ), 'PROC-009 专属账号详情')
+    caseRecord.checks.push({
+      name: '专属供应商门户账号真实创建、绑定统一客商且详情不返回密码摘要',
+      passed:
+        primary.status === 'ENABLED' &&
+        String(primary.basePartnerId) === String(partnerId) &&
+        primary.loginName === primaryLogin &&
+        primary.partnerName === `E2E-PROC009-SUPPLIER-${tag}` &&
+        !Object.prototype.hasOwnProperty.call(primary, 'password') &&
+        !Object.prototype.hasOwnProperty.call(primary, 'passwordHash'),
+      details: `partnerId=${partnerId}, accountId=${primaryAccountId}`
+    })
+
+    const changedLogin = `${primaryLogin}_updated`
+    dataOf(await api.putBusiness('/erp/supplier-portal/account/update', {
+      id: String(primaryAccountId),
+      basePartnerId: String(partnerId),
+      loginName: changedLogin,
+      contactName: 'PROC-009 updated',
+      contactMobile: '13900000009',
+      contactEmail: 'proc009-updated@example.invalid',
+      status: 'DISABLED'
+    }), 'PROC-009 更新专属账号')
+    const updated = dataOf(await api.getBusiness(
+      `/erp/supplier-portal/account/get?id=${encodeURIComponent(primaryAccountId)}`
+    ), 'PROC-009 更新后账号详情')
+    caseRecord.checks.push({
+      name: '专属账号编辑落库并可停用',
+      passed:
+        updated.loginName === changedLogin &&
+        updated.contactName === 'PROC-009 updated' &&
+        updated.contactMobile === '13900000009' &&
+        updated.contactEmail === 'proc009-updated@example.invalid' &&
+        updated.status === 'DISABLED',
+      details: `accountId=${primaryAccountId}, status=${updated.status}`
+    })
+
+    dataOf(await api.putBusiness(
+      `/erp/supplier-portal/account/status?id=${encodeURIComponent(primaryAccountId)}&status=ENABLED`
+    ), 'PROC-009 启用专属账号')
+    const newPassword = `P9R-${randomBytes(12).toString('base64url')}-z7`
+    dataOf(await api.putBusiness('/erp/supplier-portal/account/reset-password', {
+      id: String(primaryAccountId),
+      password: newPassword
+    }), 'PROC-009 重置专属账号密码')
+    const reset = dataOf(await api.getBusiness(
+      `/erp/supplier-portal/account/get?id=${encodeURIComponent(primaryAccountId)}`
+    ), 'PROC-009 重置密码后账号详情')
+    caseRecord.checks.push({
+      name: '专属账号启停和密码重置返回成功且状态回读为启用',
+      passed: reset.status === 'ENABLED' &&
+        reset.loginName === changedLogin &&
+        !Object.prototype.hasOwnProperty.call(reset, 'passwordHash'),
+      details: `accountId=${primaryAccountId}, status=${reset.status}`
+    })
+
+    const invitedLogin = `e2e_proc009_invited_${tag.toLowerCase()}`
+    const invitedAccountId = dataOf(await api.postBusiness(
+      '/erp/supplier-portal/account/create',
+      {
+        basePartnerId: String(partnerId),
+        loginName: invitedLogin,
+        contactName: 'PROC-009 invited',
+        contactEmail: '',
+        status: 'ENABLED'
+      }
+    ), 'PROC-009 邀请夹具账号')
+    const invited = dataOf(await api.getBusiness(
+      `/erp/supplier-portal/account/get?id=${encodeURIComponent(invitedAccountId)}`
+    ), 'PROC-009 邀请夹具详情')
+    const inviteWithoutEmail = await api.post('/erp/supplier-portal/account/invite', {
+      id: String(invitedAccountId)
+    })
+    caseRecord.checks.push({
+      name: '无初始密码创建为邀请中，缺少联系邮箱时邀请被业务规则拒绝',
+      passed:
+        invited.status === 'INVITED' &&
+        !invited.contactEmail &&
+        ![0, 200].includes(inviteWithoutEmail?.code) &&
+        String(inviteWithoutEmail?.msg || '').includes('邮箱'),
+      details: `accountId=${invitedAccountId}, code=${inviteWithoutEmail?.code}, msg=${inviteWithoutEmail?.msg || ''}`
+    })
+
+    const originalSettings = settings.data
+    const testInviteExpireDays = originalSettings.inviteExpireDays === 15 ? 16 : 15
+    try {
+      dataOf(await api.putBusiness('/erp/supplier-portal/account/settings', {
+        portalBaseUrl: 'http://127.0.0.1:9151/supplier',
+        inviteExpireDays: testInviteExpireDays
+      }), 'PROC-009 保存门户配置')
+      const changedSettings = dataOf(await api.getBusiness(
+        '/erp/supplier-portal/account/settings'
+      ), 'PROC-009 配置回读')
+      caseRecord.checks.push({
+        name: '门户访问地址和1-30天邀请有效期真实保存并回读一致',
+        passed:
+          changedSettings.portalBaseUrl === 'http://127.0.0.1:9151/supplier' &&
+          Number(changedSettings.inviteExpireDays) === testInviteExpireDays,
+        details: `portalBaseUrl=${changedSettings.portalBaseUrl}, inviteExpireDays=${changedSettings.inviteExpireDays}`
+      })
+    } finally {
+      await api.putBusiness('/erp/supplier-portal/account/settings', {
+        portalBaseUrl: originalSettings.portalBaseUrl || '',
+        inviteExpireDays: originalSettings.inviteExpireDays
+      })
+      caseRecord.notes.push(
+        `PROC-009 已恢复共享门户配置 inviteExpireDays=${originalSettings.inviteExpireDays}`
+      )
+    }
+    caseRecord.fixtures = [...(caseRecord.fixtures || []), {
+      kind: 'supplier-portal-account',
+      id: String(primaryAccountId),
+      partnerId: String(partnerId),
+      loginName: changedLogin,
+      status: 'ENABLED',
+      retained: true
+    }, {
+      kind: 'supplier-portal-account',
+      id: String(invitedAccountId),
+      partnerId: String(partnerId),
+      loginName: invitedLogin,
+      status: 'INVITED',
+      retained: true
+    }]
     caseRecord.evidence.push(
-      '真实登录、账号/客商分页、配置及设置页面；仅在存在样本时验证详情和邀请按钮，不发送邀请邮件'
+      `真实登录、专属账号 ${primaryAccountId} 创建/编辑/停用/启用/重置密码、` +
+      `无邮箱邀请拒绝账号 ${invitedAccountId}、门户配置写入并恢复、设置页面截图`
     )
-    return { token, api, partial: true,
-      note: '未执行账号创建、编辑、启停、密码重置及独立供应商身份隔离，不能将设置页面冒称完整 PASS' }
+    return { token, api }
   }
 
   if (caseId === 'PROC-011') {
@@ -809,19 +1102,36 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'PROC-012') {
+    if (!databaseConfigured()) {
+      throw new Error('BLOCKED: PROC-012 写侧验收需要配置本地数据库只读证据，尚未创建价格方案')
+    }
+    await assertLocalWriteSafety(caseRecord)
     const token = await login(page)
     const api = createApiClient({ token, record })
+    const snapshot = await createPurchasePriceSnapshotFixture(api, caseRecord)
     const pageResult = await api.getBusiness(
       '/erp/price-scheme/page?pageNo=1&pageSize=100&priceDirection=PURCHASE'
     )
     const rows = Array.isArray(pageResult?.data?.list) ? pageResult.data.list : []
-    if (!rows.length) missingReadonlyFact(caseRecord, '没有采购价格方案样本，方案字段和版本未验证')
+    const createdScheme = rows.find((row) => String(row.id) === snapshot.fixture.schemeId)
     caseRecord.checks.push({
-      name: '统一价格中心提供 PURCHASE 方向方案分页',
+      name: '统一价格中心 PURCHASE 分页包含本轮专属方案且不含 SALE 方案',
       passed:
         Array.isArray(pageResult?.data?.list) &&
-        rows.every((row) => row.priceDirection === 'PURCHASE'),
-      details: `purchaseSchemes=${rows.length}`
+        rows.every((row) => row.priceDirection === 'PURCHASE') &&
+        createdScheme?.code === snapshot.fixture.code &&
+        Number(createdScheme?.status) === 1,
+      details: `schemeId=${snapshot.fixture.schemeId}, purchaseSchemes=${rows.length}`
+    })
+    caseRecord.checks.push({
+      name: '专属价格方案、版本、规则、命中依据与计算时间已落库并回读一致',
+      passed:
+        snapshot.item.priceSchemeCode === snapshot.fixture.code &&
+        Number(snapshot.item.priceVersionNo) === 1 &&
+        snapshot.item.priceHitSource === 'PARTNER' &&
+        Boolean(snapshot.item.priceCalculatedAt),
+      details: `orderId=${snapshot.fixture.orderId}, itemId=${snapshot.item.id}, ` +
+        `versionId=${snapshot.item.priceVersionId}, ruleId=${snapshot.item.priceRuleId}`
     })
     await openRoute(page, '/settings/erp/price-center')
     const directionField = page.locator('.el-form-item').filter({ hasText: '价格方向' }).first()
@@ -843,9 +1153,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       details: page.url()
     })
     await saveScreenshot(page, outputDir, 'erp-purchase-price-center', record)
-    caseRecord.evidence.push('真实登录、PURCHASE 方向分页和价格中心页面截图')
-    return { token, api, partial: true,
-      note: '价格中心入口不代表采购订单取价成功；方案、版本、规则、命中依据和计算时间的正式订单快照未验证' }
+    caseRecord.evidence.push(
+      `真实登录、专属 PURCHASE 方案 ${snapshot.fixture.schemeId}、版本 ${snapshot.fixture.versionId}、` +
+      `规则 ${snapshot.fixture.ruleId}、采购订单 ${snapshot.fixture.orderId}、` +
+      '订单行快照、数据库四表回读和价格中心页面截图'
+    )
+    return { token, api }
   }
 
   if (caseId === 'PROC-013') {
@@ -1274,6 +1587,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'PROC-015') {
+    if (!databaseConfigured()) {
+      throw new Error('BLOCKED: PROC-015 写侧验收需要配置本地数据库只读证据，尚未创建变更审计')
+    }
+    await assertLocalWriteSafety(caseRecord)
     const token = await login(page)
     const api = createApiClient({ token, record })
     const pageResult = await api.getBusiness('/erp/purchase-order/page?pageNo=1&pageSize=20')
@@ -1376,12 +1693,82 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push(
       '真实登录、订单分页标签字段契约、变更/变更记录/附件接口负向契约、状态标签与变更入口截图'
     )
-    return {
-      token,
-      api,
-      notImplemented: true,
-      note: '状态标签、无供应商实单详情与变更入口已验证；尚未完成真实字段变更审计、附件写入及写权限矩阵，不能登记 PB-139 完整通过'
-    }
+
+    // PB-139 real write side: create an isolated audited order, then exercise the
+    // change / change-list / attachment chain and verify the audit in the database.
+    const writer = await createPurchaseOrderChangeFixture(api, caseRecord)
+    const auditFields = writer.auditRows.map((row) => row[0])
+    caseRecord.checks.push({
+      name: '专属直采采购订单创建即处于审核通过且变更前后状态稳定',
+      passed:
+        Number(writer.created?.status) === 20 &&
+        Number(writer.changed?.status) === 20 &&
+        Number(writer.changed?.isClosed) === 0 &&
+        String(writer.audited?.id) === writer.orderId,
+      details: `orderId=${writer.orderId}, created=${writer.created?.status}, afterChange=${writer.changed?.status}`
+    })
+    caseRecord.checks.push({
+      name: '变更接口真实改写未执行行数量与单价并重算未税金额与合计数量',
+      passed:
+        writer.changedLineACount === 4 &&
+        writer.changedLineAPrice === 60 &&
+        writer.changedTotalProductPrice === 300 &&
+        writer.changedTotalCount === 7 &&
+        String(writer.changedLineB?.remark) === `PROC-015 changed line B ${writer.tag}`,
+      details: `lineA count=${writer.changedLineACount}, price=${writer.changedLineAPrice}, totalProductPrice=${writer.changedTotalProductPrice}, totalCount=${writer.changedTotalCount}`
+    })
+    caseRecord.checks.push({
+      name: '变更不改变单据状态机，表头备注按专属值落库',
+      passed:
+        Number(writer.changed?.isClosed) === 0 &&
+        Number(writer.changed?.status) === 20 &&
+        String(writer.changed?.remark) === `PROC-015 changed header ${writer.tag}` &&
+        Number(writer.changed?.totalCount) === 7,
+      details: `remark=${writer.changed?.remark}, totalCount=${writer.changed?.totalCount}`
+    })
+    caseRecord.checks.push({
+      name: '变更记录接口返回四次字段级审计并携带原因与批次号',
+      passed:
+        Array.isArray(writer.history) &&
+        writer.history.length === 4 &&
+        writer.history.every((row) =>
+          String(row.changeBatchNo) === writer.changeBatchNo &&
+          String(row.reason) === `PROC-015 isolated change ${writer.tag}` &&
+          String(row.operatorName || '').length > 0 &&
+          Boolean(row.operateTime)) &&
+        ['remark', 'count', 'productPrice'].every((field) =>
+          writer.history.some((row) => row.fieldName === field)),
+      details: `records=${writer.history?.length}, batch=${writer.changeBatchNo}`
+    })
+    caseRecord.checks.push({
+      name: '数据库 erp_purchase_order_change 持久化专属字段级审计旧值与新值',
+      passed:
+        writer.auditRows.length === 4 &&
+        auditFields.filter((field) => field === 'count').length === 1 &&
+        auditFields.filter((field) => field === 'productPrice').length === 1 &&
+        auditFields.filter((field) => field === 'remark').length === 2 &&
+        writer.auditRows.some((row) =>
+          row[0] === 'count' && Number(row[1]) === 2 && Number(row[2]) === 4 && row[5] === 'EFFECTIVE') &&
+        writer.auditRows.some((row) =>
+          row[0] === 'productPrice' && Number(row[1]) === 50 && Number(row[2]) === 60) &&
+        writer.auditRows.every((row) =>
+          row[3] === `PROC-015 isolated change ${writer.tag}` &&
+          row[4] === writer.changeBatchNo),
+      details: JSON.stringify(writer.auditRows).slice(0, 600)
+    })
+    caseRecord.checks.push({
+      name: '专属订单附件地址真实写入并原样回读',
+      passed:
+        typeof writer.fileUrl === 'string' &&
+        String(writer.attached?.fileUrl || '') === writer.fileUrl,
+      details: `orderId=${writer.orderId}, fileUrl=${writer.attached?.fileUrl || ''}`
+    })
+    await saveScreenshot(page, outputDir, 'erp-purchase-order-change-audit', record)
+    caseRecord.evidence.push(
+      `真实登录、专属采购订单 ${writer.orderId} 创建并审核、变更批次 ${writer.changeBatchNo}、` +
+      '变更记录接口、变更后金额与状态回读、附件写入回读、数据库变更审计四行'
+    )
+    return { token, api }
   }
 
   if (caseId === 'PROC-016') {

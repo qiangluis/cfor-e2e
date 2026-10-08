@@ -20,14 +20,18 @@ import {
   salesMaterialBody,
   salesOpeningInvoiceBody,
   salesOrderBody,
+  salesPlanSnapshot,
   salesPriceFixtureBodies,
   salesPriceSnapshot,
   salesProcessDetail,
+  salesQuoteSnapshot,
   salesStockSnapshot,
   salesTypeDictionaryBody,
   salesTime
 } from '../suites/erp-sales.mjs'
 import { caseFailureAction, parseRunnerArgs } from '../lib/runner-options.mjs'
+import { caseErrorStatus } from '../lib/report.mjs'
+import { config } from '../config/index.mjs'
 
 const record = () => ({ checks: [], notes: [], evidence: [] })
 const local = {
@@ -48,6 +52,143 @@ const order = () => ({
   srcBillId: '401', totalPrice: 177.6,
   items: [{ id: '511', productId: '201', productUnitId: '301', count: 2, productPrice: 88.8 }]
 })
+
+const snapshotHelpers = [
+  {
+    label: 'sales plan', helper: salesPlanSnapshot, path: '/crm/sales-plan/get', id: '601',
+    detail: () => ({
+      id: '601', planTypeCode: 'E2E-SALES-UNIT-P', status: '执行中',
+      contractTarget: '177.6', receivableTarget: '177.6',
+      items: [{ id: '611', targetId: '201', targetType: 'PRODUCT', contractTarget: '177.6' }]
+    }),
+    invalidDetails: () => [
+      { id: '601' }, { id: '601', items: null }, { id: '601', items: {} },
+      { id: '601', items: [null] }, { id: '601', items: [[]] },
+      { id: '601', items: ['item'] }
+    ]
+  },
+  {
+    label: 'sales quote', helper: salesQuoteSnapshot, path: '/crm/quote/get', id: '701',
+    detail: () => ({
+      id: '701', subject: 'E2E-SALES-UNIT-QUOTE', currentVersionNo: 1,
+      currentVersion: { id: '711', versionNo: 1, products: [{
+        id: '721', productId: '201', quantity: '2', unitPrice: '77.7',
+        priceSchemeId: '801', priceSchemeCode: 'E2E-SALES-UNIT', priceVersionId: '811',
+        priceVersionNo: 1, priceRuleId: '821', priceHitSource: 'PARTNER',
+        priceCalculatedAt: '2026-10-08T12:00:00'
+      }] }
+    }),
+    invalidDetails: () => [
+      { id: '701' }, { id: '701', currentVersion: null }, { id: '701', currentVersion: [] },
+      { id: '701', currentVersion: { products: [] } },
+      { id: '701', currentVersion: { id: 'unsafe', products: [] } },
+      { id: '701', currentVersion: { id: '711' } },
+      { id: '701', currentVersion: { id: '711', products: null } },
+      { id: '701', currentVersion: { id: '711', products: {} } },
+      { id: '701', currentVersion: { id: '711', products: [null] } },
+      { id: '701', currentVersion: { id: '711', products: [[]] } },
+      { id: '701', currentVersion: { id: '711', products: ['product'] } }
+    ]
+  }
+]
+
+for (const { label, helper, path, id, detail, invalidDetails } of snapshotHelpers) {
+  test(`${label} snapshot keeps API 500 and thrown errors as FAIL without SQL fallback`, async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(config.db, 'host')
+    let databaseReads = 0
+    // Trap the SQL boundary before a regression can execute a real database query.
+    Object.defineProperty(config.db, 'host', {
+      configurable: true,
+      get() {
+        databaseReads++
+        throw new Error('Unexpected SQL fallback')
+      }
+    })
+    try {
+      for (const response of [
+        { code: 500, msg: '翻译组件异常' },
+        { code: 500, msg: '详情异常', data: detail() },
+        { code: 0, success: false, data: detail() }
+      ]) {
+        const evidence = record()
+        const calls = []
+        await assert.rejects(helper({
+          getBusiness: async (requested) => { calls.push(requested); return response }
+        }, evidence, id), (error) => {
+          assert.match(error.message, /business failure/)
+          assert.equal(caseErrorStatus(error, evidence.checks), 'FAIL')
+          return true
+        })
+        assert.deepEqual(calls, [`${path}?id=${id}`])
+        assert.deepEqual(evidence, record())
+      }
+      for (const failure of [
+        new Error(`HTTP 500 GET ${path}`), new Error('network failed')
+      ]) {
+        const evidence = record()
+        await assert.rejects(helper({
+          getBusiness: async () => { throw failure }
+        }, evidence, id), (error) => {
+          assert.equal(error, failure)
+          assert.equal(caseErrorStatus(error, evidence.checks), 'FAIL')
+          return true
+        })
+        assert.deepEqual(evidence, record())
+      }
+      assert.equal(databaseReads, 0)
+    } finally {
+      Object.defineProperty(config.db, 'host', descriptor)
+    }
+  })
+
+  test(`${label} snapshot returns the exact official detail with validated shape and identity`, async () => {
+    for (const responseId of [id, Number(id)]) {
+      const data = { ...detail(), id: responseId }
+      const evidence = record()
+      const calls = []
+      const actual = await helper({
+        getBusiness: async (requested) => {
+          calls.push(requested)
+          return { code: 0, data }
+        }
+      }, evidence, id)
+      assert.equal(actual, data)
+      assert.deepEqual(calls, [`${path}?id=${id}`])
+      assert.equal(evidence.checks.length, 1)
+      assert.ok(evidence.checks[0].passed)
+      assert.deepEqual(evidence.notes, [])
+      assert.equal(evidence.database, undefined)
+    }
+  })
+
+  test(`${label} snapshot rejects empty, malformed or foreign official details as FAIL`, async () => {
+    for (const data of [
+      null, [], 'detail', {}, { ...detail(), id: '999' }, { ...detail(), id: null },
+      { ...detail(), id: Number.MAX_SAFE_INTEGER + 1 }, ...invalidDetails()
+    ]) {
+      const evidence = record()
+      await assert.rejects(helper({
+        getBusiness: async () => ({ code: 0, data })
+      }, evidence, id), (error) => {
+        assert.equal(caseErrorStatus(error, evidence.checks), 'FAIL')
+        return true
+      })
+      assert.ok(evidence.checks.every((check) => check.passed === false))
+      assert.deepEqual(evidence.notes, [])
+      assert.equal(evidence.database, undefined)
+    }
+  })
+
+  test(`${label} snapshot rejects unsafe request identities before API access`, async () => {
+    let reads = 0
+    for (const requestId of [null, undefined, '', 0, -1, 'x;DELETE', Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(helper({
+        getBusiness: async () => { reads++; return { code: 0, data: detail() } }
+      }, record(), requestId), /稳定 ID/)
+    }
+    assert.equal(reads, 0)
+  })
+}
 
 test('sales JSON LocalDateTime matches the frontend T format and keeps local business date', () => {
   const date = new Date(2026, 9, 7, 11, 34, 5)
@@ -493,7 +634,7 @@ test('price fixture uses one CRM partner and a general business-type scheme that
   const source = fs.readFileSync(new URL('../suites/erp-sales.mjs', import.meta.url), 'utf8')
   const priceWrite = source.slice(source.indexOf('async function runPriceSalesWrite'),
     source.indexOf('export function salesTypeDictionaryBody'))
-  assert.match(priceWrite, /createSalesFixture\(api, caseRecord, userId, \{ crm: true \}\)/)
+  assert.match(priceWrite, /createSalesFixture\(api, caseRecord, userId, \{ crm: true, dualRole: true \}\)/)
   assert.match(priceWrite, /customerId: fixture\.customerId/)
   assert.doesNotMatch(priceWrite, /\/crm\/customer\/create/)
 })

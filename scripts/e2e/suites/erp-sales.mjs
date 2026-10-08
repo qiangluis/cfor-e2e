@@ -144,6 +144,13 @@ export const erpSalesReadOnlyCases = Object.freeze([
   'ERP-SALES-004',
   'ERP-SALES-007'
 ])
+// ERP-SALES-007 已通过 runSalesWriteCase 完成写侧闭环并升级为 READY，不再是必须保持 PARTIAL 的只读门禁案例。
+export const erpSalesPartialReadOnlyCases = Object.freeze([
+  'ERP-SALES-001',
+  'ERP-SALES-002',
+  'ERP-SALES-003',
+  'ERP-SALES-004'
+])
 
 export const erpSalesReadOnlyViews = Object.freeze({
   'ERP-SALES-001': {
@@ -1148,7 +1155,8 @@ export function salesMaterialBody(template, tag) {
   }
 }
 
-export async function createSalesFixture(api, caseRecord, userId, { crm = false, warehouse = false } = {}) {
+export async function createSalesFixture(api, caseRecord, userId,
+  { crm = false, warehouse = false, dualRole = false } = {}) {
   const tag = salesStamp()
   const materialTemplate = (await salesArray(api, '/mes/basMaterial/list/enabled'))
     .find((row) => row.saled === 'Y' && stableId(row.unitId))
@@ -1187,6 +1195,18 @@ export async function createSalesFixture(api, caseRecord, userId, { crm = false,
   const partner = await salesDetail(api, `/base/partner/get?id=${partnerId}`)
   salesFact(caseRecord, '专属客商客户角色正式回读', partner.name === tag && partner.customerEnabled === true,
     `crmCustomerId=${customerId || ''}, partnerId=${partnerId}, partnerCode=${partner.partnerCode}`)
+  if (dualRole && partner.supplierEnabled !== true) {
+    await api.putBusiness('/base/partner/update', {
+      id: partnerId, name: partner.name, shortName: partner.shortName,
+      partnerKind: partner.partnerKind, status: partner.status,
+      customerEnabled: true, supplierEnabled: true,
+      carrierEnabled: partner.carrierEnabled === true, remark: tag
+    })
+    const enabled = await salesDetail(api, `/base/partner/get?id=${partnerId}`)
+    salesFact(caseRecord, '专属公共客商同时启用供应商角色',
+      enabled.supplierEnabled === true && enabled.customerEnabled === true,
+      `partnerId=${partnerId}, supplierEnabled=${enabled.supplierEnabled}`)
+  }
   const fixture = { tag, material, partnerId, customerId }
   if (warehouse) {
     await api.postBusiness('/mes/wmsWareHouse/add', {
@@ -1357,7 +1377,7 @@ export async function createSalesSettlementAccount(api, caseRecord, tag) {
 
 async function createSignedSalesContract(context, api, userId) {
   const { caseRecord } = context
-  const fixture = await createSalesFixture(api, caseRecord, userId, { crm: true })
+  const fixture = await createSalesFixture(api, caseRecord, userId, { crm: true, dualRole: true })
   let processId
   let contractId
   try {
@@ -1497,9 +1517,7 @@ export async function runSalesWriteCase(context, api, userId, dependencies = {})
       salesFact(caseRecord, '签署合同回款计划来源唯一且总额不超合同',
         plans.length === 1 && sameId(plans[0].contractId, fixture.contractId) &&
         Number(plans[0].price) === 177.6, `contractId=${fixture.contractId}, plans=${JSON.stringify(plans)}`)
-      const accounts = await salesArray(api, '/erp/account/simple-list')
-      caseRecord.notes.push(`资金账户可用数=${accounts.length}；未将 CRM 回款计划冒充财务应收或自动核销`)
-      salesCatalogEvidence(caseId, caseRecord)
+      await runFinancialSalesWrite(context, api, fixture)
     } else {
       const processId = fixture.order.processInstanceId || fixture.order.bpmiInstanceId
       if (Number(fixture.order.status) !== 20) {
@@ -1720,6 +1738,210 @@ async function runNormalSalesOut(context, api, fixture, account, baseline) {
   }
 }
 
+export function salesReceiptBody(fixture, order, accountId, amount, suffix) {
+  const item = order?.items?.[0]
+  if (!stableId(fixture.partnerId) || !stableId(order?.id) || !stableId(item?.id) ||
+      !stableId(item?.productId) || !stableId(item?.productUnitId) ||
+      !stableId(accountId) || !finiteNumber(amount) || Number(amount) <= 0 ||
+      !/^E2E-SALES-[A-Z0-9-]+$/.test(fixture.tag || '')) {
+    throw new Error('BLOCKED: 收款核销夹具缺少本轮专属订单/客商/账户/物料或金额')
+  }
+  const amt = Number(amount)
+  return {
+    billType: '',
+    billNo: `${fixture.tag}-${suffix}`,
+    receiptType: '102',
+    srcBillType: 'SalOrder',
+    srcBillId: String(order.id),
+    srcNo: order.no,
+    customerId: String(fixture.partnerId),
+    billDate: salesDate(),
+    collectionItem: '1',
+    settleMethod: '1',
+    bankAccountId: String(accountId),
+    isAuto: 0,
+    isRubric: 0,
+    discountAmt: 0,
+    checkedAmt: 0,
+    amt,
+    detailsRemark: `${fixture.tag} ${suffix}`,
+    finReceiptEntryList: [{
+      entryNo: 1,
+      srcNo: order.no,
+      srcBillId: String(order.id),
+      srcBillType: 'SalOrder',
+      srcEntryId: String(item.id),
+      productId: String(item.productId),
+      productUnitId: String(item.productUnitId),
+      count: Number(item.count),
+      checkedAmt: 0,
+      discountAmt: 0,
+      amt,
+      collectionItem: '1',
+      settleMethod: '1',
+      bankAccountId: String(accountId),
+      remark: `${fixture.tag} ${suffix}`
+    }]
+  }
+}
+
+async function runFinancialSalesWrite(context, api, fixture) {
+  const { caseRecord, caseId } = context
+  const order = await salesDetail(api, `/erp/sale-order/get?id=${fixture.order.id}`)
+  salesFact(caseRecord, '签署合同订单已正式审核可生成应收',
+    Number(order.status) === 20 && sameId(order.contractId, fixture.contractId),
+    `orderId=${order.id}, contractId=${fixture.contractId}, status=${order.status}`)
+  const receivables = await salesRows(api,
+    `/finance/finReceivable/list?pageNo=1&pageSize=100&customerId=${encodeURIComponent(fixture.partnerId)}`)
+  const linked = receivables.filter((row) =>
+    row.srcBillType === 'SalOrder' && sameId(row.srcBillId, order.id))
+  salesFact(caseRecord, '销售订单审核自动生成唯一应收并保留来源',
+    linked.length === 1 && sameId(linked[0].customerId, fixture.partnerId) &&
+    Number(linked[0].amt) === Number(order.totalPrice),
+    `orderId=${order.id}, receivables=${JSON.stringify(linked.map((row) => ({
+      id: row.id, srcBillType: row.srcBillType, srcBillId: row.srcBillId, amt: row.amt
+    })))}`)
+  const receivable = await salesDetail(api, `/finance/finReceivable/queryById?id=${linked[0].id}`)
+  const entry = receivable.finReceivableEntryList?.find((row) =>
+    sameId(row.srcEntryId, order.items?.[0]?.id)) || receivable.finReceivableEntryList?.[0]
+  salesFact(caseRecord, '应收明细逐行对应销售订单明细且未核销余额完整',
+    entry != null && sameId(entry.srcBillId, order.id) &&
+    sameId(entry.srcEntryId, order.items?.[0]?.id) &&
+    Number(entry.amt) === Number(order.items?.[0]?.totalPrice) &&
+    Number(entry.checkedAmt) === 0,
+    `receivableId=${receivable.id}, entryId=${entry?.id}, srcEntryId=${entry?.srcEntryId}, ` +
+    `amt=${entry?.amt}, checkedAmt=${entry?.checkedAmt}`)
+  const account = await createSalesSettlementAccount(api, caseRecord, fixture.tag)
+  const receiptId = salesId(await api.postBusiness('/finance/finReceipt/add/submit',
+    salesReceiptBody(fixture, order, account.id, Number(order.totalPrice), 'RECEIPT')),
+  '创建专属销售收款单')
+  owned(caseRecord, 'sales-receipt', receiptId, { tag: fixture.tag, orderId: order.id })
+  let receipt = await salesDetail(api, `/finance/finReceipt/queryById?id=${receiptId}`)
+  if (Number(receipt.isEffective) !== 1) {
+    await api.putBusiness('/finance/finReceipt/checkReceivable', {
+      id: receiptId, approvalResultType: '1', approvalRemark: `${fixture.tag} 收款审核`
+    })
+    receipt = await salesDetail(api, `/finance/finReceipt/queryById?id=${receiptId}`)
+  }
+  if (String(receipt.billStage) === '24' || Number(receipt.isEffective) !== 1) {
+    await api.putBusiness('/finance/finReceipt/execute', { id: receiptId })
+    receipt = await salesDetail(api, `/finance/finReceipt/queryById?id=${receiptId}`)
+  }
+  const afterReceivable = await salesDetail(api,
+    `/finance/finReceivable/queryById?id=${linked[0].id}`)
+  const afterEntry = afterReceivable.finReceivableEntryList?.find((row) =>
+    sameId(row.id, entry.id))
+  const checks = await salesRows(api,
+    `/finance/finReceivableCheck/list?pageNo=1&pageSize=100&customerId=${encodeURIComponent(fixture.partnerId)}`)
+  const autoCheck = checks.find((row) =>
+    sameId(row.srcBillId, receiptId) || sameId(row.srcBillId, receipt.id))
+  const autoCheckDetail = autoCheck
+    ? await salesDetail(api, `/finance/finReceivableCheck/queryById?id=${autoCheck.id}`)
+    : null
+  const checkEntries = autoCheckDetail?.finReceivableCheckEntryList || []
+  const receivableSide = checkEntries.find((row) =>
+    String(row.srcBillType || '').startsWith('FinReceivable'))
+  const receiptSide = checkEntries.find((row) =>
+    String(row.srcBillType || '').startsWith('FinReceipt'))
+  salesFact(caseRecord, '收款审核自动生成核销并精确回写应收已核销金额',
+    Number(receipt.isEffective) === 1 && afterEntry != null &&
+    Number(afterEntry.checkedAmt) === Number(entry.amt) &&
+    autoCheck != null && Number(autoCheck.isAuto) === 1 &&
+    receivableSide != null && sameId(receivableSide.srcBillId, linked[0].id) &&
+    sameId(receivableSide.srcEntryId, entry.id) &&
+    Number(receivableSide.amt) === Number(entry.amt) &&
+    receiptSide != null && sameId(receiptSide.srcBillId, receiptId) &&
+    Number(receiptSide.amt) === Number(receipt.amt),
+    JSON.stringify({
+      receiptId, receivableId: linked[0].id, checkId: autoCheck?.id,
+      checkedAmt: afterEntry?.checkedAmt,
+      sourceSide: receivableSide ? {
+        srcBillId: receivableSide.srcBillId, srcEntryId: receivableSide.srcEntryId,
+        amt: receivableSide.amt
+      } : null,
+      receiptSide: receiptSide ? { srcBillId: receiptSide.srcBillId, amt: receiptSide.amt } : null
+    }))
+  const overOrderId = await createOwnedSalesOrder(api, fixture, 'NORMAL', caseRecord)
+  let overOrder = await salesDetail(api, `/erp/sale-order/get?id=${overOrderId}`)
+  if (Number(overOrder.status) !== 20) {
+    await api.putBusiness(`/erp/sale-order/update-status?id=${overOrderId}&status=10`)
+    overOrder = await salesDetail(api, `/erp/sale-order/get?id=${overOrderId}`)
+    const processId = overOrder.processInstanceId || overOrder.bpmiInstanceId
+    if (processId && Number(overOrder.status) !== 20) {
+      owned(caseRecord, 'sale-order-bpm', processId, {
+        tag: fixture.tag, businessId: overOrderId, orderId: overOrderId
+      })
+      await approveOwnedSalesProcess({ ...context, api, processId })
+      overOrder = await salesDetail(api, `/erp/sale-order/get?id=${overOrderId}`)
+    }
+  }
+  const overAmount = Number((Number(overOrder.totalPrice) + 10).toFixed(2))
+  const overReceiptResponse = await api.request('POST', '/finance/finReceipt/add/submit',
+    salesReceiptBody(fixture, overOrder, account.id, overAmount, 'OVER'))
+  let overReceiptId
+  if (isBusinessSuccess(overReceiptResponse)) overReceiptId = String(overReceiptResponse.data)
+  const overReceivables = await salesRows(api,
+    `/finance/finReceivable/list?pageNo=1&pageSize=100&customerId=${encodeURIComponent(fixture.partnerId)}`)
+  const overReceivable = overReceivables.find((row) =>
+    row.srcBillType === 'SalOrder' && sameId(row.srcBillId, overOrder.id))
+  const overDetail = overReceivable
+    ? await salesDetail(api, `/finance/finReceivable/queryById?id=${overReceivable.id}`)
+    : null
+  const overEntry = overDetail?.finReceivableEntryList?.[0]
+  let overReceipt
+  let overRejected = false
+  if (overReceiptId) {
+    overReceipt = await salesDetail(api, `/finance/finReceipt/queryById?id=${overReceiptId}`)
+    const checkResponse = await api.request('PUT', '/finance/finReceipt/checkReceivable',
+      { id: overReceiptId, approvalResultType: '1', approvalRemark: `${fixture.tag} 超额探针` })
+    overRejected = !isBusinessSuccess(checkResponse)
+    if (!overRejected) {
+      const overAfter = overReceivable
+        ? await salesDetail(api, `/finance/finReceivable/queryById?id=${overReceivable.id}`)
+        : null
+      overRejected = Number(overAfter?.finReceivableEntryList?.[0]?.checkedAmt) <=
+        Number(overEntry?.amt)
+    }
+  } else {
+    overRejected = objectRow(overReceiptResponse) &&
+      Number.isInteger(overReceiptResponse.code) && overReceiptResponse.code !== 0 &&
+      overReceiptResponse.code !== 500 &&
+      /核销|超出|未核|金额/.test(String(overReceiptResponse.msg || overReceiptResponse.message || ''))
+  }
+  salesFact(caseRecord, '核销金额不得超过应收未核销余额',
+    overRejected, `overReceiptId=${overReceiptId || ''}, response=${JSON.stringify(overReceiptResponse)}`)
+  if (overReceiptId) {
+    owned(caseRecord, 'sales-receipt-over-limit', overReceiptId, {
+      tag: fixture.tag, orderId: overOrder.id
+    })
+    try { await api.putBusiness('/finance/finReceipt/void', { id: overReceiptId }) } catch {}
+  }
+  const dbRows = await salesSql(caseRecord, 'sales-financial-source-and-writeoff', `
+    SELECT 'receivable',id,src_bill_type,src_bill_id,customer_id,amt,checked_amt
+      FROM fin_receivable WHERE tenant_id=1 AND id=${sqlId(linked[0].id)};
+    SELECT 'receivable_entry',id,mid,src_bill_id,src_entry_id,amt,checked_amt
+      FROM fin_receivable_entry WHERE tenant_id=1 AND id=${sqlId(entry.id)};
+    SELECT 'receipt',id,src_bill_type,src_bill_id,customer_id,amt,is_effective
+      FROM fin_receipt WHERE tenant_id=1 AND id=${sqlId(receiptId)};
+    SELECT 'check',id,src_bill_type,src_bill_id,is_auto,amt
+      FROM fin_receivable_check WHERE tenant_id=1 AND id=${sqlId(autoCheck.id)};
+    SELECT 'check_entry',id,mid,src_bill_type,src_bill_id,src_entry_id,amt
+      FROM fin_receivable_check_entry WHERE tenant_id=1 AND mid=${sqlId(autoCheck.id)}
+      ORDER BY entry_no`)
+  salesFact(caseRecord, '数据库证明应收来源、收款核销和已核销金额均真实落库',
+    dbRows.length >= 6 && dbRows[0][2] === 'SalOrder' &&
+    sameId(dbRows[0][3], order.id) && Number(dbRows[0][6]) === Number(order.totalPrice) &&
+    dbRows[1][3] === order.id && sameId(dbRows[1][4], order.items?.[0]?.id) &&
+    Number(dbRows[1][6]) === Number(entry.amt) &&
+    dbRows[2][2] === 'SalOrder' && sameId(dbRows[2][3], order.id) &&
+    String(dbRows[2][6]) === '1' &&
+    String(dbRows[3][3]) === '1' &&
+    dbRows.slice(4).some((row) => row[3] === 'FinReceivable:101') &&
+    dbRows.slice(4).some((row) => row[3] === 'FinReceipt:102'),
+    JSON.stringify(dbRows))
+  salesCatalogEvidence(caseId, caseRecord, [0, 1, 2, 3])
+}
+
 export function salesPriceFixtureBodies(fixture, schemeId, price = 88.8) {
   if (!stableId(fixture.customerId) || !stableId(fixture.partnerId) ||
       !stableId(fixture.material?.id) || !stableId(fixture.material?.unitId) ||
@@ -1742,9 +1964,70 @@ export function salesPriceFixtureBodies(fixture, schemeId, price = 88.8) {
   }
 }
 
+export function salesPurchasePriceFixtureBodies(fixture, schemeId, price = 44.4) {
+  if (!stableId(fixture.partnerId) || !stableId(fixture.material?.id) ||
+      !stableId(fixture.material?.unitId) || !/^E2E-SALES-[A-Z0-9-]+$/.test(fixture.tag || '')) {
+    throw new Error('BLOCKED: 采购价格链必须使用同一个专属公共客商/物料')
+  }
+  return {
+    scheme: {
+      priceDirection: 'PURCHASE', code: `${fixture.tag}-PUR`, name: `${fixture.tag}-PUR`,
+      priority: 0, businessTypeCode: 'NORMAL', currencyCode: 'CNY', status: 1, remark: fixtureRemark
+    },
+    publish: {
+      schemeId, effectiveFrom: salesDate(), changeReason: fixture.tag,
+      rules: [{
+        partnerId: String(fixture.partnerId), materialId: String(fixture.material.id),
+        unitId: String(fixture.material.unitId), quantityFrom: 0, quantityTo: 100,
+        currencyCode: 'CNY', taxIncluded: false, taxRate: 0, price, sort: 1, remark: fixture.tag
+      }]
+    },
+    inquiry: {
+      priceDirection: 'PURCHASE', businessTypeCode: 'NORMAL',
+      partnerId: String(fixture.partnerId), materialId: String(fixture.material.id),
+      unitId: String(fixture.material.unitId), quantity: 2, priceDate: salesDate()
+    }
+  }
+}
+
+export function salesPurchaseOrderBody(fixture, price, count = 2, { includePrice = true } = {}) {
+  if (!stableId(fixture.partnerId) || !stableId(fixture.material?.id) ||
+      !stableId(fixture.material?.unitId) || !/^E2E-SALES-[A-Z0-9-]+$/.test(fixture.tag || '')) {
+    throw new Error('BLOCKED: 采购订单夹具缺少专属供应商/物料/单位')
+  }
+  const amount = Number((Number(price) * count).toFixed(2))
+  return {
+    type: 0,
+    supplierId: String(fixture.partnerId),
+    orderTime: salesTime(),
+    billDate: salesDate(),
+    discountPercent: 0,
+    discountPrice: 0,
+    depositPrice: 0,
+    totalCount: count,
+    totalProductPrice: amount,
+    totalTaxPrice: 0,
+    totalPrice: amount,
+    directCreate: 1,
+    directCreateReason: `${fixture.tag} isolated purchase price snapshot`,
+    remark: fixture.tag,
+    items: [{
+      entryNo: 1,
+      productId: String(fixture.material.id),
+      productUnitId: String(fixture.material.unitId),
+      ...(includePrice ? { productPrice: Number(price) } : {}),
+      count,
+      taxPercent: 0,
+      totalPrice: amount,
+      taxPrice: 0,
+      remark: fixture.tag
+    }]
+  }
+}
+
 async function runPriceSalesWrite(context, api, userId) {
   const { caseRecord, caseId } = context
-  const fixture = await createSalesFixture(api, caseRecord, userId, { crm: true })
+  const fixture = await createSalesFixture(api, caseRecord, userId, { crm: true, dualRole: true })
   const { scheme } = salesPriceFixtureBodies(fixture)
   await withSalesPriceFixture(api, scheme, caseRecord, async (schemeId) => {
     const publish = (price) => api.postBusiness('/erp/price-scheme/publish',
@@ -1761,30 +2044,157 @@ async function runPriceSalesWrite(context, api, userId) {
     const order = await createOwnedSalesOrder(api, fixture, 'NORMAL', caseRecord)
     assertSalesPriceSnapshot(order.items[0], inquiry, caseRecord, '销售订单完整取价快照')
     const snapshot = salesPriceSnapshot(order.items[0])
-    const contract = salesId(await api.postBusiness('/crm/contract/create', {
-      name: fixture.tag, customerId: fixture.customerId, ownerUserId: userId, orderDate: salesTime(),
-      discountPercent: 0, remark: fixture.tag, products: [{
-        productId: fixture.material.id, productPrice: 88.8, contractPrice: 88.8, count: 2 }]
-    }), '创建专属价格合同')
-    owned(caseRecord, 'price-contract', contract)
-    const contractBefore = await salesDetail(api, `/crm/contract/get?id=${contract}`)
-    salesFact(caseRecord, '价格合同、订单与方案使用同一 CRM 客户映射的专属公共客商',
-      sameId(contractBefore.customerId, fixture.customerId) && sameId(order.customerId, fixture.partnerId),
-      `crmCustomerId=${fixture.customerId}, partnerId=${fixture.partnerId}, contractId=${contract}, orderId=${order.id}`)
-    assertSalesPriceSnapshot(contractBefore.products?.[0], inquiry, caseRecord, 'CRM 合同完整取价快照')
-    await publish(99.9)
-    const updatedInquiry = salesData(await api.postBusiness('/erp/price-scheme/inquiry',
-      salesPriceFixtureBodies(fixture, schemeId).inquiry), '销售新版本取价')
-    const history = await salesDetail(api, `/erp/sale-order/get?id=${order.id}`)
-    const contractAfter = await salesDetail(api, `/crm/contract/get?id=${contract}`)
-    salesFact(caseRecord, '发布新版本实际取价改变且历史订单/合同快照不变',
-      Number(updatedInquiry.price) === 99.9 && !sameId(updatedInquiry.versionId, versionId) &&
-      JSON.stringify(salesPriceSnapshot(history.items[0])) === JSON.stringify(snapshot) &&
-      JSON.stringify(salesPriceSnapshot(contractAfter.products[0])) ===
-      JSON.stringify(salesPriceSnapshot(contractBefore.products[0])) &&
-      Number(history.items[0].productPrice) === 88.8, `orderId=${order.id}, contractId=${contract}, oldVersion=${versionId}, newVersion=${updatedInquiry.versionId}`)
-    salesCatalogEvidence(caseId, caseRecord, [0, 1, 4, 5])
-    caseRecord.notes.push('采购订单、CRM 报价、已审核历史订单和取价不可用/未命中异常未冒称完整通过')
+    const purchaseBodies = salesPurchasePriceFixtureBodies(fixture)
+    await withSalesPriceFixture(api, purchaseBodies.scheme, caseRecord, async (purchaseSchemeId) => {
+      const purchaseFixture = salesPurchasePriceFixtureBodies(fixture, purchaseSchemeId)
+      const purchaseVersionId = salesId(
+        await api.postBusiness('/erp/price-scheme/publish', purchaseFixture.publish),
+        '发布专属采购价版本')
+      owned(caseRecord, 'purchase-price-scheme', purchaseSchemeId, {
+        code: purchaseFixture.scheme.code, versionId: purchaseVersionId
+      })
+      const purchaseInquiry = salesData(await api.postBusiness('/erp/price-scheme/inquiry', {
+        ...purchaseFixture.inquiry, quantity: 2
+      }), '统一采购取价')
+      salesFact(caseRecord, '专属采购取价实际命中方案/版本/价格行/依据/时间',
+        purchaseInquiry.matched === true && sameId(purchaseInquiry.schemeId, purchaseSchemeId) &&
+        sameId(purchaseInquiry.versionId, purchaseVersionId) && stableId(purchaseInquiry.ruleId) &&
+        purchaseInquiry.hitSource === 'PARTNER' && purchaseInquiry.calculatedAt != null &&
+        Number(purchaseInquiry.price) === 44.4, JSON.stringify(purchaseInquiry))
+      const purchaseOrderId = salesId(await api.postBusiness('/erp/purchase-order/create',
+        salesPurchaseOrderBody(fixture, 44.4)), '创建专属采购订单')
+      owned(caseRecord, 'purchase-order', purchaseOrderId, { tag: fixture.tag })
+      const purchaseOrder = await salesDetail(api,
+        `/erp/purchase-order/get?id=${purchaseOrderId}`)
+      assertSalesPriceSnapshot(purchaseOrder.items?.[0], purchaseInquiry, caseRecord,
+        '采购订单完整取价快照')
+      const purchaseSnapshot = salesPriceSnapshot(purchaseOrder.items?.[0])
+
+      const types = await salesArray(api, '/crm/business-status/type-simple-list')
+      if (!types[0]?.id) throw new Error('BLOCKED: 价格链缺少可用商机状态组')
+      const businessId = salesId(await api.postBusiness('/crm/business/create', {
+        name: `${fixture.tag}-QUOTE`, customerId: fixture.customerId, ownerUserId: userId,
+        statusTypeId: types[0].id, discountPercent: 0, quoteQualificationStatus: '已通过',
+        remark: fixture.tag,
+        products: [{
+          productId: String(fixture.material.id), productPrice: 88.8,
+          businessPrice: 88.8, count: 2
+        }]
+      }), '创建报价资格已通过的专属商机')
+      owned(caseRecord, 'price-quote-business', businessId, { tag: fixture.tag })
+      const quoteId = salesId(await api.postBusiness('/crm/quote/create', {
+        subject: `${fixture.tag}-QUOTE`, customerId: fixture.customerId,
+        businessId, quoteMethod: '正式报价', quoteDate: salesDate(),
+        ownerUserId: userId, remark: fixture.tag,
+        products: [{
+          productId: String(fixture.material.id), productName: fixture.material.name,
+          unitName: fixture.material.unitName, quantity: 2, unitPrice: 77.7,
+          discountPercent: 100, taxRate: 0, remark: fixture.tag
+        }]
+      }), '创建专属 CRM 报价')
+      owned(caseRecord, 'price-quote', quoteId, { tag: fixture.tag, businessId })
+      const quote = await salesQuoteSnapshot(api, caseRecord, quoteId)
+      const quoteProduct = quote.currentVersion?.products?.[0]
+      assertSalesPriceSnapshot(quoteProduct, inquiry, caseRecord, 'CRM 报价完整取价快照')
+      salesFact(caseRecord, 'CRM 报价取价快照不覆盖人工录入单价',
+        Number(quoteProduct.unitPrice) === 77.7,
+        `quoteId=${quoteId}, unitPrice=${quoteProduct?.unitPrice}`)
+      const quoteSnapshot = salesPriceSnapshot(quoteProduct)
+
+      const contract = salesId(await api.postBusiness('/crm/contract/create', {
+        name: fixture.tag, customerId: fixture.customerId, businessId,
+        sourceType: 10, ownerUserId: userId, orderDate: salesTime(),
+        discountPercent: 0, remark: fixture.tag,
+        products: [{
+          productId: fixture.material.id, productPrice: 88.8,
+          contractPrice: 88.8, count: 2
+        }]
+      }), '创建专属价格合同')
+      owned(caseRecord, 'price-contract', contract)
+      const contractBefore = await salesDetail(api, `/crm/contract/get?id=${contract}`)
+      assertSalesPriceSnapshot(contractBefore.products?.[0], inquiry, caseRecord,
+        'CRM 合同完整取价快照')
+      salesFact(caseRecord, '价格合同、订单与方案使用同一 CRM 客户映射的专属公共客商',
+        sameId(contractBefore.customerId, fixture.customerId) && sameId(order.customerId, fixture.partnerId),
+        `crmCustomerId=${fixture.customerId}, partnerId=${fixture.partnerId}, contractId=${contract}, orderId=${order.id}`)
+
+      await publish(99.9)
+      const updatedInquiry = salesData(await api.postBusiness('/erp/price-scheme/inquiry',
+        salesPriceFixtureBodies(fixture, schemeId).inquiry), '销售新版本取价')
+      const history = await salesDetail(api, `/erp/sale-order/get?id=${order.id}`)
+      const contractAfter = await salesDetail(api, `/crm/contract/get?id=${contract}`)
+      const purchaseHistory = await salesDetail(api,
+        `/erp/purchase-order/get?id=${purchaseOrderId}`)
+      const quoteAfter = await salesQuoteSnapshot(api, caseRecord, quoteId)
+      salesFact(caseRecord, '发布新版本实际取价改变且历史订单/采购订单/报价/合同快照不变',
+        Number(updatedInquiry.price) === 99.9 && !sameId(updatedInquiry.versionId, versionId) &&
+        JSON.stringify(salesPriceSnapshot(history.items[0])) === JSON.stringify(snapshot) &&
+        JSON.stringify(salesPriceSnapshot(purchaseHistory.items[0])) === JSON.stringify(purchaseSnapshot) &&
+        JSON.stringify(salesPriceSnapshot(quoteAfter.currentVersion?.products?.[0])) ===
+        JSON.stringify(quoteSnapshot) &&
+        JSON.stringify(salesPriceSnapshot(contractAfter.products[0])) ===
+        JSON.stringify(salesPriceSnapshot(contractBefore.products[0])) &&
+        Number(history.items[0].productPrice) === 88.8,
+        `orderId=${order.id}, purchaseOrderId=${purchaseOrderId}, quoteId=${quoteId}, ` +
+        `contractId=${contract}, oldVersion=${versionId}, newVersion=${updatedInquiry.versionId}`)
+
+      const missInquiry = salesData(await api.postBusiness('/erp/price-scheme/inquiry', {
+        ...purchaseFixture.inquiry, quantity: 101
+      }), '采购未命中取价')
+      salesFact(caseRecord, '采购未命中返回空快照且不伪造规则',
+        missInquiry.matched === false && missInquiry.schemeId == null &&
+        missInquiry.versionId == null && missInquiry.ruleId == null,
+        JSON.stringify(missInquiry))
+      const manualPrice = 55.5
+      const manualOrderId = salesId(await api.postBusiness('/erp/purchase-order/create',
+        salesPurchaseOrderBody(fixture, manualPrice, 101)), '创建未命中手工价采购订单')
+      owned(caseRecord, 'purchase-order-manual-price', manualOrderId, { tag: fixture.tag })
+      const manualOrder = await salesDetail(api,
+        `/erp/purchase-order/get?id=${manualOrderId}`)
+      salesFact(caseRecord, '采购未命中时保留人工录入手工价且不写空规则 ID',
+        Number(manualOrder.items?.[0]?.productPrice) === manualPrice &&
+        manualOrder.items?.[0]?.priceSchemeId == null &&
+        manualOrder.items?.[0]?.priceVersionId == null &&
+        manualOrder.items?.[0]?.priceRuleId == null,
+        JSON.stringify(salesPriceSnapshot(manualOrder.items?.[0])))
+
+      const noPriceResponse = await api.postBusiness('/erp/purchase-order/create',
+        salesPurchaseOrderBody(fixture, 0, 101, { includePrice: false }))
+      if (isBusinessSuccess(noPriceResponse) && stableId(noPriceResponse.data)) {
+        const noPriceOrder = await salesDetail(api,
+          `/erp/purchase-order/get?id=${noPriceResponse.data}`)
+        const storedPrice = noPriceOrder.items?.[0]?.productPrice
+        const noZero = !finiteNumber(storedPrice) || Number(storedPrice) !== 0
+        caseRecord.checks.push({
+          name: '采购未命中且未手录单价时不静默写入 0 价',
+          passed: noZero,
+          details: `purchaseOrderId=${noPriceResponse.data}, productPrice=${String(storedPrice)}`
+        })
+        if (!noZero) {
+          caseRecord.notes.push(`真实产品缺陷：未命中且未手录单价时采购订单写入 0 价，purchaseOrderId=${noPriceResponse.data}`)
+        }
+      } else {
+        const message = String(noPriceResponse?.msg || noPriceResponse?.message || '')
+        const rejected = objectRow(noPriceResponse) && Number.isInteger(noPriceResponse.code) &&
+          !isBusinessSuccess(noPriceResponse) && noPriceResponse.code !== 500 &&
+          !/SQL|Exception|系统异常|服务器异常/i.test(message)
+        caseRecord.checks.push({
+          name: '采购未命中且未手录单价时不静默写入 0 价',
+          passed: rejected,
+          details: `code=${noPriceResponse?.code}, message=${message.slice(0, 240)}`
+        })
+      }
+
+      await salesSql(caseRecord, 'price-snapshots-persisted',
+        `SELECT 'sale',price_scheme_id,price_version_id,price_rule_id FROM erp_sale_order_item
+           WHERE tenant_id=1 AND deleted=0 AND order_id=${sqlId(order.id)};
+         SELECT 'purchase',price_scheme_id,price_version_id,price_rule_id FROM erp_purchase_order_item
+           WHERE tenant_id=1 AND deleted=0 AND order_id=${sqlId(purchaseOrderId)};
+         SELECT 'quote',price_scheme_id,price_version_id,price_rule_id,unit_price FROM crm_quote_product
+           WHERE tenant_id=1 AND deleted=0 AND quote_version_id=${sqlId(
+    quote.currentVersion?.id)}`)
+      salesCatalogEvidence(caseId, caseRecord, [0, 1, 2, 3, 4, 5])
+    })
   })
 }
 
@@ -1853,14 +2263,14 @@ async function runTypeSalesWrite(context, api, userId) {
       contractTarget: 177.6, receivableTarget: 177.6 }] }
   const planId = salesId(await api.postBusiness('/crm/sales-plan/create', request), '创建专属类型销售计划')
   owned(caseRecord, 'sales-plan', planId)
-  const plan = await salesDetail(api, `/crm/sales-plan/get?id=${planId}`)
+  const plan = await salesPlanSnapshot(api, caseRecord, planId)
   salesFact(caseRecord, '销售计划正式保存计划类型和目标快照', plan.planTypeCode === planType.value &&
     Number(plan.contractTarget) === 177.6 && plan.items?.length === 1 &&
     String(plan.items[0].targetId) === String(fixture.material.id),
     `planId=${planId}, planTypeCode=${plan.planTypeCode}, contractTarget=${plan.contractTarget}`)
   for (const [action, status] of [['submit', '待审批'], ['publish', '已发布'], ['start', '执行中']]) {
     await api.putBusiness(`/crm/sales-plan/${action}?id=${planId}`)
-    const next = await salesDetail(api, `/crm/sales-plan/get?id=${planId}`)
+    const next = await salesPlanSnapshot(api, caseRecord, planId)
     salesFact(caseRecord, `销售计划正式${action}状态准确`, next.status === status &&
       next.planTypeCode === planType.value, `planId=${planId}, status=${next.status}, planTypeCode=${next.planTypeCode}`)
   }
@@ -1871,7 +2281,7 @@ async function runTypeSalesWrite(context, api, userId) {
     { ...request, name: `${fixture.tag}-REJECTED` }, /字典|启用|不存在|禁用|停用/,
     caseRecord, '本轮停用计划类型拒绝新计划')
   const historicalOrder = await salesDetail(api, `/erp/sale-order/get?id=${order.id}`)
-  const historicalPlan = await salesDetail(api, `/crm/sales-plan/get?id=${planId}`)
+  const historicalPlan = await salesPlanSnapshot(api, caseRecord, planId)
   salesFact(caseRecord, '停用专属类型后历史订单/计划仍可查询且稳定编码和金额快照不变',
     historicalOrder.saleTypeCode === saleType.value && historicalPlan.planTypeCode === planType.value &&
     Number(historicalOrder.totalPrice) === Number(order.totalPrice) &&
@@ -1890,6 +2300,26 @@ async function runTypeSalesWrite(context, api, userId) {
       if (Number(row.status) !== 1) await disableSalesTypeDictionary(api, caseRecord, dictionary)
     }
   }
+}
+
+export async function salesPlanSnapshot(api, caseRecord, planId) {
+  if (!stableId(planId)) throw new Error('销售计划详情缺少可精确表示的稳定 ID')
+  const data = await salesDetail(api, `/crm/sales-plan/get?id=${encodeURIComponent(planId)}`)
+  salesFact(caseRecord, '销售计划正式详情结构和身份准确',
+    sameId(data.id, planId) && Array.isArray(data.items) && data.items.every(objectRow),
+    `planId=${planId}, responseId=${data.id}`)
+  return data
+}
+
+export async function salesQuoteSnapshot(api, caseRecord, quoteId) {
+  if (!stableId(quoteId)) throw new Error('CRM 报价详情缺少可精确表示的稳定 ID')
+  const data = await salesDetail(api, `/crm/quote/get?id=${encodeURIComponent(quoteId)}`)
+  salesFact(caseRecord, 'CRM 报价正式详情结构和身份准确',
+    sameId(data.id, quoteId) && objectRow(data.currentVersion) &&
+    stableId(data.currentVersion.id) && Array.isArray(data.currentVersion.products) &&
+    data.currentVersion.products.every(objectRow),
+    `quoteId=${quoteId}, responseId=${data.id}, versionId=${data.currentVersion?.id}`)
+  return data
 }
 
 export const runCase = async (context, dependencies = {}) => {

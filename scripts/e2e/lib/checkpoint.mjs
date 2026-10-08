@@ -29,6 +29,7 @@ export function checkpointScope ({ environment, catalog, implementation }) {
 export function resumableCases (completedCases, definitions) {
   return new Set((Array.isArray(completedCases) ? completedCases : []).filter((id) => {
     const definition = definitions.get(id)
-    return definition && (definition.status || 'READY') === 'READY'
+    return definition && (definition.status || 'READY') === 'READY' &&
+      !definition.acceptanceGaps?.length
   }))
 }

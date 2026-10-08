@@ -1,0 +1,76 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { createApiClient, serverApiFailures } from '../lib/api.mjs'
+import { caseRuntimeErrors } from '../runner.mjs'
+
+test('service errors cannot be confused with explicit business rejections', () => {
+  const failures = [
+    { status: 500, code: 0 }, { status: 503 },
+    { status: 200, code: 500 }, { status: 200, code: '503' },
+    { networkError: true }, { responseError: true }
+  ]
+  assert.deepEqual(serverApiFailures([
+    { status: 200, code: 0 }, { status: 200, code: 200 },
+    { status: 200, code: 1005000001 }, { status: 403, code: 403 },
+    ...failures
+  ]), failures)
+})
+
+async function withFetch (fetch, operation) {
+  const original = globalThis.fetch
+  try {
+    globalThis.fetch = fetch
+    return await operation()
+  } finally {
+    globalThis.fetch = original
+  }
+}
+
+test('caught HTTP and business 500 responses remain in the per-case error evidence', async () => {
+  for (const status of [200, 500]) {
+    const record = { api: [] }
+    const api = createApiClient({ record })
+    await withFetch(async () => new Response(JSON.stringify({
+      code: 500, msg: 'system error'
+    }), { status }), async () => {
+      await assert.rejects(() => api.getBusiness('/unit-only'), /500/)
+    })
+    assert.equal(serverApiFailures(record.api).length, 1)
+  }
+})
+
+test('caught request and download transport errors remain in the evidence', async () => {
+  for (const method of ['get', 'download']) {
+    const record = { api: [] }
+    const api = createApiClient({ record })
+    await withFetch(async () => { throw new Error('unit-only connection failure') }, async () => {
+      await assert.rejects(() => api[method]('/unit-only'), /connection failure/)
+    })
+    assert.equal(record.api[0].networkError, true)
+    assert.equal(serverApiFailures(record.api).length, 1)
+  }
+})
+
+test('success and permission-denied responses are not classified as service failures', async () => {
+  for (const code of [0, 403, 1005000001]) {
+    const record = { api: [] }
+    await withFetch(async () => new Response(JSON.stringify({ code })), async () => {
+      const result = await createApiClient({ record }).get('/unit-only')
+      assert.equal(result.code, code)
+    })
+    assert.deepEqual(serverApiFailures(record.api), [])
+  }
+})
+
+test('the runner counts only current-case Node errors, including errors caught by a suite', () => {
+  const currentError = { method: 'GET', pathname: '/unit-current', status: 200, code: 500 }
+  const record = {
+    api: [{ status: 500 }, { status: 200, code: 0 }, currentError],
+    consoleErrors: [], pageErrors: [], failedApiResponses: [], requestFailures: []
+  }
+  const errors = caseRuntimeErrors(record, {
+    console: 0, page: 0, api: 0, request: 0, apiRequests: 1
+  })
+  assert.deepEqual(errors.nodeApi, [currentError])
+  assert.equal(Object.values(errors).every((items) => items.length === 0), false)
+})
