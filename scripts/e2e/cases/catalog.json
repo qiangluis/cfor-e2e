@@ -1295,7 +1295,7 @@
         {
           "id": "PROC-010",
           "title": "供应商门户独立认证与令牌隔离",
-          "status": "DESIGNED",
+          "status": "READY",
           "preconditions": [
             "独立供应商门户前端登录页与邀请激活页已完成",
             "当前租户已启用供应商门户并存在 ENABLED 的供应商门户测试账号"
@@ -3430,7 +3430,7 @@
         {
           "id": "FMS-003",
           "title": "人工确认、草稿和正式过账边界",
-          "status": "DESIGNED",
+          "status": "READY",
           "preconditions": ["FMS-002 PASS"],
           "routes": ["/fms/voucher-draft", "/fms/ledger"],
           "assertions": [
@@ -3446,7 +3446,7 @@
         {
           "id": "FMS-004",
           "title": "收款到账和付款出账事件",
-          "status": "DESIGNED",
+          "status": "READY",
           "preconditions": ["ERP 收款/付款现有链已通过", "outbox 事件已产生"],
           "routes": ["/finance/finReceipt", "/finance/finPayment", "/fms/event-inbox"],
           "assertions": [
@@ -4313,7 +4313,7 @@
         {
           "id": "COST-034",
           "title": "PB-077 取数/试算/确认/发布阶段规则通过记录",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": [
             "存在已试算或已发布的成本期间",
             "账号具备 cost:rule-hit:query 权限"
@@ -4575,7 +4575,8 @@
         {
           "id": "IOT-008",
           "title": "Modbus 点位版本由服务端维护且按协议变更递增",
-          "status": "READY",
+          "status": "BLOCKED",
+          "registration": "Modbus 设备本轮不纳入范围（用户确认暂不测试）。待接入真实 Modbus 协议设备后复测点位版本 point_version 递增、状态开关不递增与点位版本列展示。",
           "preconditions": [
             "已登录且具备 iot:device-modbus-point:* 与 iot:thing-model:query 权限",
             "当前租户存在 Modbus 协议设备及其可用物模型属性"
@@ -5136,6 +5137,7 @@
           "id": "INT-002",
           "title": "实例、映射、值映射、工作流和同步任务",
           "status": "BLOCKED",
+          "registration": "外部集成实例、映射、值映射与同步任务依赖真实外部系统连接和凭据，由用户配置后复测。配置入口：设置 → 插件中心 → 集成设置（前端路由 /settings/plugin-settings）。",
           "preconditions": ["用户提供真实外部连接和测试凭据"],
           "routes": [
             "/settings/integration/instance",

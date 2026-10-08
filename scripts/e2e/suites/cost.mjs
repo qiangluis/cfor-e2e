@@ -2,6 +2,11 @@ import { createApiClient } from '../lib/api.mjs'
 import { isBusinessSuccess, nonEmpty } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { prepareCostModelFixture, createLockedCostModelFixture } from '../fixtures/cost-model.mjs'
+import {
+  COST_SCENARIO_BY_CASE,
+  loadCostScenario,
+  prepareCostScenario
+} from '../fixtures/cost-scenario.mjs'
 import { runReadOnlySql } from '../lib/db.mjs'
 
 export const cases = ['COST-001', 'COST-002', 'COST-003', 'COST-004', 'COST-005', 'COST-006', 'COST-007', 'COST-008', 'COST-009', 'COST-010', 'COST-011', 'COST-012', 'COST-013', 'COST-014', 'COST-015', 'COST-016', 'COST-017', 'COST-018', 'COST-019', 'COST-020', 'COST-021', 'COST-022', 'COST-023', 'COST-024', 'COST-025', 'COST-026', 'COST-027', 'COST-028', 'COST-029', 'COST-030', 'COST-031', 'COST-032', 'COST-033', 'COST-034']
@@ -76,6 +81,76 @@ const recordCostDatabase = async ({ modelVersionId, caseRecord }) => {
 }
 
 export const hasDeadLetterSamples = (rows) => Array.isArray(rows) && rows.length > 0
+
+// 成本页面草稿状态的正式后端键名，与前端 cost-management 常量保持一致。
+const COST_WORKSPACE_STATE_KEYS = {
+  model: 'cost-model-base-config-20260825-clean-v2',
+  activePeriod: 'cost-active-period-20260825-clean-v2',
+  openingWipGate: 'cost-opening-wip-formal-gates-20260825-clean-v2'
+}
+
+const readCostWorkspaceState = async (api, stateKey) =>
+  responseData(
+    await api.getBusiness(
+      `/cost/workspace-states/get?accountingOrgId=${accountingOrgId}&stateKey=${encodeURIComponent(stateKey)}`
+    )
+  )
+
+const saveCostWorkspaceState = async (api, stateKey, payload, version) =>
+  responseData(
+    await api.putBusiness('/cost/workspace-states/save', {
+      accountingOrgId,
+      stateKey,
+      payloadJson: JSON.stringify(payload),
+      version
+    })
+  )
+
+/**
+ * 上期结转的口径说明只在"上期在制"阶段渲染，而该阶段由页面草稿状态派生。
+ *
+ * <p>这里按正式 workspace-state 契约，临时把当前模型标记为已产生首次正式成本并把
+ * 当前期间切到下一个月，断言结束后按原 payload 恢复，避免污染用户页面状态。</p>
+ */
+const withCarryoverStage = async (api, action) => {
+  const modelState = await readCostWorkspaceState(api, COST_WORKSPACE_STATE_KEYS.model)
+  const model = JSON.parse(modelState?.payloadJson || '{}')
+  const enterpriseType = model.enterpriseType || '生产型'
+  const modelKey = `${enterpriseType}|${model.version || 'V1'}`
+
+  const gateState = await readCostWorkspaceState(api, COST_WORKSPACE_STATE_KEYS.openingWipGate)
+  const gatePayload = JSON.parse(gateState?.payloadJson || '{}')
+  const activeState = await readCostWorkspaceState(api, COST_WORKSPACE_STATE_KEYS.activePeriod)
+  const activePayload = JSON.parse(activeState?.payloadJson || '{}')
+
+  const savedGate = await saveCostWorkspaceState(api, COST_WORKSPACE_STATE_KEYS.openingWipGate, {
+    ...gatePayload,
+    [modelKey]: {
+      firstFormalPeriod: '2000-01',
+      firstFormalBatchNo: 'E2E-CARRYOVER-STAGE',
+      state: '已正式写入',
+      lockedAt: '',
+      ...(gatePayload[modelKey] || {})
+    }
+  }, gateState?.version ?? 0)
+  const savedActive = await saveCostWorkspaceState(api, COST_WORKSPACE_STATE_KEYS.activePeriod, {
+    ...activePayload,
+    [enterpriseType]: '2000-02'
+  }, activeState?.version ?? 0)
+
+  try {
+    return await action()
+  } finally {
+    await saveCostWorkspaceState(
+      api, COST_WORKSPACE_STATE_KEYS.openingWipGate,
+      gatePayload, savedGate?.version ?? 0
+    ).catch(() => {})
+    await saveCostWorkspaceState(
+      api, COST_WORKSPACE_STATE_KEYS.activePeriod,
+      activePayload, savedActive?.version ?? 0
+    ).catch(() => {})
+  }
+}
 
 export const costArrayData = (payload, label) => {
   if (!isBusinessSuccess(payload) || !Array.isArray(payload.data)) {
@@ -306,6 +381,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       ? `${model.id}:${model.versionNo}:${model.status}`
       : '当前租户暂无成本模型，已验证空列表契约'
   })
+
+  // 正式报表 / 采购来源刷新 / 试算职责分离 / 上期结转都需要真实写侧事实，
+  // 因此先按案例语义建立专属远期期间的夹具，再进入只读断言。
+  const scenarioKind = COST_SCENARIO_BY_CASE[caseId]
+  if (scenarioKind && !loadCostScenario(caseRecord)) {
+    await (dependencies.prepareCostScenario || prepareCostScenario)({
+      api, record, caseRecord, scenario: scenarioKind
+    })
+  }
 
   if (PERIOD_DEPENDENT_CASES.has(caseId)) {
     const periodsResult = await api.getBusiness(
@@ -632,10 +716,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-006') {
     // PB-424～PB-443：统一正式成本分析/结果报表接口。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const report = await api.getBusiness(`/cost/reports/dimension-cost-report/${period.id}`)
       caseRecord.checks.push({
@@ -799,10 +880,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-010') {
     // 采购入库与采购退回共用 PURCHASE 快照，退回以负数参与净额计算。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const refreshed = await api.request(
         'POST',
@@ -870,10 +948,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-011') {
     // 采购到岸费用复用 ERP 应付明细 freight，并以采购费用分项进入同一 PURCHASE 草稿。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const refreshed = await api.request(
         'POST',
@@ -914,10 +989,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-012') {
     // PB-443：采购成本表从正式发布来源显示采购订单口径的发票价格状态与价差。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const report = await api.getBusiness(`/cost/reports/purchase-cost-report/${period.id}`)
       const rows = report?.data?.rows || []
@@ -1009,10 +1081,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-014') {
     // PB-428：自产与外购比较只读已发布事实，约束事实缺失时必须返回不可比较。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const report = await api.getBusiness(`/cost/reports/make-buy/${period.id}`)
       const rows = report?.data?.rows || []
@@ -1344,10 +1413,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-020') {
     // PB-420/421：采购/委外应付结算状态只作为来源追溯快照，不改变成本金额。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const refreshed = await api.request(
         'POST',
@@ -1392,10 +1458,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'COST-021') {
     // PB-420/421：付款与核销冲销轨迹仅作为来源追溯快照，成本确认金额保持不变。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
+    const period = loadCostScenario(caseRecord)?.period
     if (period?.id) {
       const refreshed = await api.request(
         'POST',
@@ -1453,7 +1516,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
     )
     const periods = periodsResult?.data?.list || []
-    const candidate = periods.find((row) => nonEmpty(row.id))
+    // 反月结重开的"原因必填"门禁在发布批次校验之后执行，因此必须先拿到真实的已发布期间。
+    const candidate = loadCostScenario(caseRecord)?.period || periods.find((row) => nonEmpty(row.id))
     const missingReason = candidate
       ? await api.request('POST', `/cost/periods/${candidate.id}/publications/reopen`, {})
       : null
@@ -1464,7 +1528,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         missingReason?.code !== undefined &&
         missingReason.code !== 0 &&
         missingReason.code !== 500 &&
-        String(missingReason.msg || missingReason.message || '').includes('反月结重开原因'),
+        /(反月结重开原因|反月结原因)/.test(
+          String(missingReason.msg || missingReason.message || '')
+        ),
       details: candidate
         ? `code=${missingReason?.code} msg=${missingReason?.msg || missingReason?.message || ''}`
         : '当前核算组织暂无成本期间，未执行反月结接口校验'
@@ -1508,9 +1574,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
     )
     const periods = periodsResult?.data?.list || []
-    const pending = periods.find((row) => row.status === 'TRIAL_PENDING' && nonEmpty(row.currentTrialId))
+    // 夹具期间的试算由当前登录人（admin）执行，用于验证"同人复核"必须被阻断。
+    const scenarioPeriod = loadCostScenario(caseRecord)?.period
+    const pending =
+      (scenarioPeriod?.status === 'TRIAL_PENDING' && scenarioPeriod.currentTrialId
+        ? scenarioPeriod
+        : null) ||
+      periods.find((row) => row.status === 'TRIAL_PENDING' && nonEmpty(row.currentTrialId))
     if (pending) {
-      const trial = await api.getBusiness(`/cost/periods/${pending.id}/trials/current`)
+      // getBusiness 返回 {code,data,msg}，试算事实在 data 内。
+      const trial = responseData(
+        await api.getBusiness(`/cost/periods/${pending.id}/trials/current`)
+      )
       caseRecord.checks.push({
         name: '当前试算返回执行人标识以支持职责分离校验',
         passed: nonEmpty(trial?.creatorId),
@@ -1566,7 +1641,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
     )
     const periods = periodsResult?.data?.list || []
-    const accounting = periods.filter((row) => row.status === 'ACCOUNTING')
+    // 夹具先造出"上一已发布期间 + 当前核算中期间"，因此优先用它派生 CARRYOVER。
+    const scenarioPeriod = loadCostScenario(caseRecord)?.period
+    const accounting = [
+      ...(scenarioPeriod?.status === 'ACCOUNTING' ? [scenarioPeriod] : []),
+      ...periods.filter((row) => row.status === 'ACCOUNTING' && row.id !== scenarioPeriod?.id)
+    ]
     let carriedSample = null
     let blockedSample = null
     for (const period of accounting) {
@@ -1576,6 +1656,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       )
       if (response?.code === 0) {
         carriedSample = { period, rows: response?.data || [] }
+        // 首条可用样本即本轮证据；继续遍历会覆盖成更早的共享期间，证据不再属于本轮夹具。
+        break
       } else if (blockedSample === null) {
         blockedSample = { period, response }
       }
@@ -1605,43 +1687,50 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         : '当前核算组织所有核算中期间均可派生结转，未触发缺失上期门禁'
     })
     if (carriedSample) {
-      const listed = await api.getBusiness(
-        `/cost/periods/${carriedSample.period.id}/opening-wip?stage=CARRYOVER`
+      // getBusiness 返回 {code,data,msg}，结转明细数组在 data 内。
+      const listed = responseData(
+        await api.getBusiness(
+          `/cost/periods/${carriedSample.period.id}/opening-wip?stage=CARRYOVER`
+        )
       )
       caseRecord.checks.push({
         name: '上期结转明细可在正式接口按 CARRYOVER 阶段查询',
         passed:
-          (listed?.length || 0) > 0 &&
+          Array.isArray(listed) &&
+          listed.length > 0 &&
           listed.every((row) => row.stage === 'CARRYOVER' && nonEmpty(row.sourceRef)),
-        details: `stage=CARRYOVER rows=${listed?.length || 0}`
+        details: `stage=CARRYOVER rows=${Array.isArray(listed) ? listed.length : 'n/a'}`
       })
     }
-    await openRoute(page, '/cost-management/monthly/opening-wip', {
-      readySelector: '.opening-wip-workspace'
+    // 口径说明只在"上期在制"阶段渲染，需要临时把页面草稿状态切到该阶段再断言。
+    await withCarryoverStage(api, async () => {
+      await openRoute(page, '/cost-management/monthly/opening-wip', {
+        readySelector: '.opening-wip-workspace'
+      })
+      caseRecord.checks.push({
+        name: '成本工作台可打开上期结转入口',
+        passed: (await page.getByText('期初', { exact: false }).count()) > 0,
+        details: '真实 Chrome 成本工作台期初/上期在制入口'
+      })
+      // 口径说明挂在悬浮提示里，逐个小问号 hover，直到目标文案出现。
+      const carryoverRuleTriggers = page.locator(
+        '.opening-wip-workspace .el-tooltip__trigger'
+      )
+      const carryoverTriggerCount = await carryoverRuleTriggers.count()
+      for (let index = 0; index < carryoverTriggerCount; index++) {
+        await carryoverRuleTriggers.nth(index).hover().catch(() => {})
+        await page.waitForTimeout(250)
+        if ((await page.getByText('投入结构拆分', { exact: false }).count()) > 0) break
+      }
+      caseRecord.checks.push({
+        name: '上期结转页面说明料工费拆分和数量人工确认口径',
+        passed:
+          (await page.getByText('投入结构拆分', { exact: false }).count()) > 0 ||
+          (await page.getByText('数量仍需人工确认', { exact: false }).count()) > 0,
+        details: '真实 Chrome 上期结转口径提示'
+      })
+      await saveScreenshot(page, outputDir, 'cost-opening-wip-carry-forward', record)
     })
-    caseRecord.checks.push({
-      name: '成本工作台可打开上期结转入口',
-      passed: (await page.getByText('期初', { exact: false }).count()) > 0,
-      details: '真实 Chrome 成本工作台期初/上期在制入口'
-    })
-    // 口径说明挂在悬浮提示里，逐个小问号 hover，直到目标文案出现。
-    const carryoverRuleTriggers = page.locator(
-      '.opening-wip-workspace .el-tooltip__trigger'
-    )
-    const carryoverTriggerCount = await carryoverRuleTriggers.count()
-    for (let index = 0; index < carryoverTriggerCount; index++) {
-      await carryoverRuleTriggers.nth(index).hover().catch(() => {})
-      await page.waitForTimeout(250)
-      if ((await page.getByText('投入结构拆分', { exact: false }).count()) > 0) break
-    }
-    caseRecord.checks.push({
-      name: '上期结转页面说明料工费拆分和数量人工确认口径',
-      passed:
-        (await page.getByText('投入结构拆分', { exact: false }).count()) > 0 ||
-        (await page.getByText('数量仍需人工确认', { exact: false }).count()) > 0,
-      details: '真实 Chrome 上期结转口径提示'
-    })
-    await saveScreenshot(page, outputDir, 'cost-opening-wip-carry-forward', record)
     caseRecord.evidence.push(
       '上期结转后端派生契约、CARRYOVER 阶段查询、料工费拆分提示与成本工作台截图'
     )
@@ -1654,6 +1743,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     )
     const periods = periodsResult?.data?.list || []
     const candidate =
+      loadCostScenario(caseRecord)?.period ||
       periods.find((row) => row.status === 'COST_PUBLISHED' && nonEmpty(row.currentPublicationId)) ||
       periods.find((row) => nonEmpty(row.currentPublicationId))
     if (candidate) {
@@ -1888,7 +1978,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
     )
     const periods = periodsResult?.data?.list || []
-    const candidate = periods.find((row) => nonEmpty(row.id))
+    // 回退入口在发布批次存在性校验之后才校验原因，因此必须使用真实已发布期间。
+    const candidate = loadCostScenario(caseRecord)?.period || periods.find((row) => nonEmpty(row.id))
     if (candidate) {
       const active = await api.request(
         'GET',
@@ -2583,6 +2674,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     )
     const periods = periodsResult?.data?.list || []
     const candidate =
+      loadCostScenario(caseRecord)?.period ||
       periods.find((row) => row.status === 'COST_PUBLISHED' && nonEmpty(row.currentPublicationId)) ||
       periods.find((row) => nonEmpty(row.currentPublicationId)) ||
       periods.find((row) => nonEmpty(row.currentTrialId))

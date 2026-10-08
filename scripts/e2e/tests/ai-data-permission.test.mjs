@@ -228,6 +228,14 @@ test('menu selection grants only read ancestors, excludes amount and requires te
   ], [...menuRows, { id: '999' }]), /unrelated/)
 })
 
+test('menu selection degrades to a registered gap when the tenant lacks the GoView report module', () => {
+  const withoutReport = menuRows.filter((row) => row.id !== '203')
+  const selected = selectAiDataMenus(withoutReport, withoutReport)
+  assert.equal(selected.reportAssignable, false)
+  assert.deepEqual(new Set(selected.base), new Set(['201', '202', '205']))
+  assert.deepEqual(selected.amountMenuIds, ['204'])
+})
+
 test('ownership checks refuse shared IDs, system roles and mismatched ownership markers', () => {
   const payload = aiDataPayload('UNITABC123')
   const fixture = { roleId: '1101', userId: '1102' }

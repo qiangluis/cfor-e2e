@@ -318,7 +318,9 @@ async function main () {
           finishCase(
             caseRecord,
             'SKIPPED',
-            `${declaredStatus}：当前没有完整可执行步骤，未伪造通过`
+            definition.registration
+              ? `${declaredStatus}：${definition.registration}`
+              : `${declaredStatus}：当前没有完整可执行步骤，未伪造通过`
           )
           record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
           continue
