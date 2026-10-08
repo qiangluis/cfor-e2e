@@ -1,5 +1,5 @@
 import { config } from '../config/index.mjs'
-import { assertBusinessSuccess } from './assertions.mjs'
+import { assertBusinessSuccess, isBusinessSuccess } from './assertions.mjs'
 import { decryptResponse, encryptRequest, ENCRYPT_HEADER } from './crypto.mjs'
 import { redact } from './redact.mjs'
 
@@ -22,11 +22,72 @@ function payloadFromText (text, response) {
   }
 }
 
+const nonBusinessCodes = new Set([200, 401, 403, 404, 405, 423, 429, 900, 901, 999])
+const systemFailureMessage = /(?:系统|服务器|服务|内部|未知)(?:发生(?:了)?)?(?:异常|错误|故障)|服务(?:暂时)?不可用|网络(?:异常|错误|故障)|连接(?:失败|超时)|Internal\s+Server\s+Error|Service\s+(?:Unavailable|Error|Exception)|(?:System|Server|Runtime|SQL|Database)\s+(?:Error|Exception)|Bad\s+Gateway|Gateway\s+Timeout|ECONN(?:REFUSED|RESET)|ETIMEDOUT|NullPointerException|SQL(?:SyntaxError)?Exception/i
+
+const responseMessages = (payload) => [payload?.msg, payload?.message]
+  .filter((message) => typeof message === 'string' && message.trim() !== '')
+
+/**
+ * A business rejection is an application-level refusal in an otherwise valid
+ * HTTP response. Transport, HTTP, authentication, and service failures stay
+ * outside this category so a negative assertion cannot hide runtime errors.
+ */
+export const isBusinessRejection = (payload) => {
+  const code = payload?.code
+  const messages = responseMessages(payload)
+  return !isBusinessSuccess(payload) &&
+    payload?.ok !== true &&
+    payload?.success !== true &&
+    Number.isSafeInteger(code) &&
+    code > 0 &&
+    !nonBusinessCodes.has(code) &&
+    !(code >= 500 && code < 600) &&
+    messages.length > 0 &&
+    !messages.some((message) => systemFailureMessage.test(message))
+}
+
+const matchesMessage = (messages, expectedMessage) => {
+  if (typeof expectedMessage === 'string') {
+    return messages.includes(expectedMessage)
+  }
+  if (expectedMessage instanceof RegExp) {
+    return messages.some((message) => {
+      expectedMessage.lastIndex = 0
+      return expectedMessage.test(message)
+    })
+  }
+  return false
+}
+
+/**
+ * Match an explicit request-level business rejection contract.
+ *
+ * `true` accepts any valid business rejection. Object contracts must specify
+ * both `code`/`codes` and `message`/`msg` for callers that need exact matching.
+ */
+export const matchesExpectedBusinessRejection = (payload, expected) => {
+  if (!isBusinessRejection(payload)) return false
+  if (expected === true) return true
+  if (!expected || typeof expected !== 'object') return false
+
+  const expectedCodes = expected.codes ?? expected.code
+  const expectedMessage = expected.message ?? expected.msg
+  const codeMatches = Array.isArray(expectedCodes)
+    ? expectedCodes.length > 0 &&
+      expectedCodes.every((code) => Number.isSafeInteger(code)) &&
+      expectedCodes.includes(payload.code)
+    : Number.isSafeInteger(expectedCodes) && payload.code === expectedCodes
+  return codeMatches && matchesMessage(responseMessages(payload), expectedMessage)
+}
+
 export const serverApiFailures = (entries = []) => entries.filter((entry) =>
-  entry.networkError ||
-  entry.responseError ||
-  Number(entry.status) >= 500 ||
-  (Number(entry.code) >= 500 && Number(entry.code) < 600)
+  !entry.expectedBusinessRejectionMatched && (
+    entry.networkError ||
+    entry.responseError ||
+    Number(entry.status) >= 500 ||
+    (Number(entry.code) >= 500 && Number(entry.code) < 600)
+  )
 )
 
 export const createApiClient = ({ token = '', tenantId = config.tenantId, check, record } = {}) => {
@@ -77,6 +138,10 @@ export const createApiClient = ({ token = '', tenantId = config.tenantId, check,
       status: response.status,
       code: payload?.code,
       bodySummary: (JSON.stringify(redact(payload)) ?? '<empty>').slice(0, 1000)
+    }
+    if (response.ok &&
+      matchesExpectedBusinessRejection(payload, options.expectedBusinessRejection)) {
+      entry.expectedBusinessRejectionMatched = true
     }
     record?.api?.push(entry)
     check?.step('api', `${method} ${pathname} -> ${response.status}`, response.ok, entry.bodySummary)

@@ -11,7 +11,10 @@ export const cases = [
   'WMS-QC-010'
 ]
 
-import { createApiClient as apiClient } from '../lib/api.mjs'
+import {
+  createApiClient as apiClient,
+  isBusinessRejection
+} from '../lib/api.mjs'
 import { isBusinessSuccess } from '../lib/assertions.mjs'
 import { login as browserLogin, openRoute as browserOpenRoute, saveScreenshot as browserScreenshot } from '../lib/browser.mjs'
 import {
@@ -73,22 +76,11 @@ const addPartial = (caseRecord, text) => {
 }
 
 // ---- dedicated config write-side helpers (only touch fixtures created in this run) ----
-const nonBusinessCodes = new Set([200, 401, 403, 404, 405, 423, 429, 900, 901, 999])
-const systemFailureMessage = /(?:系统|服务器|服务|内部|未知)(?:发生(?:了)?)?(?:异常|错误|故障)|服务(?:暂时)?不可用|网络(?:异常|错误|故障)|连接(?:失败|超时)|Internal\s+Server\s+Error|Service\s+(?:Unavailable|Error|Exception)|(?:System|Server|Runtime|SQL|Database)\s+(?:Error|Exception)|Bad\s+Gateway|Gateway\s+Timeout|ECONN(?:REFUSED|RESET)|ETIMEDOUT|NullPointerException|SQL(?:SyntaxError)?Exception/i
+const expectedRejection = { expectedBusinessRejection: true }
 
-const isBusinessRejection = (response) => {
-  const code = response?.code
-  const messages = [response?.msg, response?.message]
-    .filter((message) => typeof message === 'string' && message.trim() !== '')
-  return !isBusinessSuccess(response) && response?.ok !== true && response?.success !== true &&
-    Number.isSafeInteger(code) && code > 0 && !nonBusinessCodes.has(code) &&
-    !(code >= 500 && code < 600) && messages.length > 0 &&
-    !messages.some((message) => systemFailureMessage.test(message))
-}
-
-const rawCall = async (invoke) => {
+const rawCall = async (invoke, options = {}) => {
   // Transport failures must reach the runner unchanged, never become business rejections.
-  const response = await invoke()
+  const response = await invoke(options)
   return {
     ok: isBusinessSuccess(response),
     code: response?.code,
@@ -159,20 +151,20 @@ const runQc004WriteSide = async (api, caseRecord) => {
   const other = await prepareWmsFixture(api, caseRecord, 5)
   const token = fixture.token
 
-  const duplicateArea = await rawCall(() => api.post('/mes/wmsHouseArea/add', {
+  const duplicateArea = await rawCall((options) => api.post('/mes/wmsHouseArea/add', {
     areaCode: fixture.area.areaCode,
     areaName: `E2E-QC-004 duplicate area ${token}`,
     houseId: fixture.warehouse.id,
     isEnabled: true,
     remark: `${WMS_FIXTURE_MARK} ${token}`
-  }))
+  }, options), expectedRejection)
   caseRecord.checks.push({
     name: '同一仓库重复库区编码被后端拒绝',
     passed: isBusinessRejection(duplicateArea),
     details: `code=${duplicateArea.code}; msg=${duplicateArea.msg}`
   })
 
-  const duplicateLocation = await rawCall(() => api.post('/mes/wms-house-location/create', {
+  const duplicateLocation = await rawCall((options) => api.post('/mes/wms-house-location/create', {
     locationName: `E2E-QC-004 duplicate location ${token}`,
     locationCode: fixture.location.locationCode,
     houseId: fixture.warehouse.id,
@@ -180,7 +172,7 @@ const runQc004WriteSide = async (api, caseRecord) => {
     isEnabled: true,
     locationType: 1,
     remark: `${WMS_FIXTURE_MARK} ${token}`
-  }))
+  }, options), expectedRejection)
   caseRecord.checks.push({
     name: '同一仓库重复库位编码被后端拒绝',
     passed: isBusinessRejection(duplicateLocation),
@@ -188,14 +180,14 @@ const runQc004WriteSide = async (api, caseRecord) => {
   })
 
   const crossLocationCode = `QC4X${compactCode(token)}`
-  const crossLocation = await rawCall(() => api.post('/mes/wms-house-location/create', {
+  const crossLocation = await rawCall((options) => api.post('/mes/wms-house-location/create', {
     locationName: `E2E-QC-004 cross ${token}`,
     locationCode: crossLocationCode,
     houseId: fixture.warehouse.id,
     areaId: other.area.id,
     isEnabled: true,
     locationType: 1
-  }))
+  }, options), expectedRejection)
   caseRecord.checks.push({
     name: '库位所属库区与仓库不一致被后端拒绝',
     passed: isBusinessRejection(crossLocation),
@@ -228,26 +220,26 @@ const runQc004WriteSide = async (api, caseRecord) => {
     details: `code=${disabledWarehouse.code}; warehouseId=${disabledId || ''}`
   })
   if (disabledId) {
-    const disabledArea = await rawCall(() => api.post('/mes/wmsHouseArea/add', {
+    const disabledArea = await rawCall((options) => api.post('/mes/wmsHouseArea/add', {
       areaCode: `QC4DA${compactCode(token)}`,
       areaName: `E2E-QC-004 disabled area ${token}`,
       houseId: disabledId,
       isEnabled: true,
       remark: `${WMS_FIXTURE_MARK} ${token}`
-    }))
+    }, options), expectedRejection)
     caseRecord.checks.push({
       name: '未启用库区的仓库创建库区被后端拒绝',
       passed: isBusinessRejection(disabledArea),
       details: `code=${disabledArea.code}; msg=${disabledArea.msg}`
     })
-    const disabledLocation = await rawCall(() => api.post('/mes/wms-house-location/create', {
+    const disabledLocation = await rawCall((options) => api.post('/mes/wms-house-location/create', {
       locationName: `E2E-QC-004 disabled location ${token}`,
       locationCode: `QC4DL${compactCode(token)}`,
       houseId: disabledId,
       areaId: fixture.area.id,
       isEnabled: true,
       locationType: 1
-    }))
+    }, options), expectedRejection)
     caseRecord.checks.push({
       name: '未启用库位的仓库创建库位被后端拒绝',
       passed: isBusinessRejection(disabledLocation),
@@ -300,14 +292,16 @@ const runQc004WriteSide = async (api, caseRecord) => {
   }
 
   if (draftId) {
-    const inUseDelete = await rawCall(() => api.delete(
-      `/mes/wms-house-location/delete?id=${encodeURIComponent(fixture.location.id)}`))
+    const inUseDelete = await rawCall(
+      (options) => api.delete(`/mes/wms-house-location/delete?id=${encodeURIComponent(fixture.location.id)}`, options),
+      expectedRejection
+    )
     caseRecord.checks.push({
       name: '库位存在未完成出入库单时删除被后端拒绝',
       passed: isBusinessRejection(inUseDelete),
       details: `code=${inUseDelete.code}; msg=${inUseDelete.msg}`
     })
-    const inUseMove = await rawCall(() => api.put('/mes/wms-house-location/update', {
+    const inUseMove = await rawCall((options) => api.put('/mes/wms-house-location/update', {
       // 雪花 ID 超过 Number.MAX_SAFE_INTEGER，必须以字符串传输避免精度丢失。
       id: String(fixture.location.id),
       locationName: `E2E-QC-004 move ${token}`,
@@ -316,7 +310,7 @@ const runQc004WriteSide = async (api, caseRecord) => {
       areaId: other.area.id,
       isEnabled: true,
       locationType: 1
-    }))
+    }, options), expectedRejection)
     caseRecord.checks.push({
       name: '库位存在未完成出入库单时调整仓库/库区归属被后端拒绝',
       passed: isBusinessRejection(inUseMove),
@@ -393,10 +387,10 @@ const runQc008WriteSide = async (api, caseRecord) => {
     details: `areaEnabled=${detail.data?.areaEnabled}; locationEnabled=${detail.data?.locationEnabled}`
   })
 
-  const illegal = await rawCall(() => api.put('/mes/wmsWareHouse/edit', {
+  const illegal = await rawCall((options) => api.put('/mes/wmsWareHouse/edit', {
     id, pid: '0', code, name: `E2E-QC-008 ${code}`, isEnabled: true,
     areaEnabled: false, locationEnabled: true
-  }))
+  }, options), expectedRejection)
   caseRecord.checks.push({
     name: '关闭库区同时启用库位被后端拒绝',
     passed: isBusinessRejection(illegal),
@@ -416,9 +410,9 @@ const runQc008WriteSide = async (api, caseRecord) => {
     details: `code=${enable.code}; areaEnabled=${afterEnable.data?.areaEnabled}; locationEnabled=${afterEnable.data?.locationEnabled}`
   })
 
-  const closeAreaOnly = await rawCall(() => api.put('/mes/wmsWareHouse/edit', {
+  const closeAreaOnly = await rawCall((options) => api.put('/mes/wmsWareHouse/edit', {
     id, pid: '0', code, name: `E2E-QC-008 ${code}`, isEnabled: true, areaEnabled: false
-  }))
+  }, options), expectedRejection)
   caseRecord.checks.push({
     name: '库位仍启用时单独关闭库区被后端拒绝',
     passed: isBusinessRejection(closeAreaOnly),
@@ -824,7 +818,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const fixture = await prepareWmsFixture(api, caseRecord, 1)
     try {
       const opening = await createOpeningInventory(api, caseRecord, fixture, fixture.material, fixture.unit.id, 106)
-      const duplicateResponse = await api.post('/mes/stkIo/add/submit', opening.body)
+      const duplicateResponse = await api.post('/mes/stkIo/add/submit', opening.body, expectedRejection)
       caseRecord.checks.push({
         name: '同一库存维度重复提交 106 期初被拒绝',
         passed: isBusinessRejection(duplicateResponse),
@@ -849,7 +843,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         const editResponse = await api.put('/mes/stkIo/edit/submit', {
           ...opening.body, id: opening.id,
           stkIoEntryList: opening.body.stkIoEntryList
-        })
+        }, expectedRejection)
         caseRecord.checks.push({
           name: '已生效 106 期初直接编辑被拒绝',
           passed: isBusinessRejection(editResponse),
@@ -1016,7 +1010,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       businessTypeCode: unknownCode,
       stkIoEntryList: [],
       stkIoBomList: []
-    })
+    }, expectedRejection)
     caseRecord.checks.push({
       name: '写侧拒绝不在字典中的企业业务类型',
       passed: isBusinessRejection(rejected) &&
@@ -1051,16 +1045,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const retiredCode = 1030400002
     const probeId = rows[0]?.id ?? '1'
     const writes = [
-      ['create', () => api.post('/erp/warehouse/create', { name: 'E2E-退役校验', sort: '1', status: 0 })],
-      ['update', () => api.put('/erp/warehouse/update', { id: probeId, name: 'E2E-退役校验', sort: '1', status: 0 })],
-      ['delete', () => api.delete(`/erp/warehouse/delete?id=${probeId}`)],
+      ['create', (options) => api.post('/erp/warehouse/create', {
+        name: 'E2E-退役校验', sort: '1', status: 0
+      }, options)],
+      ['update', (options) => api.put('/erp/warehouse/update', { id: probeId, name: 'E2E-退役校验', sort: '1', status: 0 }, options)],
+      ['delete', (options) => api.delete(`/erp/warehouse/delete?id=${probeId}`, options)],
       [
         'update-default-status',
-        () => api.put(`/erp/warehouse/update-default-status?id=${probeId}&defaultStatus=false`)
+        (options) => api.put(`/erp/warehouse/update-default-status?id=${probeId}&defaultStatus=false`, options)
       ]
     ]
     for (const [label, invoke] of writes) {
-      const resp = await rawCall(invoke)
+      const resp = await rawCall(invoke, expectedRejection)
       caseRecord.checks.push({
         name: `写侧 ${label} 返回退役错误码`,
         passed: isBusinessRejection(resp) && resp.code === retiredCode,

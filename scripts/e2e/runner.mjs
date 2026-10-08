@@ -171,6 +171,8 @@ export function caseRuntimeErrors (record, before) {
     page: record.pageErrors.slice(before.page),
     api: record.failedApiResponses.slice(before.api),
     request: record.requestFailures.slice(before.request),
+    // Keep Node API failures fail-closed; only the API client may mark an
+    // explicitly matched 2xx business rejection as non-runtime evidence.
     nodeApi: serverApiFailures(record.api.slice(before.apiRequests))
   }
 }
