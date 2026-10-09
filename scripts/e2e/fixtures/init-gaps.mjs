@@ -13,6 +13,20 @@ const catalogPath = path.join(here, '..', 'cases', 'catalog.json')
 
 export const cases = Object.freeze(['INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-002'])
 
+export const INIT_READINESS_FACT_KEYS = Object.freeze([
+  'material', 'unit', 'supplier', 'customer', 'account', 'warehouse', 'accountSet'
+])
+
+const INIT_READINESS_KEY_BY_FACT = Object.freeze({
+  material: 'erp.material',
+  unit: 'erp.unit',
+  supplier: 'erp.supplier',
+  customer: 'erp.customer',
+  account: 'erp.account',
+  warehouse: 'wms.base',
+  accountSet: 'fms.account-set'
+})
+
 // 专属写侧初始化租户：名称、账号固定且可识别，重复运行复用，不污染正式租户 1。
 export const dedicatedTenantSpec = Object.freeze({
   name: 'CFOR E2E 写侧初始化租户',
@@ -117,11 +131,16 @@ export function initializeCatalogAssertions (caseRecord, caseId, verified = new 
     index,
     assertion,
     status: statusFor(index).status === 'VERIFIED' ? 'VERIFIED' : 'GAP',
-    ...(statusFor(index).evidence ? { evidence: statusFor(index).evidence } : {})
+    ...(statusFor(index).evidence ? { evidence: statusFor(index).evidence } : {}),
+    ...(statusFor(index).reason ? { reason: statusFor(index).reason } : {})
   }))
   caseRecord.remainingAssertions = caseRecord.catalogAssertions
     .filter((item) => item.status !== 'VERIFIED')
-    .map((item) => ({ index: item.index, assertion: item.assertion }))
+    .map((item) => ({
+      index: item.index,
+      assertion: item.assertion,
+      ...(item.reason ? { reason: item.reason } : {})
+    }))
   caseRecord.readyCandidate = false
   return caseRecord.catalogAssertions
 }
@@ -233,6 +252,88 @@ export function readinessClassification (payload) {
     opening: descriptors.filter((item) => /opening|initial|期初|初始/.test(item.haystack)),
     unknown: descriptors.some((item) => item.status === 'UNKNOWN')
   }
+}
+
+export function initReadinessFactSql (tenantId = 1) {
+  if (Number(tenantId) !== 1) {
+    throw new Error('INIT-005 只允许核对标准平台 tenant_id=1')
+  }
+  return `
+    SELECT 'material', COUNT(*) FROM mes_bas_material
+    WHERE tenant_id = 1 AND deleted = 0;
+    SELECT 'unit', COUNT(*) FROM mes_bas_unit
+    WHERE tenant_id = 1 AND deleted = 0;
+    SELECT 'supplier', COUNT(*) FROM base_partner
+    WHERE tenant_id = 1 AND deleted = 0 AND supplier_enabled = 1;
+    SELECT 'customer', COUNT(*) FROM base_partner
+    WHERE tenant_id = 1 AND deleted = 0 AND customer_enabled = 1;
+    SELECT 'account', COUNT(*) FROM erp_account
+    WHERE tenant_id = 1 AND deleted = 0;
+    SELECT 'warehouse', COUNT(*) FROM mes_wms_ware_house
+    WHERE tenant_id = 1 AND deleted = 0 AND is_enabled = 1;
+    SELECT 'accountSet', COUNT(*)
+    FROM fms_account_set a
+    WHERE a.tenant_id = 1 AND a.deleted = 0 AND a.initialized = 1
+      AND a.standard IS NOT NULL AND a.start_time IS NOT NULL AND a.currency_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM fms_finance_parameter p
+        WHERE p.account_set_id = a.id AND p.tenant_id = 1 AND p.deleted = 0
+      )
+      AND EXISTS (
+        SELECT 1 FROM fms_currency c
+        WHERE c.account_set_id = a.id AND c.tenant_id = 1 AND c.deleted = 0 AND c.standard = 1
+      )
+      AND EXISTS (
+        SELECT 1 FROM fms_voucher_word v
+        WHERE v.account_set_id = a.id AND v.tenant_id = 1 AND v.deleted = 0
+      )
+      AND EXISTS (
+        SELECT 1 FROM fms_subject s
+        WHERE s.account_set_id = a.id AND s.tenant_id = 1 AND s.deleted = 0
+      )
+      AND EXISTS (
+        SELECT 1 FROM fms_closing_template t
+        WHERE t.account_set_id = a.id AND t.tenant_id = 1 AND t.deleted = 0
+      );
+  `
+}
+
+export function validateInitReadinessFacts (factRows, readinessItems) {
+  const rows = Array.isArray(factRows) ? factRows : []
+  const rowMap = new Map()
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length !== 2 ||
+        !INIT_READINESS_FACT_KEYS.includes(row[0]) || rowMap.has(row[0]) ||
+        !/^\d+$/.test(String(row[1] ?? ''))) {
+      return { valid: false, reason: '七类事实计数必须完整、唯一且为非负整数', factMap: new Map() }
+    }
+    rowMap.set(row[0], Number(row[1]))
+  }
+  if (rowMap.size !== INIT_READINESS_FACT_KEYS.length) {
+    return { valid: false, reason: '七类官方事实计数缺失', factMap: rowMap }
+  }
+
+  const itemMap = new Map((Array.isArray(readinessItems) ? readinessItems : [])
+    .map((item) => [item?.key, item]))
+  for (const factKey of INIT_READINESS_FACT_KEYS) {
+    const item = itemMap.get(INIT_READINESS_KEY_BY_FACT[factKey])
+    const count = item?.count
+    if (!item || !Number.isInteger(count) || count < 0 || count !== rowMap.get(factKey)) {
+      return {
+        valid: false,
+        reason: `${factKey} readiness 计数缺失或与官方事实不一致`,
+        factMap: rowMap
+      }
+    }
+    if (rowMap.get(factKey) === 0 && item.status === 'READY') {
+      return {
+        valid: false,
+        reason: `${factKey} 空事实不能标记 READY`,
+        factMap: rowMap
+      }
+    }
+  }
+  return { valid: true, reason: '', factMap: rowMap }
 }
 
 export function inspectLogoFields (fields = []) {
@@ -669,40 +770,14 @@ async function runInit005 ({ api, caseRecord }) {
   addCheck(caseRecord, '成本模型/集成仅按现状读取，不伪造外部连接', external.length > 0 &&
     external.every((item) => ['READY', 'INCOMPLETE', 'NOT_STARTED', 'SKIPPED', 'UNKNOWN'].includes(item.status)),
   `externalItems=${external.length}`)
-  // 真实事实源：readiness 计数必须与当前租户真实落库事实一致（不凭空构造样本）。
-  const factRows = await readSql(caseRecord, 'init-readiness-facts', `
-    SELECT 'material', COUNT(*) FROM mes_bas_material WHERE deleted = 0;
-    SELECT 'unit', COUNT(*) FROM mes_bas_unit WHERE deleted = 0;
-    SELECT 'customer', COUNT(*) FROM base_partner WHERE deleted = 0 AND customer_enabled = 1;
-    SELECT 'supplier', COUNT(*) FROM base_partner WHERE deleted = 0 AND supplier_enabled = 1;
-    SELECT 'account', COUNT(*) FROM erp_account WHERE deleted = 0;
-    SELECT 'warehouse', COUNT(*) FROM erp_warehouse WHERE deleted = 0;
-    SELECT 'accountSet', COUNT(*) FROM fms_account_set WHERE deleted = 0;
-  `)
-  const factMap = new Map((factRows || []).map(([key, value]) => [key, Number(value)]))
-  const materialItem = (classified.categories.material || []).find((row) => row.key === 'erp.material')
-  const unitItem = (classified.categories.unit || []).find((row) => row.key === 'erp.unit')
-  const accountSetItem = (classified.categories.accountSet || []).find((row) => row.key === 'fms.account-set')
-  const materialReadiness = materialItem?.count == null ? null : Number(materialItem.count)
-  const unitReadiness = unitItem?.count == null ? null : Number(unitItem.count)
-  const accountSetReadiness = accountSetItem?.count == null ? null : Number(accountSetItem.count)
-  const accountItem = (classified.categories.account || []).find((row) => row.key === 'erp.account')
-  const accountReadiness = accountItem?.count == null ? null : Number(accountItem.count)
-  const factsConsistent = factRows != null &&
-    factMap.get('material') > 0 && factMap.get('unit') > 0 && factMap.get('account') > 0 &&
-    (materialReadiness == null || materialReadiness === factMap.get('material')) &&
-    (unitReadiness == null || unitReadiness === factMap.get('unit')) &&
-    (accountReadiness == null || accountReadiness === factMap.get('account')) &&
-    (accountSetReadiness == null || accountSetReadiness === factMap.get('accountSet')) &&
-    (materialReadiness != null || unitReadiness != null || accountReadiness != null)
-  addCheck(caseRecord, 'readiness 计数与 mes_bas_material/mes_bas_unit/erp_account/fms_account_set 真实事实一致',
-    factsConsistent,
-    `material=${factMap.get('material')}/${materialReadiness} unit=${factMap.get('unit')}/${unitReadiness} ` +
-    `account=${factMap.get('account')}/${accountReadiness} accountSet=${factMap.get('accountSet')}/${accountSetReadiness}`)
-  addCheck(caseRecord, '供应商/客户按 base_partner 类型标记统计真实存在',
-    (factMap.get('customer') || 0) >= 0 && (factMap.get('supplier') || 0) >= 0 &&
-    (classified.categories.customer.length > 0) && (classified.categories.supplier.length > 0),
-    `customer=${factMap.get('customer')} supplier=${factMap.get('supplier')}`)
+  // Official readiness facts are tenant-scoped and must never be fabricated.
+  const factRows = await readSql(caseRecord, 'init-readiness-facts', initReadinessFactSql(1))
+  const factValidation = validateInitReadinessFacts(factRows, classified.items || [])
+  const factMap = factValidation.factMap
+  addCheck(caseRecord, 'readiness 七类官方计数与当前租户事实一致', factValidation.valid,
+    factValidation.valid
+      ? INIT_READINESS_FACT_KEYS.map((key) => `${key}=${factMap.get(key)}`).join(' ')
+      : factValidation.reason)
   let jobVerified = false
   try {
     const result = await runReadOnlySql(`
@@ -719,14 +794,36 @@ async function runInit005 ({ api, caseRecord }) {
     caseRecord.notes.push(`Job 只读检查未完成：${String(error.message || error).slice(0, 240)}`)
   }
   addCheck(caseRecord, 'Job 默认关闭且 Quartz 无活动触发器', jobVerified, jobVerified ? 'read-only SQL' : '缺少可用只读数据库证据')
-  const verified = new Map()
-  if (completeCategories) verified.set(0, { status: 'VERIFIED' })
-  if (classified.opening.some((item) => item.skippable === true)) verified.set(1, { status: 'VERIFIED' })
-  if (external.length > 0 && external.every((item) => item.status !== undefined)) verified.set(2, { status: 'VERIFIED' })
-  if (jobVerified) verified.set(3, { status: 'VERIFIED' })
+  const verified = new Map([
+    [0, {
+      status: 'GAP',
+      reason: factValidation.valid
+        ? '七类计数已闭环，但未在本用例核验 wms.base 的库区、库位和 ERP 映射完整性'
+        : '七类真实事实计数未闭环，且 wms.base 三级仓储完整性未核验'
+    }],
+    [1, {
+      status: 'GAP',
+      reason: '仅证明 readiness 返回 skippable=true；未调用正式 skip API，也未回读 state/readiness 验证跳过与恢复闭环'
+    }],
+    [2, {
+      status: 'GAP',
+      reason: '仅读取 status enum；未证明成本/集成原事实未变化，也未验证不存在伪造连接的服务端写侧闭环'
+    }]
+  ])
+  if (jobVerified) {
+    verified.set(3, {
+      status: 'VERIFIED',
+      evidence: '只读快照 enabled-jobs=0、active-triggers=0；默认关闭策略由 V202609272500__disable_jobs_by_default.sql 明确设置 infra_job=2、Quartz=PAUSED'
+    })
+  } else {
+    verified.set(3, {
+      status: 'GAP',
+      reason: '缺少 enabled Job 与 Quartz active trigger 的完整只读快照'
+    })
+  }
   initializeCatalogAssertions(caseRecord, 'INIT-005', verified)
   evidence(caseRecord,
-    `state status=${text(dataOf(state)?.status)}；readiness 计数与真实主数据事实核对（material/unit/account/accountSet）， ` +
+    `state status=${text(dataOf(state)?.status)}；readiness 七类官方计数与 tenant_id=1 事实核对， ` +
     '未启用 Job、未伪造外部连接。')
 }
 

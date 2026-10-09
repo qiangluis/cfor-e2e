@@ -6,13 +6,16 @@ import {
   catalogDefinition,
   cases,
   initRoutes,
+  initReadinessFactSql,
+  INIT_READINESS_FACT_KEYS,
   initializeCatalogAssertions,
   inspectLogoFields,
   isAllowedRequest,
   isForbiddenRequest,
   presetConfirmButtonSelector,
   presetConfirmButtonText,
-  readinessClassification
+  readinessClassification,
+  validateInitReadinessFacts
 } from '../fixtures/init-gaps.mjs'
 
 const local = {
@@ -77,6 +80,24 @@ test('catalog mapping preserves every assertion and keeps unproven work as GAP',
   assert.equal(record.readyCandidate, false)
 })
 
+test('INIT-005 catalog mapping preserves GAP reasons without upgrading assertions', () => {
+  const record = { checks: [] }
+  initializeCatalogAssertions(record, 'INIT-005', new Map([
+    [0, { status: 'GAP', reason: 'WMS topology not checked' }],
+    [1, { status: 'GAP', reason: 'skip API round trip not executed' }],
+    [2, { status: 'GAP', reason: 'facts-before/after not captured' }],
+    [3, { status: 'VERIFIED', evidence: 'default migration plus read-only snapshot' }]
+  ]))
+  assert.equal(record.catalogAssertions.length, 4)
+  assert.deepEqual(record.catalogAssertions.map((item) => item.status), [
+    'GAP', 'GAP', 'GAP', 'VERIFIED'
+  ])
+  assert.deepEqual(record.remainingAssertions.map((item) => item.reason), [
+    'WMS topology not checked', 'skip API round trip not executed', 'facts-before/after not captured'
+  ])
+  assert.equal(record.readyCandidate, false)
+})
+
 test('headed init routes and preset confirmation locator match the current Web contract', () => {
   assert.equal(initRoutes.overview, '/systemInit/index')
   assert.equal(
@@ -113,6 +134,57 @@ test('readiness classification requires structured items and distinguishes openi
   assert.equal(result.opening[0].skippable, true)
   assert.equal(result.unknown, true)
   assert.deepEqual(readinessClassification({ code: 0, data: {} }).items, null)
+})
+
+function readinessItems (counts, statuses = {}) {
+  return [
+    ['erp.material', 'material'],
+    ['erp.unit', 'unit'],
+    ['erp.supplier', 'supplier'],
+    ['erp.customer', 'customer'],
+    ['erp.account', 'account'],
+    ['wms.base', 'warehouse'],
+    ['fms.account-set', 'accountSet']
+  ].map(([key, fact]) => ({
+    key,
+    count: counts[fact],
+    status: statuses[fact] || (counts[fact] > 0 ? 'READY' : 'NOT_STARTED')
+  }))
+}
+
+test('INIT-005 official fact SQL is tenant-scoped and uses WMS wms.base source', () => {
+  const sql = initReadinessFactSql(1)
+  assert.doesNotThrow(() => initReadinessFactSql(1))
+  assert.throws(() => initReadinessFactSql(2), /tenant_id=1/)
+  assert.doesNotMatch(sql, /erp_warehouse/)
+  assert.match(sql, /mes_wms_ware_house/)
+  for (const table of [
+    'mes_bas_material', 'mes_bas_unit', 'base_partner', 'erp_account',
+    'mes_wms_ware_house', 'fms_account_set'
+  ]) assert.match(sql, new RegExp(`${table}[\\s\\S]*tenant_id = 1`))
+  for (const key of INIT_READINESS_FACT_KEYS) assert.match(sql, new RegExp(`'${key}'`))
+})
+
+test('INIT-005 rejects cross-tenant/unscoped counts and missing or wrong official counts', () => {
+  const counts = { material: 420, unit: 5, supplier: 2, customer: 3, account: 4, warehouse: 1, accountSet: 1 }
+  const rows = INIT_READINESS_FACT_KEYS.map((key) => [key, String(counts[key])])
+  const items = readinessItems(counts)
+  assert.equal(validateInitReadinessFacts(rows, items).valid, true)
+
+  const crossTenantRows = rows.map(([key, value]) =>
+    [key, key === 'material' ? '423' : key === 'unit' ? '11' : value])
+  assert.equal(validateInitReadinessFacts(crossTenantRows, items).valid, false)
+
+  assert.equal(validateInitReadinessFacts(rows.slice(1), items).valid, false)
+  const wrongRows = rows.map(([key, value]) => [key, key === 'accountSet' ? '0' : value])
+  assert.equal(validateInitReadinessFacts(wrongRows, items).valid, false)
+})
+
+test('INIT-005 permits empty facts only with a non-ready status', () => {
+  const counts = { material: 0, unit: 0, supplier: 0, customer: 0, account: 0, warehouse: 0, accountSet: 0 }
+  const rows = INIT_READINESS_FACT_KEYS.map((key) => [key, '0'])
+  assert.equal(validateInitReadinessFacts(rows, readinessItems(counts)).valid, true)
+  assert.equal(validateInitReadinessFacts(rows, readinessItems(counts, { material: 'READY' })).valid, false)
 })
 
 test('logo inspection requires actual labeled fields and does not infer save behavior', () => {
