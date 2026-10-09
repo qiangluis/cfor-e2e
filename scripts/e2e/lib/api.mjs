@@ -67,8 +67,7 @@ const matchesMessage = (messages, expectedMessage) => {
  * both `code`/`codes` and `message`/`msg` for callers that need exact matching.
  */
 export const matchesExpectedBusinessRejection = (payload, expected) => {
-  if (!isBusinessRejection(payload)) return false
-  if (expected === true) return true
+  if (expected === true) return isBusinessRejection(payload)
   if (!expected || typeof expected !== 'object') return false
 
   const expectedCodes = expected.codes ?? expected.code
@@ -78,6 +77,10 @@ export const matchesExpectedBusinessRejection = (payload, expected) => {
       expectedCodes.every((code) => Number.isSafeInteger(code)) &&
       expectedCodes.includes(payload.code)
     : Number.isSafeInteger(expectedCodes) && payload.code === expectedCodes
+  if (expected.allowServiceCode === true) {
+    return codeMatches && matchesMessage(responseMessages(payload), expectedMessage)
+  }
+  if (!isBusinessRejection(payload)) return false
   return codeMatches && matchesMessage(responseMessages(payload), expectedMessage)
 }
 

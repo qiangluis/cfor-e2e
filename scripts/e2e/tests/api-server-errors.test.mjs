@@ -73,6 +73,28 @@ test('only an explicitly matched valid 2xx business rejection leaves Node runtim
   )
 })
 
+test('an explicitly matched legacy service code can be treated as a business rejection', async () => {
+  const record = { api: [] }
+  const api = createApiClient({ record })
+  await withFetch(
+    async () => new Response(JSON.stringify({
+      code: 500, msg: 'legacy business validation'
+    })),
+    async () => {
+      const result = await api.post('/unit-only', {}, {
+        expectedBusinessRejection: {
+          code: 500,
+          message: 'legacy business validation',
+          allowServiceCode: true
+        }
+      })
+      assert.equal(result.code, 500)
+    }
+  )
+  assert.equal(record.api[0].expectedBusinessRejectionMatched, true)
+  assert.deepEqual(serverApiFailures(record.api), [])
+})
+
 test('success, system errors, and service codes never match an expected business rejection', async () => {
   for (const payload of [
     { code: 0, data: { id: 'success' } },
