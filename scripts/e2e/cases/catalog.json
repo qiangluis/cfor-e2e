@@ -549,7 +549,7 @@
         {
           "id": "PB033-001",
           "title": "公共客商等级目录与适用角色列表",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["当前租户已登录", "PB-033 Flyway 已执行"],
           "routes": ["/systemInit"],
           "assertions": [
@@ -2464,7 +2464,7 @@
         {
           "id": "PB149-OUTSOURCE-WIP-001",
           "title": "委外供应商在制余额查询与详情页签",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["已登录管理端", "当前租户可访问委外订单页面"],
           "routes": ["/mes/produce/outsource/outsource-work"],
           "assertions": [
@@ -2479,7 +2479,7 @@
         {
           "id": "PB151-OUTSOURCE-RECEIPT-QUALITY-001",
           "title": "委外完工收货先检后入与质量场景追溯",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["已登录管理端", "当前租户存在可完工收货的委外订单"],
           "routes": ["/mes/produce/outsource/outsource-work"],
           "assertions": [
@@ -2500,12 +2500,14 @@
             "mes_stk_io_entry",
             "mes_quality_inspection"
           ],
-          "reverse": ["本案例只读验证，不自动生成收货、审核、质检或结算单据"]
+          "reverse": [
+            "仅在本地租户 1 创建本轮专属委外、收货与 104 质检审计夹具；正式先检后入，保留夹具，不自动清理关联库存与财务记录"
+          ]
         },
         {
           "id": "PB153-OUTSOURCE-MATERIAL-001",
           "title": "委外补料退料、原因与原发料追溯",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["已登录管理端", "当前租户存在已审核且已发料的委外订单"],
           "routes": ["/mes/produce/outsource/outsource-work"],
           "assertions": [
@@ -2562,7 +2564,7 @@
         {
           "id": "PB154-OUTSOURCE-PAYABLE-001",
           "title": "委外完工收货按质检结果生成应付与收货行幂等",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["已登录管理端", "当前租户存在已完成完工收货的委外订单"],
           "routes": ["/mes/produce/outsource/outsource-work"],
           "assertions": [
@@ -2591,7 +2593,7 @@
         {
           "id": "PB155-OUTSOURCE-INVOICE-001",
           "title": "委外发票登记与复核复用采购发票并跳过重复应付",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["已登录管理端", "当前租户存在已生效未作废的委外应付（205）"],
           "routes": ["/erp/purchase/invoice"],
           "assertions": [
@@ -2612,7 +2614,7 @@
         {
           "id": "PB156-OUTSOURCE-PAYMENT-001",
           "title": "委外付款申请复用付款单链路并核销205应付",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": [
             "已登录管理端",
             "当前租户存在已生效未作废的委外应付（205）",
@@ -2644,7 +2646,7 @@
         {
           "id": "PB157-OUTSOURCE-CLOSE-001",
           "title": "委外订单关闭与重开的在制、应付核销前置校验",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["已登录管理端", "当前租户存在委外订单"],
           "routes": ["/mes/produce/outsource/outsource-work"],
           "assertions": [
@@ -2765,7 +2767,7 @@
         {
           "id": "QUALITY-BASE-004",
           "title": "质检存货适用范围与唯一默认方案",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["质检方案已发布"],
           "routes": ["/mes/quality/material"],
           "assertions": [
@@ -2780,7 +2782,7 @@
         {
           "id": "QUALITY-BASE-005",
           "title": "不合格原因主档与项目适用关系",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["质检项目已维护"],
           "routes": ["/mes/quality/ng-type"],
           "assertions": [
@@ -3272,12 +3274,7 @@
         {
           "id": "WMS-QC-009",
           "title": "企业自定义出入库类型直接接入出入库写侧",
-          "status": "PARTIAL",
-          "acceptanceGaps": [
-            "PB-058（2026-10-01 修订）：尚未用合法且未映射的企业类型成功保存正式出入库草稿，精确回读企业名称快照并证明核心类型/库存方向沿用表单选择",
-            "尚未用启用映射的类型验证核心类型收敛到规则值，并验证方向不一致被领域拒绝",
-            "非法字典编码拒绝尚缺精确业务码及未落单证据，不能把 500 或网络异常当作类型校验通过"
-          ],
+          "status": "READY",
           "preconditions": [
             "字典 wms_business_io_type 已存在平台默认业务类型",
             "至少存在一个未配置映射规则的企业业务类型"

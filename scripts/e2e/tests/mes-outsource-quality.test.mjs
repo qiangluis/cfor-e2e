@@ -5,13 +5,20 @@ import {
   businessDateAsiaShanghai,
   createDedicatedOutsourceQuality,
   isStableQualityId,
+  isOutsourceInboundSourceBillType,
+  normalizeQualityDate,
+  requiresOutsourceInspectionSubmit,
   OUTSOURCE_QUALITY_RETAINED,
   OUTSOURCE_QUALITY_SOURCE
 } from '../fixtures/mes-outsource-quality.mjs'
 
 const ok = (data) => ({ code: 0, data })
 
-const makeQualityApi = (marker, { failRule = false, unsafeItemId = false } = {}) => {
+const makeQualityApi = (marker, {
+  failRule = false,
+  unsafeItemId = false,
+  ruleEffectiveFrom = businessDateAsiaShanghai()
+} = {}) => {
   const calls = []
   let published = false
   let planRemark = ''
@@ -56,12 +63,13 @@ const makeQualityApi = (marker, { failRule = false, unsafeItemId = false } = {})
       }
       if (path.includes('/mes/quality/qualityMaterial/list/dictText')) {
         const query = new URL(`http://quality${path}`).searchParams
+        const typedRuleId = query.get('types') === '110' ? '204' : ruleId
         return ok([{
-          id: ruleId,
+          id: typedRuleId,
           materialId: query.get('materialId'),
           planId,
           type: query.get('types'),
-          effectiveFrom: businessDateAsiaShanghai(),
+          effectiveFrom: ruleEffectiveFrom,
           effectiveTo: null,
           applyOrgId: '',
           businessSubType: '',
@@ -100,10 +108,13 @@ test('专属委外104前置使用生产入库项目、104已发布方案和专�
   assert.equal(result.rule.row.planId, result.plan.planId)
   assert.equal(result.rule.row.type, '104')
   assert.equal(result.rule.row.isDefault, true)
-  assert.equal(result.resources.length, 3)
+  assert.ok(result.resources.every((row) => row.marker === marker))
+  assert.ok(result.resources.every((row) => typeof row.token === 'string' && row.token.length > 0))
+  assert.equal(result.resources.length, 4)
   assert.deepEqual(caseRecord.fixtures.map((row) => row.kind), [
-    'quality-item', 'quality-plan', 'quality-material-rule'
+    'quality-item', 'quality-plan', 'quality-material-rule', 'quality-material-rule'
   ])
+  assert.deepEqual(result.resources.slice(-2).map((row) => row.type), ['104', '110'])
   assert.ok(caseRecord.fixtures.every((row) =>
     row.source === OUTSOURCE_QUALITY_SOURCE && row.cleanup === OUTSOURCE_QUALITY_RETAINED))
 
@@ -115,6 +126,15 @@ test('专属委外104前置使用生产入库项目、104已发布方案和专�
   assert.equal(ruleAdd.body.planId, result.plan.planId)
   assert.equal(ruleAdd.body.type, '104')
   assert.equal(ruleAdd.body.effectiveFrom, businessDateAsiaShanghai())
+  assert.ok(api.calls
+    .filter((call) => call.method === 'POST')
+    .every((call) => call.body?.itemName === undefined || String(call.body.itemName).length <= 32))
+  assert.ok(api.calls
+    .filter((call) => call.method === 'POST')
+    .every((call) => call.body?.planName === undefined || String(call.body.planName).length <= 32))
+  assert.ok(api.calls
+    .filter((call) => call.method === 'POST')
+    .every((call) => call.body?.itemCode === undefined || String(call.body.itemCode).length <= 64))
 })
 
 test('104方案回读不允许默认按101查询', async () => {
@@ -139,6 +159,60 @@ test('专属质检配置中途失败会保留已创建的项目和方案审计�
   ), /simulated quality rule failure/)
   assert.deepEqual(caseRecord.fixtures.map((row) => row.kind), ['quality-item', 'quality-plan'])
   assert.ok(caseRecord.fixtures.every((row) => row.cleanup === OUTSOURCE_QUALITY_RETAINED))
+})
+
+test('LocalDate数组日期可规范化并与ISO日期等价', () => {
+  const expected = businessDateAsiaShanghai()
+  const [year, month, day] = expected.split('-').map(Number)
+  assert.equal(normalizeQualityDate(expected), expected)
+  assert.equal(normalizeQualityDate([year, month, day]), expected)
+})
+
+test('非法月日和日期漂移会被拒绝', () => {
+  assert.throws(() => normalizeQualityDate('2026-02-30'), /非法年月日/)
+  assert.throws(() => normalizeQualityDate([2026, 13, 1]), /非法年月日/)
+  assert.throws(() => normalizeQualityDate([2026, 4, 31]), /非法年月日/)
+  assert.throws(() => normalizeQualityDate([100, 2, 29]), /非法年月日/)
+  assert.equal(normalizeQualityDate([2000, 2, 29]), '2000-02-29')
+  assert.throws(() => normalizeQualityDate('2026-1-09'), /合法ISO日期/)
+})
+
+test('规则日期回读失败前已登记规则资源，且拒绝日期漂移', async () => {
+  const marker = 'E2E-OUTSRC-QUALITY-DATE-MISMATCH'
+  const expected = businessDateAsiaShanghai()
+  const drifted = expected.startsWith('2026-10-09') ? '2026-10-10' : '2026-01-01'
+  const caseRecord = { checks: [], notes: [], fixtures: [] }
+  await assert.rejects(() => createDedicatedOutsourceQuality(
+    makeQualityApi(marker, { ruleEffectiveFrom: drifted }),
+    caseRecord,
+    { marker, product: { id: '901' } }
+  ), /归属回读失败/)
+  assert.deepEqual(caseRecord.fixtures.map((row) => row.kind), [
+    'quality-item', 'quality-plan', 'quality-material-rule', 'quality-material-rule'
+  ])
+})
+
+test('规则合法LocalDate数组可通过归属校验', async () => {
+  const marker = 'E2E-OUTSRC-QUALITY-DATE-TUPLE'
+  const expected = businessDateAsiaShanghai()
+  const tuple = expected.split('-').map(Number)
+  const result = await createDedicatedOutsourceQuality(
+    makeQualityApi(marker, { ruleEffectiveFrom: tuple }),
+    { checks: [], notes: [], fixtures: [] },
+    { marker, product: { id: '902' } }
+  )
+  assert.equal(result.rule.row.effectiveFrom, tuple)
+})
+
+test('规则非法LocalDate数组会失败但仍保留规则manifest', async () => {
+  const marker = 'E2E-OUTSRC-QUALITY-DATE-INVALID'
+  const caseRecord = { checks: [], notes: [], fixtures: [] }
+  await assert.rejects(() => createDedicatedOutsourceQuality(
+    makeQualityApi(marker, { ruleEffectiveFrom: [2026, 2, 30] }),
+    caseRecord,
+    { marker, product: { id: '903' } }
+  ), /非法年月日/)
+  assert.equal(caseRecord.fixtures.at(-1).kind, 'quality-material-rule')
 })
 
 test('不安全数字ID在专属104前置入口被拒绝', async () => {
@@ -209,9 +283,46 @@ test('合格104草稿payload拒绝错误类型、来源、缺失关联和多明�
   const entry = { id: '804', srcEntryId: '805', materialId: '806' }
   const item = { id: '807', itemId: '808' }
   assert.throws(() => buildQualifiedInspectionPayload({ ...detail, type: '101' }, [entry], [item]), /不是104/)
-  assert.throws(() => buildQualifiedInspectionPayload({ ...detail, srcBillType: 'MesStkIo:104' }, [entry], [item]), /来源不是 MesStkIo:110/)
+  assert.throws(() => buildQualifiedInspectionPayload({ ...detail, srcBillType: 'MesStkIo:104' }, [entry], [item]), /来源不是 MesStkIo 或 MesStkIo:110/)
   assert.throws(() => buildQualifiedInspectionPayload({ ...detail, inspectionPlan: null }, [entry], [item]), /质检方案未返回合法/)
   assert.throws(() => buildQualifiedInspectionPayload(detail, [{ ...entry, srcEntryId: null }], [item]), /来源库存明细未返回合法/)
   assert.throws(() => buildQualifiedInspectionPayload(detail, [entry, { ...entry, id: '809' }], [item]), /只能有一条/)
   assert.throws(() => buildQualifiedInspectionPayload(detail, [entry], []), /缺少质检项目明细/)
+})
+
+test('质检审核后的库存来源归一化为MesStkIo仍属于110委外收货来源', () => {
+  assert.equal(isOutsourceInboundSourceBillType('MesStkIo:110'), true)
+  assert.equal(isOutsourceInboundSourceBillType('MesStkIo'), true)
+  assert.equal(isOutsourceInboundSourceBillType('MesStkIo:101'), false)
+  assert.equal(isOutsourceInboundSourceBillType('MesStkIo:104'), false)
+
+  const detail = {
+    id: '901',
+    type: '104',
+    srcBillType: 'MesStkIo',
+    srcBillId: '902',
+    inspectionPlan: '903'
+  }
+  const payload = buildQualifiedInspectionPayload(
+    detail,
+    [{ id: '904', srcEntryId: '905', materialId: '906' }],
+    [{ id: '907', itemId: '908' }]
+  )
+  assert.equal(payload.srcBillType, 'MesStkIo')
+})
+
+test('已自动完成104按数量事实核对而不重复编辑，未生效单据必须允许编辑', () => {
+  const detail = {
+    type: '104', srcBillType: 'MesStkIo', isEffective: 1, isVoided: 0,
+    billStage: '34', actions: { edit: false }
+  }
+  const entries = [{ qty: 1, inspectionQty: 1, passQty: 1, concessionQty: 0, pendingJudgeQty: 0 }]
+  assert.equal(requiresOutsourceInspectionSubmit(detail, entries), false)
+  assert.throws(() => requiresOutsourceInspectionSubmit(detail, [{ ...entries[0], passQty: 0 }]), /不是本轮合格/)
+  assert.throws(() => requiresOutsourceInspectionSubmit({ ...detail, isVoided: 1 }, entries), /不是本轮合格/)
+  assert.throws(() => requiresOutsourceInspectionSubmit({ ...detail, billStage: '24' }, entries), /不是本轮合格/)
+  assert.equal(requiresOutsourceInspectionSubmit({
+    ...detail, isEffective: 0, billStage: '14', actions: { edit: true }
+  }, entries), true)
+  assert.throws(() => requiresOutsourceInspectionSubmit({ ...detail, isEffective: 0 }, entries), /不允许编辑/)
 })
