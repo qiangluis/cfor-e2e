@@ -3,6 +3,7 @@ import { config } from '../config/index.mjs'
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { findMenuRouteByComponent } from '../suites/base-partner.mjs'
+import { prepareOpeningBatchFilter } from './search-form.mjs'
 import {
   dataOf, fixtureKey, numericId, ownedKey, money, check, proof, missing,
   preflight, database, sourceDelivery, balancedDraft, draftLedgerPaths, reconcileMatches, readEvent,
@@ -46,7 +47,8 @@ async function show (ctx, component, text, tag, { detail = false } = {}) {
     await ctx.page.getByRole('button', { name: '查询', exact: true }).click()
   }
   if (component === 'erp/finance/dealingsBeginning/index' && text) {
-    await ctx.page.getByPlaceholder('期初导入批次号').fill(text)
+    const batchFilter = await prepareOpeningBatchFilter(ctx.page)
+    await batchFilter.fill(text)
     await ctx.page.getByRole('button', { name: '查询', exact: true }).click()
   }
   if (text) {
