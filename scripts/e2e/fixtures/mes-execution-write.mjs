@@ -21,10 +21,11 @@ const stableId = (value) =>
 
 const cleanupDefinitions = {
   report: { table: 'mes_prod_work_report', endpoint: '/mes/prodWorkReport/delete' },
-  task: { table: 'mes_prod_work_task', endpoint: '/mes/prodWorkTask/delete' },
+  task: { table: 'mes_prod_work_task', endpoint: '/mes/prodWorkTask/delete', deletedColumn: 'is_deleted' },
   work: { table: 'mes_prod_work', endpoint: '/mes/prodWork/delete' },
   order: { table: 'mes_prod_order', endpoint: '/mes/prodOrder/delete' },
   opening: { table: 'mes_stk_io', endpoint: '/mes/stkIo/void' },
+  inventory: { table: 'mes_stk_inventory', endpoint: '/mes/stkInventory/delete' },
   route: { table: 'mes_wms_tech_route', endpoint: '/mes/wmsTechRoute/delete' },
   procedure: { table: 'mes_wms_procedure', endpoint: '/mes/wmsProcedure/delete' },
   bom: { table: 'mes_wms_assemble', endpoint: '/mes/wmsAssemble/delete' },
@@ -63,8 +64,18 @@ const queryId = async (sql, context) => {
   return String(result.rows[0][0])
 }
 
+const queryRows = async (sql, context) => {
+  const result = await runReadOnlySql(sql)
+  if (!result.available) throw new Error(`BLOCKED: ${result.reason}`)
+  assert(result.rows.length > 0, `${context} 所有权回读不能为空`)
+  return result.rows
+}
+
+const isZeroQuantity = (value) =>
+  value == null || (Number.isFinite(Number(value)) && Number(value) === 0)
+
 export const executionMarker = (caseId) =>
-  `AUTOTEST-${caseId}-${Date.now().toString(36).slice(-6).toUpperCase()}-${randomBytes(1).toString('hex').toUpperCase()}`
+  `AUTOTEST-${caseId}-${Date.now().toString(36).slice(-6).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`
 
 /**
  * 为任务暂停和监控用例创建一条独立的生产计划-工单-任务链路。
@@ -73,17 +84,25 @@ export const executionMarker = (caseId) =>
  * 走业务删除/取消接口，接口拒绝时保留数据并在报告中写明残留。
  */
 export class ExecutionWorkflowFixture {
-  constructor (api, record, caseId, { overdue = false, schedule = true, withTeam = true } = {}) {
+  constructor (api, record, caseId, {
+    overdue = false,
+    schedule = true,
+    withTeam = true,
+    withOpeningInventory = true
+  } = {}) {
     this.api = api
     this.record = record
     this.caseId = caseId
     this.marker = executionMarker(caseId)
-    this.shortCode = `AUTOTEST-${caseId}-${randomBytes(1).toString('hex').toUpperCase()}`
-    this.teamCode = `AT-${caseId.split('-').pop()}-${randomBytes(1).toString('hex').toUpperCase()}-T`
-    this.teamName = `AUTOTEST-${caseId.split('-').pop()}-${randomBytes(1).toString('hex').toUpperCase()}`
+    this.shortCode = `AT-${caseId.replaceAll('-', '').slice(0, 12)}-${Date.now().toString(36).slice(-5).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`
+    // 班组编码必须跨运行唯一；只用 1 字节随机会在历史残留后偶发重号，导致所有权回读不唯一。
+    const teamSuffix = `${Date.now().toString(36).slice(-5).toUpperCase()}${randomBytes(3).toString('hex').toUpperCase()}`
+    this.teamCode = `AT-${caseId.split('-').pop()}-${teamSuffix}-T`
+    this.teamName = `AUTOTEST-${caseId.split('-').pop()}-${teamSuffix}`
     this.overdue = overdue
     this.shouldSchedule = schedule
     this.withTeam = withTeam
+    this.withOpeningInventory = withOpeningInventory
     this.owned = []
     this.works = []
     this.tasks = []
@@ -94,6 +113,7 @@ export class ExecutionWorkflowFixture {
       overdue,
       schedule,
       withTeam,
+      withOpeningInventory,
       resources: this.owned
     }
   }
@@ -154,7 +174,11 @@ export class ExecutionWorkflowFixture {
     this.material = await this.createMaterial('FG', false)
     this.component = await this.createMaterial('RM', true)
     this.bom = await this.createBom()
-    this.opening = await this.createOpeningInventory()
+    // Production execution cases do not need stock facts; WMS suites own the
+    // opening-inventory lifecycle and its audit-retained rows.
+    this.opening = this.withOpeningInventory
+      ? await this.createOpeningInventory()
+      : null
     this.procedure = await this.createProcedure()
     this.route = await this.createRoute()
     this.order = await this.createOrder()
@@ -344,6 +368,33 @@ export class ExecutionWorkflowFixture {
       ), '期初库存审核后回读')
     }
     assert.equal(Number(detail?.isEffective || 0), 1, '专属期初库存必须正式生效')
+    const inventoryRows = await queryRows(
+      `SELECT id, warehouse_id, material_id, ware_area_id, ware_location_id, batch_no,
+              qty, available_qty, lock_qty, hold_qty, frozen_qty, pending_putaway_qty,
+              deleted+0, is_closed
+       FROM mes_stk_inventory
+       WHERE tenant_id=1 AND deleted=0 AND is_closed=0
+         AND warehouse_id='${sqlText(this.warehouse.id)}'
+         AND material_id='${sqlText(this.component.id)}'
+         AND ware_area_id='${sqlText(this.area.id)}'
+         AND ware_location_id='${sqlText(this.location.id)}'
+         AND batch_no='${sqlText(`${this.shortCode}-OPEN`)}'`,
+      '专属期初库存事实'
+    )
+    assert.equal(inventoryRows.length, 1, '专属期初库存必须只生成一条库存事实')
+    const [inventoryId, warehouseId, materialId, wareAreaId, wareLocationId, batchNo] =
+      inventoryRows[0]
+    assert.equal(String(warehouseId), this.warehouse.id, '专属库存仓库归属不匹配')
+    assert.equal(String(materialId), this.component.id, '专属库存物料归属不匹配')
+    const inventory = this.remember('inventory', inventoryId, batchNo)
+    inventory.dimensions = {
+      warehouseId: String(warehouseId),
+      materialId: String(materialId),
+      wareAreaId: String(wareAreaId),
+      wareLocationId: String(wareLocationId),
+      batchNo: String(batchNo)
+    }
+    this.inventory = inventory
     return resource
   }
 
@@ -414,6 +465,7 @@ export class ExecutionWorkflowFixture {
       '专属班组'
     )
     this.team = this.remember('team', id, teamId)
+    this.memberId = String(memberId)
     return id
   }
 
@@ -552,6 +604,9 @@ export class ExecutionWorkflowFixture {
     unwrap(await this.api.putBusiness('/mes/prodWorkTask/edit', {
       id: task.id,
       prodLineId: this.lineId,
+      memberIds: this.memberId,
+      leaderId: this.memberId,
+      teamId: this.team?.id,
       remark: this.marker
     }), '工单任务绑定产线')
     const taskReadback = unwrap(await this.api.getBusiness(
@@ -559,6 +614,14 @@ export class ExecutionWorkflowFixture {
     ), '工单任务绑定后回读')
     this.assertOwnedTask(taskReadback, task.id)
     assert.equal(String(taskReadback.prodLineId), this.lineId)
+    unwrap(await this.api.request(
+      'GET',
+      `/mes/prodWorkTask/checkOnly?prodWorkTaskId=${encodeURIComponent(task.id)}`
+    ), '工单任务审核生效')
+    const effectiveTask = this.assertOwnedTask(unwrap(await this.api.getBusiness(
+      `/mes/prodWorkTask/queryById?id=${encodeURIComponent(task.id)}`
+    ), '工单任务审核后回读'), task.id)
+    assert.equal(effectiveTask.isEffective, 'Y', '正式排产任务审核后必须生效')
   }
 
   async startWork () {
@@ -609,6 +672,7 @@ export class ExecutionWorkflowFixture {
       this.owned.includes(resource), '清理专属资源所有权未登记')
     const definition = cleanupDefinitions[resource.kind]
     assert(definition, '清理资源类型无效')
+    const deletedColumn = definition.deletedColumn || 'deleted'
     const value = (text) => `'${sqlText(text)}'`
     let ownership
     if (resource.kind === 'work') {
@@ -620,6 +684,16 @@ export class ExecutionWorkflowFixture {
       } else {
         ownership += ` AND remark=${value(this.marker)}`
       }
+    } else if (resource.kind === 'inventory') {
+      const dimensions = resource.dimensions
+      assert(dimensions, '专属库存事实缺少维度所有权')
+      ownership = [
+        `warehouse_id=${value(dimensions.warehouseId)}`,
+        `material_id=${value(dimensions.materialId)}`,
+        `ware_area_id=${value(dimensions.wareAreaId)}`,
+        `ware_location_id=${value(dimensions.wareLocationId)}`,
+        `batch_no=${value(dimensions.batchNo)}`
+      ].join(' AND ')
     } else {
       const identityColumn = {
         area: 'area_code', location: 'location_code', opening: 'bill_no',
@@ -633,29 +707,20 @@ export class ExecutionWorkflowFixture {
     }
     const id = await queryId(
       `SELECT id FROM ${definition.table}
-       WHERE tenant_id=1 AND deleted=0 AND id=${value(resource.id)} AND ${ownership}`,
+       WHERE tenant_id=1 AND ${deletedColumn}=0 AND id=${value(resource.id)} AND ${ownership}`,
       `清理 ${resource.kind}`
     )
     assert.equal(id, resource.id, '清理资源所有权主键不匹配')
   }
 
   async confirmDeleted (resource, caseRecord) {
-    let apiActive = false
-    let apiEvidence = ''
-    if (resource.kind === 'work') {
-      try {
-        const detail = unwrap(await this.api.getBusiness(
-          `/mes/prodWork/queryById?id=${encodeURIComponent(resource.id)}`
-        ), '删除后工单回读')
-        apiActive = detail != null && detail.deleted !== true && String(detail.deleted) !== '1'
-        apiEvidence = JSON.stringify(detail)
-      } catch (error) {
-        // Query APIs reject missing rows; only independent SQL can prove deletion.
-        apiEvidence = error.message
-      }
-    }
+    const definition = cleanupDefinitions[resource.kind]
+    const deletedColumn = definition.deletedColumn || 'deleted'
+    const apiEvidence = resource.kind === 'work'
+      ? '工单详情接口对已删除记录返回业务错误，使用租户范围数据库回读确认'
+      : ''
     const snapshot = await runReadOnlySql(
-      `SELECT id, deleted+0 FROM ${cleanupDefinitions[resource.kind].table}
+      `SELECT id, ${deletedColumn}+0 FROM ${definition.table}
        WHERE tenant_id=1 AND id='${sqlText(resource.id)}'`
     )
     caseRecord.database = [...(caseRecord.database || []), {
@@ -663,21 +728,118 @@ export class ExecutionWorkflowFixture {
     }]
     if (!snapshot.available) throw new Error(`清理未完成：${snapshot.reason}`)
     assert(Array.isArray(snapshot.rows) && snapshot.rows.length <= 1 &&
-      snapshot.rows.every((row) => String(row[0]) === resource.id && String(row[1]) === '1') &&
-      !apiActive, `${resource.kind}=${resource.id} 删除后仍有残留或删除证据无效`)
+      snapshot.rows.every((row) => String(row[0]) === resource.id && String(row[1]) === '1'),
+    `${resource.kind}=${resource.id} 删除后仍有残留或删除证据无效`)
+  }
+
+  async retainReferencedWarehouse (resource, caseRecord) {
+    const detail = unwrap(await this.api.getBusiness(
+      `/mes/wmsWareHouse/queryById?id=${encodeURIComponent(resource.id)}`
+    ), '引用仓库停用前回读')
+    assert.equal(String(detail?.id), resource.id, '引用仓库所有权主键不匹配')
+    assert.equal(detail.code, resource.identity, '引用仓库编码所有权不匹配')
+    assert.equal(detail.mark, this.marker, '引用仓库标记所有权不匹配')
+    unwrap(await this.api.putBusiness('/mes/wmsWareHouse/edit', {
+      id: resource.id,
+      pid: detail.pid,
+      code: detail.code,
+      name: detail.name,
+      isEnabled: false
+    }), '引用仓库停用')
+    const disabled = unwrap(await this.api.getBusiness(
+      `/mes/wmsWareHouse/queryById?id=${encodeURIComponent(resource.id)}`
+    ), '引用仓库停用后回读')
+    assert.equal(String(disabled?.id), resource.id, '停用后仓库主键不匹配')
+    assert.equal(disabled.code, resource.identity, '停用后仓库编码不匹配')
+    assert.equal(disabled.mark, this.marker, '停用后仓库标记不匹配')
+    assert(
+      disabled.isEnabled === false ||
+      String(disabled.isEnabled).toLowerCase() === 'false' ||
+      Number(disabled.isEnabled) === 0,
+      '被历史单据引用的专属仓库必须正式停用'
+    )
+    resource.cleanup = 'RETAINED_AUDIT_DISABLED'
+    caseRecord.notes.push(
+      `仓库 ${resource.id} 被作废期初单审计历史引用，已通过正式接口停用并保留审计事实。`
+    )
+    addCheck(caseRecord, `专属 ${resource.kind}=${resource.id} 停用并保留审计已确认`,
+      true, resource.cleanup)
+    return true
   }
 
   async cleanupResource (resource, caseRecord) {
     const label = `${resource.kind}=${resource.id}`
     try {
+      if (resource.kind === 'task') {
+        // Parent work-order revocation formally removes its task. Avoid a
+        // second void request after that state transition.
+        const snapshot = await runReadOnlySql(
+          `SELECT id, is_deleted+0 FROM mes_prod_work_task
+           WHERE tenant_id=1 AND id='${sqlText(resource.id)}'`
+        )
+        if (!snapshot.available) throw new Error(`清理未完成：${snapshot.reason}`)
+        if (snapshot.rows.length === 0 ||
+          (snapshot.rows.length === 1 && String(snapshot.rows[0][1]) === '1')) {
+          await this.confirmDeleted(resource, caseRecord)
+          resource.cleanup = 'DELETED_VERIFIED'
+          addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+          return true
+        }
+      }
+      if (resource.kind === 'inventory') {
+        await this.assertCleanupOwnership(resource)
+        const snapshot = await runReadOnlySql(
+          `SELECT id, qty, available_qty, lock_qty, hold_qty, frozen_qty,
+                  pending_putaway_qty, deleted+0, is_closed
+           FROM mes_stk_inventory
+           WHERE tenant_id=1 AND deleted=0 AND id='${sqlText(resource.id)}'`
+        )
+        caseRecord.database = [...(caseRecord.database || []), {
+          stage: 'execution-cleanup-inventory-balance',
+          kind: resource.kind,
+          id: resource.id,
+          ...snapshot
+        }]
+        if (!snapshot.available) throw new Error(`清理未完成：${snapshot.reason}`)
+        assert.equal(snapshot.rows.length, 1, '专属库存事实清理前必须唯一存在')
+        const quantities = snapshot.rows[0].slice(1, 7)
+        assert(
+          quantities.every(isZeroQuantity),
+          `专属库存事实仍有非零分量，拒绝删除：${JSON.stringify(quantities)}`
+        )
+        unwrap(await this.api.deleteBusiness(
+          `${cleanupDefinitions.inventory.endpoint}?id=${encodeURIComponent(resource.id)}`
+        ), `删除 ${label}`)
+        await this.confirmDeleted(resource, caseRecord)
+        resource.cleanup = 'DELETED_VERIFIED'
+        addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+        return true
+      }
       await this.assertCleanupOwnership(resource)
       if (resource.kind === 'work') {
-        try {
-          unwrap(await this.api.request('POST', '/mes/prodWork/cancel', {
-            id: resource.id, prodWorkOrderId: resource.id
-          }), '取消专属工单')
-        } catch (error) {
-          caseRecord.notes.push(`取消工单 ${resource.id} 失败：${error.message}`)
+        const taskRows = rowsOf(await this.api.getBusiness(
+          `/mes/prodWorkTask/list?pageNo=1&pageSize=100&workTicketId=${encodeURIComponent(resource.id)}`
+        ), '清理前工单任务回读')
+        const effectiveTasks = taskRows.filter((task) => task?.isEffective === 'Y')
+        if (taskRows.length === 0 || effectiveTasks.length > 0) {
+          unwrap(await this.api.request(
+            'GET',
+            `/mes/prodWorkTask/void?prodWorkId=${encodeURIComponent(resource.id)}`
+          ), '作废专属工单任务并复位工单')
+        }
+        unwrap(await this.api.request('POST', '/mes/prodWork/revocation', {
+          id: resource.id, prodWorkOrderId: resource.id
+        }), '撤回专属工单')
+      }
+      if (resource.kind === 'task') {
+        const task = unwrap(await this.api.getBusiness(
+          `/mes/prodWorkTask/queryById?id=${encodeURIComponent(resource.id)}`
+        ), '清理前工单任务回读')
+        if (task?.isEffective === 'Y') {
+          unwrap(await this.api.request(
+            'GET',
+            `/mes/prodWorkTask/voidOnly?prodWorkTaskId=${encodeURIComponent(resource.id)}`
+          ), '作废专属工单任务')
         }
       }
       if (resource.kind === 'opening') {
@@ -690,11 +852,28 @@ export class ExecutionWorkflowFixture {
         assert.equal(Number(detail.isVoided), 1, '专属期初库存未确认作废')
         resource.cleanup = 'VOIDED_RETAINED'
       } else {
-        unwrap(await this.api.deleteBusiness(
-          `${cleanupDefinitions[resource.kind].endpoint}?id=${encodeURIComponent(resource.id)}`
-        ), `删除 ${label}`)
-        await this.confirmDeleted(resource, caseRecord)
-        resource.cleanup = 'DELETED_VERIFIED'
+        try {
+          const deleteOptions = resource.kind === 'warehouse'
+            ? {
+                expectedBusinessRejection: {
+                  code: 500,
+                  message: '已被引用，不能删除！',
+                  allowServiceCode: true
+                }
+              }
+            : undefined
+          unwrap(await this.api.deleteBusiness(
+            `${cleanupDefinitions[resource.kind].endpoint}?id=${encodeURIComponent(resource.id)}`,
+            deleteOptions
+          ), `删除 ${label}`)
+          await this.confirmDeleted(resource, caseRecord)
+          resource.cleanup = 'DELETED_VERIFIED'
+        } catch (error) {
+          if (resource.kind !== 'warehouse' || !/已被引用，不能删除/.test(error.message)) {
+            throw error
+          }
+          return await this.retainReferencedWarehouse(resource, caseRecord)
+        }
       }
       addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
       return true
@@ -719,8 +898,8 @@ export class ExecutionWorkflowFixture {
       results.push(await this.cleanupResource(resource, caseRecord))
     }
     for (const reportId of [...this.reportIds].reverse()) await clean('report', reportId)
-    for (const task of this.tasks) await clean('task', task.id)
     for (const work of this.works) await clean('work', work.id)
+    for (const task of this.tasks) await clean('task', task.id)
     if (this.order) await clean('order', this.order.id)
     for (const material of this.owned.filter((item) => item.kind === 'material')) {
       try {
@@ -731,7 +910,13 @@ export class ExecutionWorkflowFixture {
         assert.equal(String(detail?.id), material.id, '专属物料所有权主键不匹配')
         assert.equal(detail.code, material.identity, '专属物料所有权编码不匹配')
         assert.equal(detail.remark, this.marker, '专属物料所有权标记不匹配')
-        if (String(detail?.defaultProdBom || '') !== '') {
+        const hasDefaultReferences = [
+          detail?.defaultProdBom,
+          detail?.defaultWare,
+          detail?.defaultWareArea,
+          detail?.defaultWareLocation
+        ].some((value) => String(value ?? '') !== '')
+        if (hasDefaultReferences) {
           // Preserve fields required by material validation, never replay the full entity.
           unwrap(await this.api.putBusiness('/mes/basMaterial/edit', {
             id: material.id,
@@ -756,7 +941,10 @@ export class ExecutionWorkflowFixture {
             oneBarcode: detail.oneBarcode,
             leadTime: detail.leadTime,
             bufferTime: detail.bufferTime,
-            defaultProdBom: ''
+            defaultProdBom: '',
+            defaultWare: '',
+            defaultWareArea: '',
+            defaultWareLocation: ''
           }), '清理物料默认生产 BOM')
           const cleared = unwrap(await this.api.getBusiness(
             `/mes/basMaterial/queryById?id=${encodeURIComponent(material.id)}`
@@ -765,6 +953,9 @@ export class ExecutionWorkflowFixture {
           assert.equal(cleared.code, material.identity, '清理后专属物料编码不匹配')
           assert.equal(cleared.remark, this.marker, '清理后专属物料标记不匹配')
           assert.equal(String(cleared.defaultProdBom ?? ''), '', '专属物料默认生产 BOM 未清空')
+          assert.equal(String(cleared.defaultWare ?? ''), '', '专属物料默认仓库未清空')
+          assert.equal(String(cleared.defaultWareArea ?? ''), '', '专属物料默认库区未清空')
+          assert.equal(String(cleared.defaultWareLocation ?? ''), '', '专属物料默认库位未清空')
         }
       } catch (error) {
         caseRecord.notes.push(`清理物料 ${material.id} 默认生产 BOM 失败，残留或未清理：${error.message}`)
@@ -772,7 +963,7 @@ export class ExecutionWorkflowFixture {
         results.push(false)
       }
     }
-    const cleanupOrder = ['opening', 'route', 'procedure', 'bom', 'material', 'location', 'area', 'warehouse']
+    const cleanupOrder = ['opening', 'inventory', 'route', 'procedure', 'bom', 'material', 'location', 'area', 'warehouse']
     for (const kind of cleanupOrder) {
       for (const resource of this.owned.filter((item) => item.kind === kind).reverse()) {
         results.push(await this.cleanupResource(resource, caseRecord))
@@ -783,8 +974,11 @@ export class ExecutionWorkflowFixture {
     }
     const complete = results.every(Boolean)
     this.record.executionFixture.cleanup = complete ? 'VERIFIED' : 'INCOMPLETE'
+    const retainedOpening = this.owned.some((resource) => resource.kind === 'opening')
     caseRecord.notes.push(complete
-      ? `AUTOTEST 夹具 ${this.marker} 清理已回读确认；作废期初单保留审计历史。`
+      ? `AUTOTEST 夹具 ${this.marker} 清理已回读确认${retainedOpening
+          ? '；作废期初单保留审计历史'
+          : ''}。`
       : `AUTOTEST 夹具 ${this.marker} 清理未完成，残留与失败证据已记录。`)
   }
 }

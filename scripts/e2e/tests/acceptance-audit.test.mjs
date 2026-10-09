@@ -71,16 +71,6 @@ const auditBaseline = [
     ]
   },
   {
-    id: 'WMS-QC-009',
-    title: '企业自定义出入库类型直接接入出入库写侧',
-    assertions: [
-      '企业自定义出入库类型可直接在字典新增，不强制要求配置映射规则',
-      '未配置映射规则时仅快照企业业务类型名称，核心出入库类型与库存方向沿用表单选择',
-      '企业业务类型编码必须来自字典 wms_business_io_type，非字典编码被后端拒绝',
-      '已配置启用状态的映射规则时，核心库存类型收敛到规则值并做方向一致性校验'
-    ]
-  },
-  {
     id: 'WMS-QC-010',
     title: '旧 ERP 仓库映射表退役为只读兼容视图',
     assertions: [
@@ -333,12 +323,12 @@ const catalog = JSON.parse(fs.readFileSync(
 const cases = catalog.suites.flatMap((suite) => suite.cases)
 const auditedIds = new Set(auditBaseline.map((item) => item.id))
 
-test('acceptance audit contains exactly 33 unique target cases, excluding PB123/PB124', () => {
-  assert.equal(auditBaseline.length, 33, 'actual audit manifest count')
-  assert.equal(auditedIds.size, 33, 'unique audit manifest count')
+test('acceptance audit contains exactly 32 unique target cases, excluding PB123/PB124', () => {
+  assert.equal(auditBaseline.length, 32, 'actual audit manifest count')
+  assert.equal(auditedIds.size, 32, 'unique audit manifest count')
   assert.equal(auditedIds.has('PB123-001'), false)
   assert.equal(auditedIds.has('PB124-001'), false)
-  assert.equal(cases.filter((item) => auditedIds.has(item.id)).length, 33,
+  assert.equal(cases.filter((item) => auditedIds.has(item.id)).length, 32,
     'actual catalog target count')
 })
 

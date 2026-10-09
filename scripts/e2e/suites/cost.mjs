@@ -1712,10 +1712,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         passed: (await page.getByText('期初', { exact: false }).count()) > 0,
         details: '真实 Chrome 成本工作台期初/上期在制入口'
       })
+      // 上期结转阶段由远端 workspace-state 异步 hydrate 派生，必须等分支真正切到
+      // 上期在制后再取口径提示，否则会因初始渲染仍处于期初阶段而漏判提示。
+      await page
+        .getByText('上期结转', { exact: false })
+        .first()
+        .waitFor({ state: 'visible', timeout: 30000 })
       // 口径说明挂在悬浮提示里，逐个小问号 hover，直到目标文案出现。
       const carryoverRuleTriggers = page.locator(
         '.opening-wip-workspace .el-tooltip__trigger'
       )
+      await carryoverRuleTriggers.first().waitFor({ state: 'visible', timeout: 30000 })
       const carryoverTriggerCount = await carryoverRuleTriggers.count()
       for (let index = 0; index < carryoverTriggerCount; index++) {
         await carryoverRuleTriggers.nth(index).hover().catch(() => {})

@@ -569,7 +569,7 @@
         {
           "id": "PB033-002",
           "title": "客商等级设置页真实渲染与角色维度读取",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["当前租户已登录", "PB-033 客商等级菜单 Flyway 已执行"],
           "routes": ["/base/partner-level"],
           "assertions": [
@@ -855,7 +855,7 @@
         {
           "id": "PB028-001",
           "title": "业务选项目录完整性与事实源治理",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["当前租户存在系统配置查询权限"],
           "routes": ["/system/config"],
           "assertions": [
@@ -2116,7 +2116,7 @@
         {
           "id": "MES-BASE-001",
           "title": "企业生产类型映射系统生产场景与规则版本",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["生产订单根节点和正常/紧急生产模板已预置"],
           "routes": ["/mes/produce/order", "/system/settings/production"],
           "assertions": [
@@ -2220,7 +2220,7 @@
         {
           "id": "PB102-001",
           "title": "设备产能按产品维度承载版本并发布/停用",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["工艺路线与工序设备关系已维护"],
           "routes": ["/settings/production/technique"],
           "assertions": [
@@ -2235,7 +2235,7 @@
         {
           "id": "PB102-002",
           "title": "工序设备产能版本真实写侧：草稿保存、按节点回读与字段契约",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["工艺路线存在已绑定设备的工序节点"],
           "routes": ["/settings/production/technique"],
           "assertions": [
@@ -2250,7 +2250,7 @@
         {
           "id": "PB102-003",
           "title": "产能读取键升级为「工序+设备+产品」维度",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["工艺路线与工序设备关系已维护"],
           "routes": ["/settings/production/technique"],
           "assertions": [
@@ -2311,7 +2311,7 @@
         {
           "id": "PB038-004",
           "title": "WMS 出入库单据明细品级选择控件",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": [
             "公共存货品级目录已维护 A/B/C",
             "VxeTableDialog 明细表使用 grade_select 列"
@@ -2329,7 +2329,7 @@
         {
           "id": "PB038-005",
           "title": "办公用品/样品/赠品/销售出库明细列配置齐全且含品级列",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": [
             "公共存货品级目录已维护 A/B/C",
             "VxeTableDialog 明细表使用 grade_select 列"
@@ -2722,7 +2722,7 @@
         {
           "id": "QUALITY-BASE-001",
           "title": "四类核心质检场景与企业子类型映射",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["初始化中心已预置 101/104/201/300 四类标准质检场景"],
           "routes": ["/system/settings/mes-quality"],
           "assertions": [
@@ -2737,7 +2737,7 @@
         {
           "id": "QUALITY-BASE-002",
           "title": "质检项目判定与发布",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["质检项目分类已维护"],
           "routes": ["/mes/quality/item"],
           "assertions": [
@@ -2752,7 +2752,7 @@
         {
           "id": "QUALITY-BASE-003",
           "title": "质检方案发布版本与正式快照",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["质检项目已发布"],
           "routes": ["/mes/quality/plan"],
           "assertions": [

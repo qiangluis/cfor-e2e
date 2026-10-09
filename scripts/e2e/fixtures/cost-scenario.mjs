@@ -81,7 +81,7 @@ const listPeriods = async (api) => {
   return page.list
 }
 
-/** 未来月份池：只排除已被 LOCKED 模型或既有期间占用的月份。 */
+/** 未来月份池：只排除已被 LOCKED 模型或既有期间占用的月份，并保证多月份场景连续。 */
 const allocateMonths = async (api, count) => {
   const models = responseData(
     await api.getBusiness('/cost/model-versions?accountingOrgId=1&pageNo=1&pageSize=100'),
@@ -92,15 +92,28 @@ const allocateMonths = async (api, count) => {
     ...(models?.list || []).filter((row) => row.status === 'LOCKED').map((row) => row.effectiveMonth),
     ...periods.map((row) => row.period)
   ])
-  const pool = []
-  for (let year = 2200; year < 2260 && pool.length < 240; year++) {
+  const available = new Set()
+  for (let year = 2200; year < 2260; year++) {
     for (let index = 1; index <= 12; index++) {
       const month = `${year}-${String(index).padStart(2, '0')}`
-      if (!used.has(month)) pool.push(month)
+      if (!used.has(month)) available.add(month)
     }
   }
-  if (pool.length < count) throw new Error('No unused far-future month for the cost scenario fixture')
-  return pool.slice(0, count)
+  const pool = []
+  for (let year = 2200; year < 2260; year++) {
+    for (let index = 1; index <= 12; index++) {
+      const month = `${year}-${String(index).padStart(2, '0')}`
+      if (!available.has(month)) continue
+      const candidate = [month]
+      for (let offset = 1; offset < count; offset++) {
+        const next = shiftMonth(month, offset)
+        if (!available.has(next)) break
+        candidate.push(next)
+      }
+      if (candidate.length === count) return candidate
+    }
+  }
+  throw new Error(`No ${count} consecutive unused far-future months for the cost scenario fixture`)
 }
 
 const loginAs = async (record, username, password) => {
