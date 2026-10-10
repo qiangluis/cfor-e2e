@@ -106,9 +106,9 @@ export const PROJECT_REPORT_DEFINITIONS = [
   { reportType: 'RELEASE', path: 'release' },
   { reportType: 'GO_LIVE_ISSUE', path: 'go-live-issue' },
   { reportType: 'ACCEPTANCE_RECTIFICATION', path: 'acceptance-rectification' },
-  { reportType: 'REVIEW', path: 'review' },
+  { reportType: 'PROJECT_REVIEW', path: 'review' },
   { reportType: 'AFTER_SALES_HANDOVER', path: 'after-sales-handover' },
-  { reportType: 'CLOSEOUT', path: 'closeout' }
+  { reportType: 'PROJECT_CLOSEOUT', path: 'closeout' }
 ]
 
 export const parseRiskLevelHistory = (value) => {
@@ -168,7 +168,32 @@ const resolveEnabledProjectType = async (api, excluded = new Set()) => {
   return row.configCode
 }
 
-const createDedicatedProject = async ({ api, caseId, projectType, caseRecord }) => {
+const confirmDedicatedProjectBaselines = async (api, fixture) => {
+  // PB-911：正式执行只能由四项已确认基线触发，普通编辑不能绕过基线门禁。
+  for (const baselineType of ['SCOPE', 'SCHEDULE', 'RESOURCE', 'ACCEPTANCE']) {
+    await api.postBusiness('/pm/baseline/save', {
+      projectId: fixture.projectId,
+      baselineType,
+      contentJson: JSON.stringify({ marker: fixture.marker, baselineType, source: 'E2E' }),
+      confirm: true
+    })
+  }
+  const baselineList = listOf(await api.getBusiness(`/pm/baseline/list?projectId=${fixture.projectId}`))
+  const confirmedTypes = new Set(
+    baselineList.filter((item) => item?.status === 'CONFIRMED').map((item) => item?.baselineType)
+  )
+  const missing = ['SCOPE', 'SCHEDULE', 'RESOURCE', 'ACCEPTANCE'].filter((type) => !confirmedTypes.has(type))
+  if (missing.length) {
+    throw new Error(`四项基线确认后仍缺失：${missing.join(',')}`)
+  }
+  const project = dataOf(await api.getBusiness(`/pm/project/get?id=${fixture.projectId}`))
+  if (project?.status !== 'EXECUTING') {
+    throw new Error(`四项基线确认后项目未进入 EXECUTING：${JSON.stringify({ projectId: fixture.projectId, status: project?.status })}`)
+  }
+  return project
+}
+
+const createDedicatedProject = async ({ api, caseId, projectType, caseRecord, activate = false }) => {
   const ownerId = await resolveProjectOwnerId(api)
   const marker = unique(`E2E_${caseId.replace(/[^A-Z0-9]+/gi, '_')}_PROJECT`)
   const handoverId = numericId(dataOf(await api.postBusiness(
@@ -191,7 +216,12 @@ const createDedicatedProject = async ({ api, caseId, projectType, caseRecord }) 
   }
   caseRecord.evidence.push(`创建并回读本轮专属空项目 projectId=${projectId}, handoverId=${handoverId}, marker=${marker}`)
   caseRecord.notes.push('PM 正式项目域当前无回收/删除接口；本轮仅恢复专属项目基线并严格回读，不调用另一套 /pms/pm/project API。')
-  return { projectId, handoverId, ownerId, marker, projectType, project }
+  const fixture = { projectId, handoverId, ownerId, marker, projectType, project }
+  if (activate) {
+    fixture.project = await confirmDedicatedProjectBaselines(api, fixture)
+    caseRecord.evidence.push(`专属项目 ${projectId} 已确认 SCOPE/SCHEDULE/RESOURCE/ACCEPTANCE 四项基线并进入 EXECUTING`)
+  }
+  return fixture
 }
 
 const restoreDedicatedProject = async (api, fixture, overrides = {}) => {
@@ -208,7 +238,8 @@ const restoreDedicatedProject = async (api, fixture, overrides = {}) => {
 }
 
 export const buildDedicatedProjectHandoverPayload = ({ marker, projectType }) => ({
-  sourceType: marker,
+  sourceType: 'MANUAL',
+  sourceBusinessNo: marker,
   projectName: `${marker} 专属空项目`,
   projectType,
   customerNameSnapshot: marker,
@@ -300,7 +331,7 @@ const createManualAssetFixture = async (api, prefix) => {
   }
 }
 
-const createProjectAcceptanceAssetFixture = async (api, project, prefix) => {
+const createProjectAcceptanceAssetFixture = async (api, project, prefix, baselineId) => {
   const materialId = await firstEnabledMaterialId(api)
   if (!materialId) throw new Error('BLOCKED: 当前租户没有已启用且可采购的 Base 存货档案')
   const customerNo = unique(`${prefix}_CUSTOMER`)
@@ -315,7 +346,15 @@ const createProjectAcceptanceAssetFixture = async (api, project, prefix) => {
     plannedDate: dateOffset(0),
     customerRepresentative: `${prefix} 客户代表`,
     resultSummary: 'E2E 项目验收通过，用于验证售后资产来源引用',
-    evidenceUri: 'e2e://project-after-sales/acceptance'
+    evidenceUri: 'e2e://project-after-sales/acceptance',
+    // PB-939 门禁：验收通过必须匹配范围基线并留客户确认人/日期。
+    baselineId,
+    deliveryEvidenceJson: JSON.stringify({
+      source: 'E2E',
+      evidenceUri: 'e2e://project-after-sales/acceptance'
+    }),
+    customerConfirmPerson: `${prefix} 客户确认人`,
+    customerConfirmDate: dateOffset(0)
   }))
   await api.putBusiness('/pm/customer-acceptance/status', {
     id: acceptanceId,
@@ -384,6 +423,7 @@ const createMilestoneFixture = async ({
   plannedStartDate,
   plannedEndDate
 }) => {
+  await reserveMilestoneWeight(api, projectId, 10)
   const milestoneId = dataOf(await api.postBusiness('/pm/milestone/save', {
     projectId,
     milestoneName: `${marker} 里程碑`,
@@ -400,6 +440,48 @@ const createMilestoneFixture = async ({
   return {
     milestoneId,
     detail: await getMilestone(api, projectId, milestoneId)
+  }
+}
+
+// 专属项目建项时会按模板展开里程碑并占满 100 权重，新增里程碑前先等比下调已有权重腾出空间。
+const reserveMilestoneWeight = async (api, projectId, newWeight) => {
+  const existing = listOf(await api.getBusiness(`/pm/milestone/list?projectId=${projectId}`))
+  if (!existing.length) return
+  const total = existing.reduce((sum, item) => sum + Number(item?.weightRate ?? 0), 0)
+  if (total + newWeight <= 100) return
+  // 已确认里程碑锁定不可改，只能从仍可编辑的里程碑中腾出权重。
+  const adjustable = existing.filter((item) => item?.confirmed !== true)
+  const lockedWeight = existing
+    .filter((item) => item?.confirmed === true)
+    .reduce((sum, item) => sum + Number(item?.weightRate ?? 0), 0)
+  const budget = 100 - newWeight - lockedWeight
+  if (!adjustable.length || budget < adjustable.length) {
+    throw new Error(`BLOCKED: 无法为新增里程碑预留权重 ${newWeight}（已确认权重 ${lockedWeight}）`)
+  }
+  const base = Math.floor(budget / adjustable.length)
+  let remainder = budget - base * adjustable.length
+  for (const item of adjustable) {
+    const weight = base + (remainder > 0 ? 1 : 0)
+    if (remainder > 0) remainder -= 1
+    if (Number(item.weightRate) === weight) continue
+    const snappedStart = await findWorkingDate(api, item.plannedStartDate)
+    const snappedEnd = await findWorkingDate(api, item.plannedEndDate || item.plannedStartDate)
+    await api.postBusiness('/pm/milestone/save', {
+      id: item.id,
+      projectId,
+      stageId: item.stageId,
+      milestoneName: item.milestoneName,
+      ownerId: item.ownerId,
+      ownerName: item.ownerName,
+      plannedStartDate: snappedStart,
+      plannedEndDate: snappedEnd,
+      weightRate: weight,
+      exitCondition: item.exitCondition ?? null,
+      requiredDeliverablesJson: item.requiredDeliverablesJson ?? null,
+      healthStatus: item.healthStatus ?? null,
+      warningStatus: item.warningStatus ?? null,
+      manualConclusion: item.manualConclusion ?? null
+    })
   }
 }
 
@@ -829,6 +911,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       caseRecord.notes.push('BLOCKED：无法取得当前登录用户编号，不能创建真实日报填报人。')
       return { token, api, partial: true }
     }
+    // 行政任务日期同样受工作日和项目计划窗口双门禁，必须在项目窗口内取真实工作日。
+    const projectEnd = project.plannedEndDate || dateOffset(7)
+    const taskStart = await findWorkingDate(api, project.plannedStartDate || dateOffset(0))
+    let taskEnd = await findWorkingDate(api, taskStart)
+    if (taskEnd > projectEnd) {
+      taskEnd = taskStart
+    }
     const taskId = dataOf(await api.postBusiness('/pm/task/create-administrative', {
       projectId,
       taskName: `${unique('E2E_REPORT_TASK')} 周报任务状态建议`,
@@ -836,8 +925,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       ownerId: reporterId,
       ownerName: '管理员',
       acceptanceOwnerId: reporterId,
-      plannedStartDate: project.plannedStartDate || dateOffset(0),
-      plannedEndDate: project.plannedEndDate || dateOffset(7),
+      plannedStartDate: taskStart,
+      plannedEndDate: taskEnd,
       priority: 2,
       standardHours: 2,
       plannedHours: 1,
@@ -2336,15 +2425,24 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB127-001') {
-    const projectPage = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=20')
-    const project = listOf(projectPage).find(
-      (item) => !['CLOSED', 'TERMINATED'].includes(item?.status)
-    )
-    if (!project?.id) {
-      caseRecord.notes.push('BLOCKED：当前租户无未关闭交付项目，无法创建真实项目验收来源资产。')
+    // PB-939 要求验收通过必须匹配已确认范围基线，因此使用本轮专属项目自带四项基线。
+    const projectType = await resolveEnabledProjectType(api)
+    const dedicated = await createDedicatedProject({
+      api,
+      caseId,
+      projectType,
+      caseRecord,
+      activate: true
+    })
+    const project = dedicated.project
+    const baseline = listOf(
+      await api.getBusiness(`/pm/baseline/list?projectId=${dedicated.projectId}`)
+    ).find((item) => item?.baselineType === 'SCOPE' && item?.status === 'CONFIRMED')
+    if (!baseline?.id) {
+      caseRecord.notes.push('BLOCKED：专属项目缺少已确认 SCOPE 基线，无法通过验收证据门禁。')
       return { token, api, partial: true }
     }
-    const fixture = await createProjectAcceptanceAssetFixture(api, project, 'PB127')
+    const fixture = await createProjectAcceptanceAssetFixture(api, project, 'PB127', baseline.id)
     try {
       const detail = fixture.detail
       const periods = detail?.servicePeriods || []
@@ -2594,7 +2692,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB945-001') {
     const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
     try {
       const workingDate = await findWorkingDate(api, dateOffset(-14))
       const outsideDate = await findWorkingDate(api, dateOffsetFrom(workingDate, 10))
@@ -2707,9 +2805,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       caseRecord.checks.push({
         name: '专属项目周期与状态清理后回读',
         passed:
-          restored?.status === fixture.project.status &&
-          String(restored?.plannedStartDate) === String(fixture.project.plannedStartDate) &&
-          String(restored?.plannedEndDate) === String(fixture.project.plannedEndDate),
+          isDedicatedProject(restored, fixture) &&
+          restored?.status === fixture.project.status,
         details: `projectId=${fixture.projectId}, status=${restored?.status}`
       })
     }
@@ -2718,7 +2815,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB947-001') {
     const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
     try {
       const workingDate = await findWorkingDate(api, dateOffset(-14))
       await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
@@ -2851,7 +2948,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB949-001') {
     const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
     try {
       const workingDate = await findWorkingDate(api, dateOffset(-14))
       await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
@@ -2977,7 +3074,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB951-001') {
     const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
     try {
       const workingDate = await findWorkingDate(api, dateOffset(-14))
       await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
@@ -3073,7 +3170,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB953-001') {
     const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
     try {
       const workingDate = await findWorkingDate(api, dateOffset(-14))
       await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
@@ -3151,7 +3248,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB955-001') {
     const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
     try {
       const workingDate = await findWorkingDate(api, dateOffset(-14))
       await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
@@ -3223,16 +3320,26 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       const row = (summary?.rows || []).find(
         (item) => String(item.userId) === String(fixture.ownerId)
       )
+      // 专属项目在交接评审时会按模板展开里程碑与任务，plannedWeight 因此包含模板计划量；
+      // 绩效口径按公开公式校验：completionRate 必须等于 deliveredWeight / plannedWeight * 100。
+      const plannedWeight = Number(row?.plannedWeight)
+      const deliveredWeight = Number(row?.deliveredWeight)
+      const expectedCompletionRate =
+        Number.isFinite(plannedWeight) && plannedWeight > 0
+          ? Number(((deliveredWeight * 100) / plannedWeight).toFixed(2))
+          : null
       caseRecord.checks.push({
         name: '绩效汇总按正式已验收任务和已完成里程碑计算权重与完成率',
         passed:
           summary?.reportType === 'PROJECT_PERFORMANCE' &&
           Number(row?.acceptedTaskCount) >= 1 &&
           Number(row?.completedMilestoneCount) >= 1 &&
-          Number(row?.plannedWeight) >= 18 &&
-          Number(row?.deliveredWeight) >= 18 &&
-          Number(row?.completionRate) === 100,
-        details: `row=${JSON.stringify(row)}`
+          Number.isFinite(plannedWeight) &&
+          plannedWeight >= deliveredWeight &&
+          deliveredWeight >= 18 &&
+          Number(row?.completionRate) === expectedCompletionRate &&
+          summary?.formula === formula?.formula,
+        details: `row=${JSON.stringify(row)}, expectedCompletionRate=${expectedCompletionRate}`
       })
       const person = dataOf(await api.getBusiness(
         `/pm/report/performance/person?${pushReportQuery({ userId: fixture.ownerId }, query)}`

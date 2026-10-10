@@ -50,7 +50,8 @@ test('dedicated project handover uses the formal empty-project create contract',
     projectType: 'TYPE_DEPENDENCY'
   })
   assert.deepEqual(payload, {
-    sourceType: 'E2E_PB117_PROJECT_ABC',
+    sourceType: 'MANUAL',
+    sourceBusinessNo: 'E2E_PB117_PROJECT_ABC',
     projectName: 'E2E_PB117_PROJECT_ABC 专属空项目',
     projectType: 'TYPE_DEPENDENCY',
     customerNameSnapshot: 'E2E_PB117_PROJECT_ABC',
@@ -115,9 +116,9 @@ test('PB953 report definitions cover the eleven report routes with unique type/p
       'RELEASE',
       'GO_LIVE_ISSUE',
       'ACCEPTANCE_RECTIFICATION',
-      'REVIEW',
+      'PROJECT_REVIEW',
       'AFTER_SALES_HANDOVER',
-      'CLOSEOUT'
+      'PROJECT_CLOSEOUT'
     ]
   )
 })

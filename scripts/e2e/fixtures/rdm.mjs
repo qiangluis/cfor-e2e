@@ -66,6 +66,29 @@ const today = (offset = 0) => {
   return date.toISOString().slice(0, 10)
 }
 
+const dateOffsetFrom = (dateText, days) => {
+  const date = new Date(`${dateText}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() + days)
+  return date.toISOString().slice(0, 10)
+}
+
+const isHrmWorkingDay = async (api, date) => {
+  const holiday = await getBusiness(api, `/hrm/attendance/holiday/check?day=${encodeURIComponent(`${date}T00:00:00`)}`)
+  if (Number(holiday?.type) === 1) return true
+  if (Number(holiday?.type) === 2) return false
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay()
+  return weekday !== 0 && weekday !== 6
+}
+
+// 项目任务同时受项目计划窗口和 HRM 工作日门禁约束，夹具必须给出真实工作日。
+const findWorkingDate = async (api, startDate, searchDays = 60) => {
+  for (let offset = 0; offset < searchDays; offset += 1) {
+    const candidate = dateOffsetFrom(startDate, offset)
+    if (await isHrmWorkingDay(api, candidate)) return candidate
+  }
+  throw new Error(`BLOCKED: 自 ${startDate} 起 ${searchDays} 天内没有可用 HRM 工作日`)
+}
+
 const summaryOf = (payload) => {
   const value = dataOf(payload)
   if (value === null || value === undefined) return '<empty>'
@@ -228,7 +251,8 @@ export async function createPmProject ({ api, fixture, caseRecord }) {
     throw new Error(`BLOCKED: 正式 PM 建项硬编码要求启用 ${missing.join(', ')}，专属 E2E-RDM 规则不可替代，需主线程确认共享规则修复`)
   }
   const handoverId = await postBusiness(api, '/pm/handover/create', {
-    sourceType: RDM_PREFIX,
+    sourceType: 'MANUAL',
+    sourceBusinessNo: fixture.tag,
     projectName: `${fixture.tag}-PM`,
     projectType: fixture.projectType,
     customerNameSnapshot: fixture.tag,
@@ -519,6 +543,8 @@ export async function runRdmWriteCase ({
 
   if (caseId === 'RDM-002') {
     const { projectId } = await createPmProject({ api, fixture, caseRecord })
+    const taskStart = await findWorkingDate(api, today())
+    const taskEnd = await findWorkingDate(api, taskStart)
     const taskId = asNumberId(await postBusiness(api, '/pm/task/create-administrative', {
       projectId,
       taskName: `${fixture.tag}-task`,
@@ -526,8 +552,8 @@ export async function runRdmWriteCase ({
       ownerId: fixture.ownerId,
       ownerName: fixture.ownerName,
       acceptanceOwnerId: fixture.ownerId,
-      plannedStartDate: today(),
-      plannedEndDate: today(7),
+      plannedStartDate: taskStart,
+      plannedEndDate: taskEnd,
       standardHours: 1,
       plannedHours: 2,
       requiredOutput: fixture.tag,
@@ -758,7 +784,10 @@ export async function runRdmWriteCase ({
     await putBusiness(api, '/pm/change/status', {
       id: changeId,
       status: 'APPROVED',
-      approvalOpinion: `${fixture.tag}-approved`
+      approvalOpinion: `${fixture.tag}-approved`,
+      // PB-949：审批通过必须冻结变更对象版本并确定下游执行策略。
+      objectVersion: Number(before?.objectVersion ?? 1),
+      downstreamStrategy: 'MANUAL'
     })
     const after = await getBusiness(api, `/pm/change/get?id=${changeId}`)
     const approvedSnapshotId = asNumberId(after?.approvedSnapshotId, '审批后范围快照')
@@ -1121,7 +1150,7 @@ export async function runRdmWriteCase ({
       rollbackPlan: `${fixture.tag}-rollback`,
       detail: fixture.tag
     }), '回退方案')
-    await postBusiness(api, '/pm/release/cutover/save', {
+    await postBusiness(api, '/pm/release/cutover-record/save', {
       releaseId,
       environment: 'TEST',
       plannedTime: `${today()}T10:00:00`
