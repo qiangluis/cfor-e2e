@@ -66,9 +66,14 @@ const SELECTORS = {
 const loginContexts = new WeakMap()
 
 export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
-  resourceType === 'media' &&
   error === 'net::ERR_ABORTED' &&
-  /\/ai-human\/digital-human-idle\.webm(?:$|\?)/.test(url || '')
+  (
+    (resourceType === 'media' &&
+      /\/ai-human\/digital-human-idle\.webm(?:$|\?)/.test(url || '')) ||
+    // Vite cancels the local root fetch while openRoute warms the dynamic route
+    // registry. It is a navigation teardown, not a business request failure.
+    (resourceType === 'fetch' && /^http:\/\/127\.0\.0\.1:\d+\/$/.test(url || ''))
+  )
 
 async function firstVisible (page, selectors, timeout = 30000) {
   for (const selector of selectors) {
