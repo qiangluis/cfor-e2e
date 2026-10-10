@@ -25,9 +25,11 @@ import {
   DEFAULT_CASE_TIMEOUT_MS,
   parseRunnerArgs
 } from './lib/runner-options.mjs'
+import { loadPausedCatalog, pauseReasonFor } from './lib/paused.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const catalog = JSON.parse(fs.readFileSync(path.join(here, 'cases/catalog.json'), 'utf8'))
+const pausedCatalog = loadPausedCatalog(path.join(here, 'cases/paused.json'))
 
 const suiteFiles = {
   smoke: 'smoke.mjs',
@@ -323,6 +325,12 @@ async function main () {
         record.cases.push(caseRecord)
         const declaredStatus = definition.status || 'READY'
 
+        const pauseReason = pauseReasonFor(caseDefinition, pausedCatalog)
+        if (pauseReason) {
+          finishCase(caseRecord, 'SKIPPED', `已暂停自动化：${pauseReason}`)
+          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
+          continue
+        }
         if (completed.has(definition.id)) {
           finishCase(caseRecord, 'SKIPPED', '断点续跑：此前已通过')
           record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
