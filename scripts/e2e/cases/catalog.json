@@ -5673,6 +5673,180 @@
           "reverse": [
             "售后只维护转接规则，不复制排班事实"
           ]
+        },
+        {
+          "id": "PB945-001",
+          "status": "READY",
+          "title": "日报、周报、月报按项目周期生成只读事实快照",
+          "preconditions": [
+            "已执行 PB-945 项目报告 Flyway",
+            "当前租户存在启用项目类型和 HRM 工作日历"
+          ],
+          "routes": ["/project/reporting/dev-daily/list"],
+          "assertions": [
+            "DAILY、WEEKLY、MONTHLY 周期范围分别按当天、ISO 自然周和自然月生成",
+            "生成报告由服务端构造任务/风险/里程碑只读来源快照",
+            "日报来源按当天过滤周期外任务",
+            "报告生成不反写任务状态和正式任务日期"
+          ],
+          "api": [
+            "/pm/daily-report/generate",
+            "/pm/daily-report/source",
+            "/pm/daily-report/get"
+          ],
+          "database": ["pm_daily_report", "pm_project_task", "pm_project_risk", "pm_project_milestone"],
+          "reverse": [
+            "报告只读来源，正式任务状态和工时事实不由报告生成链路写入"
+          ]
+        },
+        {
+          "id": "PB947-001",
+          "status": "PARTIAL",
+          "acceptanceGaps": [
+            "PB-947：问题/Bug 的关联和转化来源字段已迁移到数据库，但 PmIssue/PmBug 的 DO、ReqVO、RespVO 和 Controller 尚未接入，不能伪造转化闭环",
+            "尚缺风险升级规则命中、结项前关闭或有权接受、跨对象权限与统计口径的完整真实链路",
+            "高等级风险的自动升级通知和处置审计仍未覆盖"
+          ],
+          "title": "风险关联、等级历史、验证关闭，问题与 Bug 保持独立记录",
+          "preconditions": [
+            "已执行 PB-947 风险问题变更迁移",
+            "当前租户存在启用项目类型"
+          ],
+          "routes": ["/project/execution/controls/risk-issue"],
+          "assertions": [
+            "风险可关联任务并保留责任人和期限",
+            "风险等级变化写前值、变化时间和结构化历史",
+            "风险关闭缺少验证人时按领域错误拒绝",
+            "风险验证后关闭并回读关闭时间、验证人和验证时间",
+            "问题、Bug 使用独立记录和编号，不通过转化删除原记录"
+          ],
+          "api": [
+            "/pm/risk/save",
+            "/pm/risk/status",
+            "/pm/issue/save",
+            "/pm/bug/save"
+          ],
+          "database": ["pm_project_risk", "pm_project_issue", "pm_project_bug"],
+          "reverse": [
+            "关闭风险必须验证，问题/Bug 转化不物理删除来源记录"
+          ]
+        },
+        {
+          "id": "PB949-001",
+          "status": "READY",
+          "title": "变更审批冻结版本，服务端一次性执行并校验幂等键",
+          "preconditions": [
+            "已执行 PB-949 字段级变更与执行幂等迁移",
+            "当前租户存在启用项目类型"
+          ],
+          "routes": ["/project/execution/plan-change/list"],
+          "assertions": [
+            "变更按 DRAFT→ASSESSING→PENDING_APPROVAL→APPROVED→EXECUTING→VERIFIED→CLOSED 推进",
+            "审批通过冻结对象版本并记录下游处理策略",
+            "执行写入幂等键、执行人和执行时间并更新字段明细状态",
+            "重复幂等键被领域拒绝且第二条变更不进入执行",
+            "验证关闭保留全链路时间"
+          ],
+          "api": [
+            "/pm/change/save",
+            "/pm/change/status",
+            "/pm/change/get"
+          ],
+          "database": ["pm_project_change", "pm_field_change_detail"],
+          "reverse": [
+            "同一幂等键不产生第二次执行，重复请求只返回领域拒绝"
+          ]
+        },
+        {
+          "id": "PB951-001",
+          "status": "READY",
+          "title": "里程碑准出条件、必需交付物和人工结论分层保存",
+          "preconditions": [
+            "已执行 PB-951 里程碑准出与结论迁移",
+            "HRM 工作日历可判定项目计划窗口内的工作日"
+          ],
+          "routes": ["/project/execution/milestone-confirm/list"],
+          "assertions": [
+            "缺少准出条件或必需交付物的里程碑不能完成",
+            "具备门禁的里程碑确认后可人工完成",
+            "完成回读人工结论、实际完成日期和必需交付物",
+            "里程碑人工完成不代替任务责任人确认或改写任务状态"
+          ],
+          "api": [
+            "/pm/milestone/save",
+            "/pm/milestone/confirm",
+            "/pm/milestone/complete",
+            "/pm/milestone/list"
+          ],
+          "database": ["pm_project_milestone", "pm_project_task"],
+          "reverse": [
+            "完成门禁通过后才写 COMPLETED，不越过准出条件"
+          ]
+        },
+        {
+          "id": "PB953-001",
+          "status": "READY",
+          "title": "十一类项目报表统一筛选、重算口径和导出服务",
+          "preconditions": [
+            "已执行 PB-953 报表口径配置迁移",
+            "报表事实数据来自正式项目、任务、风险和里程碑"
+          ],
+          "routes": ["/project/statistics/overview"],
+          "assertions": [
+            "十一类报表均返回 reportType、metricVersion、RECHECKED 和 generatedAt",
+            "所有报表使用相同 projectId/startDate/endDate 筛选上下文",
+            "Excel 导出复用报表服务并可解析",
+            "导出文件与列表查询使用同一项目、日期和版本口径"
+          ],
+          "api": [
+            "/pm/report/project-progress",
+            "/pm/report/task-execution",
+            "/pm/report/research",
+            "/pm/report/risk-issue",
+            "/pm/report/plan-change",
+            "/pm/report/release",
+            "/pm/report/go-live-issue",
+            "/pm/report/acceptance-rectification",
+            "/pm/report/review",
+            "/pm/report/after-sales-handover",
+            "/pm/report/closeout",
+            "/pm/report/export-excel"
+          ],
+          "database": ["pm_daily_report", "pm_project_task", "pm_project_risk"],
+          "reverse": [
+            "报表只读，不反写项目、任务、风险或里程碑事实"
+          ]
+        },
+        {
+          "id": "PB955-001",
+          "status": "READY",
+          "title": "绩效公式公开、个人明细授权和风险趋势审计",
+          "preconditions": [
+            "已执行 PB-955 绩效配置与权限 Flyway",
+            "当前管理员具备项目报表和个人绩效查看权限"
+          ],
+          "routes": ["/project/ai/performance/dashboard"],
+          "assertions": [
+            "绩效公式、数据来源、剔除规则和可见角色公开可读",
+            "绩效汇总按已验收任务和已完成里程碑计算权重与完成率",
+            "个人绩效明细返回任务、里程碑和统一公式口径",
+            "风险趋势保留等级变化和验证关闭后的处置时长"
+          ],
+          "api": [
+            "/pm/report/performance/formula",
+            "/pm/report/performance/summary",
+            "/pm/report/performance/person",
+            "/pm/report/risk-trend"
+          ],
+          "database": [
+            "pm_modeling_config",
+            "pm_project_task",
+            "pm_project_milestone",
+            "pm_project_risk"
+          ],
+          "reverse": [
+            "个人绩效按登录用户可见范围读取，趋势接口只读风险历史"
+          ]
         }
       ]
     },

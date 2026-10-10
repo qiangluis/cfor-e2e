@@ -1,5 +1,6 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import * as XLSX from 'xlsx'
 
 export const cases = [
   'PB111-001',
@@ -21,7 +22,13 @@ export const cases = [
   'PB128-001',
   'PB129-001',
   'PB126-001',
-  'PB130-001'
+  'PB130-001',
+  'PB945-001',
+  'PB947-001',
+  'PB949-001',
+  'PB951-001',
+  'PB953-001',
+  'PB955-001'
 ]
 
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
@@ -45,6 +52,72 @@ const dateOffset = (days) => {
   const date = new Date()
   date.setDate(date.getDate() + days)
   return date.toISOString().slice(0, 10)
+}
+
+export const resolveReportPeriodRange = (reportType, periodKey) => {
+  const type = String(reportType || '').trim().toUpperCase()
+  const key = String(periodKey || '').trim()
+  if (type === 'DAILY' && /^\d{4}-\d{2}-\d{2}$/.test(key)) {
+    return [key, key]
+  }
+  if (type === 'WEEKLY') {
+    const match = key.match(/^(\d{4})-W(\d{2})$/)
+    if (!match) return null
+    const year = Number(match[1])
+    const week = Number(match[2])
+    if (week < 1 || week > 53) return null
+    const jan4 = new Date(Date.UTC(year, 0, 4))
+    const weekday = jan4.getUTCDay() || 7
+    const monday = new Date(jan4)
+    monday.setUTCDate(jan4.getUTCDate() - weekday + 1 + (week - 1) * 7)
+    const sunday = new Date(monday)
+    sunday.setUTCDate(monday.getUTCDate() + 6)
+    return [monday.toISOString().slice(0, 10), sunday.toISOString().slice(0, 10)]
+  }
+  if (type === 'MONTHLY') {
+    const match = key.match(/^(\d{4})-(\d{2})$/)
+    if (!match) return null
+    const year = Number(match[1])
+    const month = Number(match[2])
+    if (month < 1 || month > 12) return null
+    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate()
+    return [`${match[1]}-${match[2]}-01`, `${match[1]}-${match[2]}-${String(lastDay).padStart(2, '0')}`]
+  }
+  return null
+}
+
+export const isoWeekKey = (dateText) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateText || ''))) return null
+  const date = new Date(`${dateText}T00:00:00Z`)
+  const day = date.getUTCDay() || 7
+  date.setUTCDate(date.getUTCDate() + 4 - day)
+  const year = date.getUTCFullYear()
+  const yearStart = new Date(Date.UTC(year, 0, 1))
+  const week = Math.ceil((((date - yearStart) / 86400000) + 1) / 7)
+  return `${year}-W${String(week).padStart(2, '0')}`
+}
+
+export const PROJECT_REPORT_DEFINITIONS = [
+  { reportType: 'PROJECT_PROGRESS', path: 'project-progress' },
+  { reportType: 'TASK_EXECUTION', path: 'task-execution' },
+  { reportType: 'RESEARCH', path: 'research' },
+  { reportType: 'RISK_ISSUE_BUG', path: 'risk-issue' },
+  { reportType: 'PLAN_CHANGE', path: 'plan-change' },
+  { reportType: 'RELEASE', path: 'release' },
+  { reportType: 'GO_LIVE_ISSUE', path: 'go-live-issue' },
+  { reportType: 'ACCEPTANCE_RECTIFICATION', path: 'acceptance-rectification' },
+  { reportType: 'REVIEW', path: 'review' },
+  { reportType: 'AFTER_SALES_HANDOVER', path: 'after-sales-handover' },
+  { reportType: 'CLOSEOUT', path: 'closeout' }
+]
+
+export const parseRiskLevelHistory = (value) => {
+  try {
+    const parsed = JSON.parse(value || '[]')
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
 }
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
@@ -76,6 +149,79 @@ const projectUpdatePayload = (project, overrides = {}) => ({
   remark: project.remark,
   ...overrides
 })
+
+const numericId = (value, label) => {
+  const text = String(value ?? '')
+  if (!/^\d+$/.test(text)) throw new Error(`BLOCKED: ${label} 未返回合法数据库ID`)
+  return text
+}
+
+const resolveProjectOwnerId = async (api) => {
+  const profile = dataOf(await api.getBusiness('/system/user/profile/get'))
+  return numericId(profile?.id, '项目负责人')
+}
+
+const resolveEnabledProjectType = async (api, excluded = new Set()) => {
+  const rows = listOf(await api.getBusiness('/pm/modeling/list?configKey=projectType&status=ENABLED'))
+  const row = rows.find((item) => item?.configCode && !excluded.has(item.configCode))
+  if (!row) throw new Error('BLOCKED: 没有可用于专属 PM 建项的启用 projectType 配置')
+  return row.configCode
+}
+
+const createDedicatedProject = async ({ api, caseId, projectType, caseRecord }) => {
+  const ownerId = await resolveProjectOwnerId(api)
+  const marker = unique(`E2E_${caseId.replace(/[^A-Z0-9]+/gi, '_')}_PROJECT`)
+  const handoverId = numericId(dataOf(await api.postBusiness(
+    '/pm/handover/create',
+    buildDedicatedProjectHandoverPayload({ marker, projectType })
+  )), '专属项目交接单')
+  await api.putBusiness(`/pm/handover/submit?id=${handoverId}`, undefined)
+  const projectId = numericId(dataOf(await api.putBusiness('/pm/handover/review', {
+    id: handoverId,
+    decision: 'APPROVE',
+    opinion: `${marker} 审核通过`,
+    proposedPmId: ownerId,
+    developmentManagerId: ownerId,
+    consultantId: ownerId
+  })), '专属 PM 项目')
+  const project = dataOf(await api.getBusiness(`/pm/project/get?id=${projectId}`))
+  if (!isDedicatedProject(project, { projectId, handoverId, marker }) ||
+      project?.projectType !== projectType) {
+    throw new Error(`专属 PM 项目归属回读失败：${JSON.stringify({ projectId, handoverId, marker, project })}`)
+  }
+  caseRecord.evidence.push(`创建并回读本轮专属空项目 projectId=${projectId}, handoverId=${handoverId}, marker=${marker}`)
+  caseRecord.notes.push('PM 正式项目域当前无回收/删除接口；本轮仅恢复专属项目基线并严格回读，不调用另一套 /pms/pm/project API。')
+  return { projectId, handoverId, ownerId, marker, projectType, project }
+}
+
+const restoreDedicatedProject = async (api, fixture, overrides = {}) => {
+  const before = dataOf(await api.getBusiness(`/pm/project/get?id=${fixture.projectId}`))
+  if (!isDedicatedProject(before, fixture)) {
+    throw new Error(`专属 PM 项目清理前归属回读失败：projectId=${fixture.projectId}`)
+  }
+  await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, overrides))
+  const after = dataOf(await api.getBusiness(`/pm/project/get?id=${fixture.projectId}`))
+  if (!isDedicatedProject(after, fixture)) {
+    throw new Error(`专属 PM 项目清理后归属回读失败：projectId=${fixture.projectId}`)
+  }
+  return after
+}
+
+export const buildDedicatedProjectHandoverPayload = ({ marker, projectType }) => ({
+  sourceType: marker,
+  projectName: `${marker} 专属空项目`,
+  projectType,
+  customerNameSnapshot: marker,
+  scopeIn: marker,
+  commitments: marker,
+  acceptanceConditions: marker,
+  initialRisks: marker
+})
+
+export const isDedicatedProject = (project, fixture) =>
+  String(project?.id) === String(fixture?.projectId) &&
+  String(project?.handoverId) === String(fixture?.handoverId) &&
+  project?.customerNameSnapshot === fixture?.marker
 
 const firstEnabledMaterialId = async (api) => {
   const response = await api.getBusiness(
@@ -224,6 +370,196 @@ const disableAfterSalesConfig = (api, configType, id) =>
 
 const readAfterSalesConfig = async (api, listPath, id) =>
   listOf(await api.getBusiness(listPath)).find((row) => String(row.id) === String(id))
+
+const getMilestone = async (api, projectId, milestoneId) =>
+  listOf(await api.getBusiness(`/pm/milestone/list?projectId=${projectId}`))
+    .find((item) => String(item.id) === String(milestoneId))
+
+const createMilestoneFixture = async ({
+  api,
+  projectId,
+  ownerId,
+  marker,
+  withGates = true,
+  plannedStartDate,
+  plannedEndDate
+}) => {
+  const milestoneId = dataOf(await api.postBusiness('/pm/milestone/save', {
+    projectId,
+    milestoneName: `${marker} 里程碑`,
+    ownerId,
+    ownerName: '管理员',
+    plannedStartDate,
+    plannedEndDate,
+    weightRate: 10,
+    exitCondition: withGates ? `${marker} 准出条件` : null,
+    requiredDeliverablesJson: withGates ? JSON.stringify([`${marker}-deliverable`]) : null,
+    healthStatus: withGates ? 'NORMAL' : null,
+    warningStatus: withGates ? 'NONE' : null
+  }))
+  return {
+    milestoneId,
+    detail: await getMilestone(api, projectId, milestoneId)
+  }
+}
+
+const createTaskFixture = async ({
+  api,
+  projectId,
+  ownerId,
+  marker,
+  plannedStartDate,
+  plannedEndDate
+}) => {
+  const taskId = dataOf(await api.postBusiness('/pm/task/create-administrative', {
+    projectId,
+    taskName: `${marker} 任务`,
+    taskContent: 'E2E 项目绩效与报告来源任务',
+    ownerId,
+    ownerName: '管理员',
+    acceptanceOwnerId: ownerId,
+    plannedStartDate,
+    plannedEndDate,
+    priority: 2,
+    standardHours: 8,
+    plannedHours: 8,
+    requiredOutput: `${marker}-output`,
+    acceptanceCriteria: `${marker} 验收标准`
+  }))
+  return taskId
+}
+
+const completeTaskFixture = async (api, taskId) => {
+  await api.putBusiness(`/pm/task/dispatch?id=${taskId}`, undefined)
+  await api.putBusiness(`/pm/task/accept?id=${taskId}`, undefined)
+  await api.putBusiness(`/pm/task/start?id=${taskId}`, undefined)
+  await api.postBusiness('/pm/task/submit-result', {
+    taskId,
+    resultSummary: 'E2E 任务成果提交',
+    outputJson: JSON.stringify({ marker: taskId, delivered: true }),
+    attachmentIds: null
+  })
+  await api.putBusiness('/pm/task/accept-result', {
+    taskId,
+    decision: 'APPROVE',
+    conclusion: 'E2E 验收通过',
+    evidenceJson: JSON.stringify({ source: 'cfor-e2e' }),
+    exceptionAllowed: true,
+    exceptionRuleCode: 'SAME_PERSON_AUTHORIZED',
+    exceptionReason: '自动化验收使用同一管理员账号并显式记录例外规则'
+  })
+}
+
+const createRiskFixture = async ({
+  api,
+  projectId,
+  ownerId,
+  marker,
+  level = 'LOW',
+  relatedType = null,
+  relatedId = null
+}) => {
+  const riskId = dataOf(await api.postBusiness('/pm/risk/save', {
+    projectId,
+    title: `${marker} 风险`,
+    description: `${marker} 风险描述`,
+    level,
+    probability: 'MEDIUM',
+    impact: 'MEDIUM',
+    responsePlan: `${marker} 应对计划`,
+    ownerId,
+    ownerName: '管理员',
+    dueDate: dateOffset(14),
+    relatedType,
+    relatedId
+  }))
+  return {
+    riskId,
+    detail: dataOf(await api.getBusiness(`/pm/risk/get?id=${riskId}`))
+  }
+}
+
+const createChangeFixture = async ({ api, projectId, requesterId, marker, relatedType, relatedId }) =>
+  dataOf(await api.postBusiness('/pm/change/save', {
+    projectId,
+    title: `${marker} 变更`,
+    changeType: 'MODIFY',
+    reason: `${marker} 变更原因`,
+    impactScope: `${marker} 影响范围`,
+    baselineType: 'PROJECT_SCOPE',
+    requesterId,
+    requesterName: '管理员',
+    fieldChanges: [{
+      changeType: 'MODIFY',
+      fieldName: `${marker}_scope_field`,
+      oldValue: 'OLD',
+      newValue: 'NEW'
+    }],
+    relatedType,
+    relatedId
+  }))
+
+const riskUpdatePayload = (risk, overrides = {}) => ({
+  id: risk.id,
+  projectId: risk.projectId,
+  title: risk.title,
+  description: risk.description,
+  level: risk.level,
+  probability: risk.probability,
+  impact: risk.impact,
+  responsePlan: risk.responsePlan,
+  ownerId: risk.ownerId,
+  ownerName: risk.ownerName,
+  dueDate: risk.dueDate,
+  sourceType: risk.sourceType,
+  sourceId: risk.sourceId,
+  relatedType: risk.relatedType,
+  relatedId: risk.relatedId,
+  ...overrides
+})
+
+const isHrmWorkingDay = async (api, date) => {
+  const holiday = dataOf(await api.getBusiness(
+    `/hrm/attendance/holiday/check?day=${encodeURIComponent(`${date}T00:00:00`)}`
+  ))
+  if (Number(holiday?.type) === 1) return true
+  if (Number(holiday?.type) === 2) return false
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay()
+  return weekday !== 0 && weekday !== 6
+}
+
+const findWorkingDate = async (api, startDate, searchDays = 45) => {
+  for (let offset = 0; offset < searchDays; offset += 1) {
+    const candidate = dateOffsetFrom(startDate, offset)
+    if (await isHrmWorkingDay(api, candidate)) return candidate
+  }
+  throw new Error(`BLOCKED: 自 ${startDate} 起 ${searchDays} 天内没有可用 HRM 工作日`)
+}
+
+const dateOffsetFrom = (dateText, days) => {
+  const date = new Date(`${dateText}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() + days)
+  return date.toISOString().slice(0, 10)
+}
+
+const pushReportQuery = (params, query) => {
+  const result = new URLSearchParams(params)
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== '') {
+      result.set(key, String(value))
+    }
+  }
+  return result.toString()
+}
+
+const setChangeStatus = (api, id, status, extra = {}) =>
+  api.putBusiness('/pm/change/status', { id, status, ...extra })
+
+const projectDateRange = (project) => {
+  const start = project?.plannedStartDate || dateOffset(0)
+  const configuredEnd = project?.plannedEndDate || start
+  return configuredEnd < start ? [start, start] : [start, configuredEnd]
+}
 
 const readDocument = async (api, documentId) =>
   dataOf(await api.getBusiness(`/ai/knowledge/document/get?id=${documentId}`))
@@ -671,37 +1007,49 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB118-001') {
-    const pageData = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=10')
-    caseRecord.checks.push({
-      name: '交付项目分页可读',
-      passed: Array.isArray(listOf(pageData)),
-      details: `项目数=${dataOf(pageData)?.total ?? listOf(pageData).length}`
-    })
-    const project = listOf(pageData)[0]
-    if (!project) {
-      caseRecord.notes.push('BLOCKED：当前租户无交付项目，无法验证健康状态与核心状态解耦。')
-      return { token, api, partial: true }
-    }
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    let project = fixture.project
     try {
-      let invalidRejected = false
-      try {
-        const payload = await api.put(
-          '/pm/project/update',
-          projectUpdatePayload(project, { healthStatus: 'NOT_A_HEALTH_STATE' })
-        )
-        // 业务校验失败时后端仍返回 HTTP 200，需要读取业务错误码判断是否拒绝。
-        invalidRejected = Number(payload?.code) !== 0
-        if (invalidRejected) {
-          caseRecord.notes.push(`非法健康状态被拒绝：code=${payload.code} msg=${payload.msg}`)
-        }
-      } catch (error) {
-        invalidRejected = true
-        caseRecord.notes.push(`非法健康状态被拒绝：${error.message}`)
+      await api.putBusiness(
+        '/pm/project/update',
+        projectUpdatePayload(project, { healthStatus: 'NORMAL' })
+      )
+      fixture.project = dataOf(await api.getBusiness(`/pm/project/get?id=${fixture.projectId}`))
+      project = fixture.project
+      const pageData = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=100')
+      const pageProject = listOf(pageData).find((item) =>
+        String(item?.id) === String(fixture.projectId))
+      caseRecord.checks.push({
+        name: '交付项目分页可读',
+        passed: Array.isArray(listOf(pageData)) && Boolean(pageProject),
+        details: `专属项目=${project.id}, pageMatch=${Boolean(pageProject)}, projectType=${project.projectType}`
+      })
+      const invalidPayload = await api.put(
+        '/pm/project/update',
+        projectUpdatePayload(project, { healthStatus: 'NOT_A_HEALTH_STATE' })
+      )
+      // Business rejection is returned in an HTTP-success response; transport and HTTP failures must surface.
+      const invalidRejected = isBusinessRejected(
+        invalidPayload,
+        400,
+        '健康状态必须是 NORMAL 或 DELAYED'
+      )
+      if (invalidRejected) {
+        caseRecord.notes.push(`非法健康状态被拒绝：code=${invalidPayload.code} msg=${invalidPayload.msg}`)
       }
       caseRecord.checks.push({
         name: '非法健康状态被拒绝，核心状态与健康状态解耦',
         passed: invalidRejected,
         details: `projectId=${project.id}`
+      })
+      const afterInvalid = dataOf(await api.getBusiness(`/pm/project/get?id=${project.id}`))
+      caseRecord.checks.push({
+        name: '非法健康状态拒绝后原项目状态和健康状态不变',
+        passed:
+          afterInvalid?.status === project.status &&
+          afterInvalid?.healthStatus === project.healthStatus,
+        details: `status=${afterInvalid?.status}, healthStatus=${afterInvalid?.healthStatus}`
       })
       await api.putBusiness(
         '/pm/project/update',
@@ -719,11 +1067,20 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         `PB-118 项目 ${project.id} 仅健康状态切换为 DELAYED，核心状态保持 ${project.status}`
       )
     } finally {
-      await cleanup(caseRecord, `恢复项目 ${project.id} 原健康状态`, () =>
-        api.putBusiness('/pm/project/update', projectUpdatePayload(project))
-      )
+      const restored = await restoreDedicatedProject(api, fixture)
+      caseRecord.checks.push({
+        name: '专属项目清理后归属与原健康状态回读',
+        passed: restored?.healthStatus === project.healthStatus &&
+          restored?.status === project.status,
+        details: `projectId=${fixture.projectId}, healthStatus=${restored?.healthStatus}, status=${restored?.status}`
+      })
     }
-    return { token, api }
+    return {
+      token,
+      api,
+      partial: true,
+      note: 'PB-118 核心生命周期、前置条件、权限、审批和审计仍保留 PARTIAL；本次仅完成专属项目上的健康状态解耦验证。'
+    }
   }
 
   if (caseId === 'PB120-001') {
@@ -1650,8 +2007,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     const typeCode = unique('TYPE_DEPENDENCY')
     const dependencyIds = []
     let typeId
-    const projectPage = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=10')
-    const sampleProject = listOf(projectPage)[0]
+    let projectFixture
     try {
       dependencyIds.push(dataOf(await api.postBusiness('/pm/modeling/save', {
         configKey: 'milestoneTemplate',
@@ -1687,50 +2043,75 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           details: `dependencyId=${id}, ${JSON.stringify(response)}`
         })
       }
-      if (sampleProject) {
-        try {
-          await api.putBusiness(
-            '/pm/project/update',
-            projectUpdatePayload(sampleProject, { projectType: typeCode })
-          )
-          const updatedProject = dataOf(
-            await api.getBusiness(`/pm/project/get?id=${sampleProject.id}`)
-          )
-          const snapshot = parseJson(updatedProject?.projectTypeConfigSnapshotJson)
-          const snapshotCodes = [
-            ...(snapshot?.dependencySnapshots?.milestone || []),
-            ...(snapshot?.dependencySnapshots?.taskLibrary || [])
-          ].map((item) => item?.configCode)
-          caseRecord.checks.push({
-            name: '项目主档切换项目类型时固化服务端依赖配置快照',
-            passed:
-              updatedProject?.projectType === typeCode &&
-              Number(updatedProject?.projectTypeConfigVersion) >= 1 &&
-              snapshotCodes.includes(milestoneCode) &&
-              snapshotCodes.includes(taskCode),
-            details: `projectId=${sampleProject.id}, version=${updatedProject?.projectTypeConfigVersion}, snapshotCodes=${snapshotCodes.join(',')}`
-          })
-        } finally {
-          await cleanup(caseRecord, `恢复项目 ${sampleProject.id} 原项目类型`, () =>
-            api.putBusiness('/pm/project/update', projectUpdatePayload(sampleProject))
-          )
-        }
-      } else {
-        caseRecord.checks.push({
-          name: '项目主档切换项目类型时固化服务端依赖配置快照',
-          passed: false,
-          details: '当前租户无项目，无法执行建项关联配置快照正向验收'
-        })
-      }
+      const baseProjectType = await resolveEnabledProjectType(api, new Set([typeCode]))
+      projectFixture = await createDedicatedProject({
+        api,
+        caseId,
+        projectType: baseProjectType,
+        caseRecord
+      })
+      await api.putBusiness(
+        '/pm/project/update',
+        projectUpdatePayload(projectFixture.project, { projectType: typeCode })
+      )
+      const projectAfterUpdate = dataOf(
+        await api.getBusiness(`/pm/project/get?id=${projectFixture.projectId}`)
+      )
+      const snapshot = parseJson(projectAfterUpdate?.projectTypeConfigSnapshotJson)
+      const snapshotCodes = [
+        ...(snapshot?.dependencySnapshots?.milestone || []),
+        ...(snapshot?.dependencySnapshots?.taskLibrary || [])
+      ].map((item) => item?.configCode)
+      caseRecord.checks.push({
+        name: '项目主档切换项目类型时固化服务端依赖配置快照',
+        passed:
+          projectAfterUpdate?.projectType === typeCode &&
+          Number(projectAfterUpdate?.projectTypeConfigVersion) >= 1 &&
+          snapshotCodes.includes(milestoneCode) &&
+          snapshotCodes.includes(taskCode),
+        details: `projectId=${projectFixture.projectId}, version=${projectAfterUpdate?.projectTypeConfigVersion}, snapshotCodes=${snapshotCodes.join(',')}`
+      })
     } finally {
-      if (typeId) await api.postBusiness(`/pm/modeling/status?id=${typeId}&status=DISABLED`)
+      const cleanupErrors = []
+      if (projectFixture) {
+        try {
+          const restored = await restoreDedicatedProject(api, projectFixture)
+          caseRecord.checks.push({
+            name: '专属项目清理后归属与原项目类型回读',
+            passed: restored?.projectType === projectFixture.project.projectType &&
+              restored?.projectName === projectFixture.project.projectName,
+            details: `projectId=${projectFixture.projectId}, projectType=${restored?.projectType}`
+          })
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
+      }
+      if (typeId) {
+        try {
+          await api.postBusiness(`/pm/modeling/status?id=${typeId}&status=DISABLED`)
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
+      }
       for (const id of dependencyIds) {
-        await api.postBusiness(`/pm/modeling/status?id=${id}&status=DISABLED`)
+        try {
+          await api.postBusiness(`/pm/modeling/status?id=${id}&status=DISABLED`)
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
+      }
+      if (cleanupErrors.length) {
+        throw new AggregateError(cleanupErrors, 'PB117 专属项目或建模配置清理失败')
       }
     }
     await openRoute(page, '/project/modeling/foundation/project-base/list?modeling=projectType')
     await saveScreenshot(page, outputDir, 'pb117-project-type-dependencies', record)
-    return { token, api }
+    return {
+      token,
+      api,
+      partial: true,
+      note: 'PB-117 七类依赖完整 ID/版本/配置快照、建项自动展开和版本漂移仍保留 PARTIAL；本次仅修复专属项目切换与快照验证污染。'
+    }
   }
 
   if (caseId === 'PB119-001') {
@@ -2208,6 +2589,697 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     caseRecord.evidence.push(
       `PB-129 创建评价模板 ${templateCode}（templateId=${templateId}），修改主档后快照保持 ${originalItemName}`
     )
+    return { token, api }
+  }
+
+  if (caseId === 'PB945-001') {
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    try {
+      const workingDate = await findWorkingDate(api, dateOffset(-14))
+      const outsideDate = await findWorkingDate(api, dateOffsetFrom(workingDate, 10))
+      const projectStart = dateOffsetFrom(workingDate, -7)
+      const projectEnd = dateOffsetFrom(workingDate, 90)
+      await api.putBusiness('/pm/project/update', projectUpdatePayload(
+        fixture.project,
+        {
+          status: 'EXECUTING',
+          plannedStartDate: projectStart,
+          plannedEndDate: projectEnd
+        }
+      ))
+      const insideTaskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: `${fixture.marker}_INSIDE`,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      const outsideTaskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: `${fixture.marker}_OUTSIDE`,
+        plannedStartDate: outsideDate,
+        plannedEndDate: outsideDate
+      })
+      const milestone = await createMilestoneFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      const risk = await createRiskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        relatedType: 'TASK',
+        relatedId: insideTaskId
+      })
+      const beforeTask = dataOf(await api.getBusiness(`/pm/task/get?id=${insideTaskId}`))
+      const generated = []
+      for (const [reportType, periodKey] of [
+        ['DAILY', workingDate],
+        ['WEEKLY', isoWeekKey(workingDate)],
+        ['MONTHLY', workingDate.slice(0, 7)]
+      ]) {
+        const reportId = numericId(dataOf(await api.postBusiness(
+          `/pm/daily-report/generate?projectId=${fixture.projectId}&reporterId=${fixture.ownerId}` +
+          `&reportType=${reportType}&periodKey=${encodeURIComponent(periodKey)}`
+        )), `${reportType} 周期报告`)
+        const report = dataOf(await api.getBusiness(`/pm/daily-report/get?id=${reportId}`))
+        const range = resolveReportPeriodRange(reportType, periodKey)
+        const source = dataOf(await api.getBusiness(
+          `/pm/daily-report/source?projectId=${fixture.projectId}` +
+          `&reportType=${reportType}&periodKey=${encodeURIComponent(periodKey)}`
+        ))
+        const sourceTaskIds = (source?.tasks || []).map((item) => String(item.id))
+        const periodMatches =
+          range &&
+          String(report?.periodStart) === range[0] &&
+          String(report?.periodEnd) === range[1]
+        const sourceMatches =
+          String(source?.projectId) === String(fixture.projectId) &&
+          sourceTaskIds.includes(String(insideTaskId)) &&
+          Array.isArray(source?.risks) &&
+          (source?.risks || []).some((item) => String(item.id) === String(risk.riskId)) &&
+          Array.isArray(source?.milestones) &&
+          (source?.milestones || []).some((item) => String(item.id) === String(milestone.milestoneId))
+        caseRecord.checks.push({
+          name: `${reportType} 生成周期范围并由服务端构造只读来源快照`,
+          passed:
+            Boolean(range) &&
+            periodMatches &&
+            report?.aiSuggestionStatus === 'SUGGESTED' &&
+            sourceMatches &&
+            Boolean(source?.generatedAt) &&
+            typeof report?.sourceSnapshotJson === 'string' &&
+            report.sourceSnapshotJson.includes('generatedAt'),
+          details: `reportId=${reportId}, period=${report?.periodStart}~${report?.periodEnd}, sourceTasks=${sourceTaskIds.join(',')}`
+        })
+        generated.push({ reportType, reportId, sourceTaskIds })
+      }
+      const daily = generated.find((item) => item.reportType === 'DAILY')
+      caseRecord.checks.push({
+        name: '日报来源按当天过滤，周期外任务不进入快照',
+        passed:
+          daily?.sourceTaskIds.includes(String(insideTaskId)) &&
+          !daily?.sourceTaskIds.includes(String(outsideTaskId)),
+        details: `inside=${insideTaskId}, outside=${outsideTaskId}, snapshot=${daily?.sourceTaskIds.join(',')}`
+      })
+      const afterTask = dataOf(await api.getBusiness(`/pm/task/get?id=${insideTaskId}`))
+      caseRecord.checks.push({
+        name: '报告生成只读取任务和工时，不反写任务状态',
+        passed:
+          afterTask?.status === beforeTask?.status &&
+          String(afterTask?.plannedEndDate) === String(beforeTask?.plannedEndDate),
+        details: `taskId=${insideTaskId}, before=${beforeTask?.status}, after=${afterTask?.status}`
+      })
+      caseRecord.evidence.push(
+        `PB-945 在专属项目 ${fixture.projectId} 生成 ${generated.map((item) => `${item.reportType}:${item.reportId}`).join(', ')}，日报仅包含 ${workingDate} 的任务`
+      )
+    } finally {
+      const restored = await restoreDedicatedProject(api, fixture)
+      caseRecord.checks.push({
+        name: '专属项目周期与状态清理后回读',
+        passed:
+          restored?.status === fixture.project.status &&
+          String(restored?.plannedStartDate) === String(fixture.project.plannedStartDate) &&
+          String(restored?.plannedEndDate) === String(fixture.project.plannedEndDate),
+        details: `projectId=${fixture.projectId}, status=${restored?.status}`
+      })
+    }
+    return { token, api }
+  }
+
+  if (caseId === 'PB947-001') {
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    try {
+      const workingDate = await findWorkingDate(api, dateOffset(-14))
+      await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
+        status: 'EXECUTING',
+        plannedStartDate: dateOffsetFrom(workingDate, -7),
+        plannedEndDate: dateOffsetFrom(workingDate, 90)
+      }))
+      const taskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      const risk = await createRiskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        relatedType: 'TASK',
+        relatedId: taskId
+      })
+      const issueId = dataOf(await api.postBusiness('/pm/issue/save', {
+        projectId: fixture.projectId,
+        title: `${fixture.marker} 问题`,
+        description: 'E2E 验证问题独立于风险记录',
+        level: 'MEDIUM',
+        ownerId: fixture.ownerId,
+        ownerName: '管理员',
+        dueDate: dateOffset(14)
+      }))
+      const bugId = dataOf(await api.postBusiness('/pm/bug/save', {
+        projectId: fixture.projectId,
+        title: `${fixture.marker} Bug`,
+        description: 'E2E 验证 Bug 独立编号与记录',
+        severity: 'MEDIUM',
+        priority: 2,
+        reporterId: fixture.ownerId,
+        reporterName: '管理员',
+        assigneeId: fixture.ownerId,
+        assigneeName: '管理员',
+        dueDate: dateOffset(14)
+      }))
+      const [issue, bug] = await Promise.all([
+        api.getBusiness(`/pm/issue/get?id=${issueId}`),
+        api.getBusiness(`/pm/bug/get?id=${bugId}`)
+      ])
+      caseRecord.checks.push({
+        name: '风险、问题、Bug 使用独立记录和编号，不通过转化删除原记录',
+        passed:
+          Boolean(dataOf(issue)?.issueNo) &&
+          Boolean(dataOf(bug)?.bugNo) &&
+          String(dataOf(issue)?.id) !== String(dataOf(bug)?.id),
+        details: `riskNo=${risk.detail?.riskNo}, issueNo=${dataOf(issue)?.issueNo}, bugNo=${dataOf(bug)?.bugNo}`
+      })
+      await api.postBusiness('/pm/risk/save', riskUpdatePayload(risk.detail, { level: 'HIGH' }))
+      const leveled = dataOf(await api.getBusiness(`/pm/risk/get?id=${risk.riskId}`))
+      const history = parseRiskLevelHistory(leveled?.levelHistoryJson)
+      caseRecord.checks.push({
+        name: '风险等级变化写前值、变化时间和结构化历史',
+        passed:
+          leveled?.level === 'HIGH' &&
+          leveled?.previousLevel === 'LOW' &&
+          Boolean(leveled?.levelChangedTime) &&
+          history.some((item) =>
+            item?.previousLevel === 'LOW' &&
+            item?.currentLevel === 'HIGH' &&
+            Boolean(item?.changedTime)),
+        details: `riskId=${risk.riskId}, history=${JSON.stringify(history)}`
+      })
+      caseRecord.checks.push({
+        name: '风险可关联任务且保留责任人和期限',
+        passed:
+          leveled?.relatedType === 'TASK' &&
+          String(leveled?.relatedId) === String(taskId) &&
+          String(leveled?.ownerId) === String(fixture.ownerId) &&
+          Boolean(leveled?.dueDate),
+        details: `relatedType=${leveled?.relatedType}, relatedId=${leveled?.relatedId}, dueDate=${leveled?.dueDate}`
+      })
+      await api.putBusiness('/pm/risk/status', { id: risk.riskId, status: 'MITIGATING' })
+      const invalidMissingVerifier = await api.put('/pm/risk/status', {
+        id: risk.riskId,
+        status: 'CLOSED'
+      }, {
+        expectedBusinessRejection: {
+          code: 1055009002,
+          message: /verifier is required before closing/
+        }
+      })
+      caseRecord.checks.push({
+        name: '风险关闭缺少验证人时按领域错误拒绝',
+        passed: isBusinessRejected(
+          invalidMissingVerifier,
+          1055009002,
+          'verifier is required before closing'
+        ),
+        details: JSON.stringify(invalidMissingVerifier)
+      })
+      await api.putBusiness('/pm/risk/status', {
+        id: risk.riskId,
+        status: 'CLOSED',
+        verifierId: fixture.ownerId
+      })
+      const closed = dataOf(await api.getBusiness(`/pm/risk/get?id=${risk.riskId}`))
+      caseRecord.checks.push({
+        name: '风险验证后关闭并回读关闭时间、验证人和验证时间',
+        passed:
+          closed?.status === 'CLOSED' &&
+          String(closed?.verifiedBy) === String(fixture.ownerId) &&
+          Boolean(closed?.closedTime) &&
+          Boolean(closed?.verifiedTime),
+        details: `riskId=${risk.riskId}, status=${closed?.status}, verifiedBy=${closed?.verifiedBy}`
+      })
+      caseRecord.evidence.push(
+        `PB-947 验证风险 ${risk.riskId} 关联任务 ${taskId}、LOW→HIGH 历史、关闭验证及问题 ${issueId}/Bug ${bugId} 独立记录`
+      )
+      await openRoute(page, '/project/execution/controls/risk-issue')
+      await saveScreenshot(page, outputDir, 'pb947-risk-issue-governance', record)
+    } finally {
+      await restoreDedicatedProject(api, fixture)
+    }
+    return {
+      token,
+      api,
+      partial: true,
+      note: 'PB-947 已验证风险关联/等级历史/验证关闭及问题、Bug 独立记录；问题/Bug 的关联、转化来源字段尚未接入 Do、ReqVO 和 Controller，保留 PARTIAL。'
+    }
+  }
+
+  if (caseId === 'PB949-001') {
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    try {
+      const workingDate = await findWorkingDate(api, dateOffset(-14))
+      await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
+        status: 'EXECUTING',
+        plannedStartDate: dateOffsetFrom(workingDate, -7),
+        plannedEndDate: dateOffsetFrom(workingDate, 90)
+      }))
+      const taskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      const changeId = await createChangeFixture({
+        api,
+        projectId: fixture.projectId,
+        requesterId: fixture.ownerId,
+        marker: fixture.marker,
+        relatedType: 'TASK',
+        relatedId: taskId
+      })
+      const idempotencyKey = unique('E2E_CHANGE_EXEC')
+      await setChangeStatus(api, changeId, 'ASSESSING')
+      await setChangeStatus(api, changeId, 'PENDING_APPROVAL')
+      await setChangeStatus(api, changeId, 'APPROVED', {
+        objectVersion: 1,
+        downstreamStrategy: 'MANUAL',
+        approvalOpinion: 'E2E 审批通过并冻结对象版本'
+      })
+      const approved = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+      caseRecord.checks.push({
+        name: '变更审批通过冻结对象版本并记录下游处理策略',
+        passed:
+          approved?.status === 'APPROVED' &&
+          approved?.objectVersion === 1 &&
+          approved?.downstreamStrategy === 'MANUAL' &&
+          String(approved?.approverId) === String(fixture.ownerId),
+        details: `changeId=${changeId}, version=${approved?.objectVersion}, strategy=${approved?.downstreamStrategy}`
+      })
+      await setChangeStatus(api, changeId, 'EXECUTING', { executionIdempotencyKey: idempotencyKey })
+      const executing = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+      caseRecord.checks.push({
+        name: '服务端一次性执行写入幂等键、执行人和执行时间',
+        passed:
+          executing?.status === 'EXECUTING' &&
+          executing?.executionIdempotencyKey === idempotencyKey &&
+          String(executing?.executedBy) === String(fixture.ownerId) &&
+          Boolean(executing?.executedTime) &&
+          executing?.fieldChanges?.[0]?.executionStatus === 'EXECUTING',
+        details: `changeId=${changeId}, key=${executing?.executionIdempotencyKey}, fieldStatus=${executing?.fieldChanges?.[0]?.executionStatus}`
+      })
+      await setChangeStatus(api, changeId, 'VERIFIED', {
+        approvalOpinion: 'E2E 执行结果已验证'
+      })
+      await setChangeStatus(api, changeId, 'CLOSED', {
+        approvalOpinion: 'E2E 变更闭环'
+      })
+      const closed = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+      caseRecord.checks.push({
+        name: '变更经执行、验证后关闭且全链路时间可回读',
+        passed:
+          closed?.status === 'CLOSED' &&
+          Boolean(closed?.verifiedTime) &&
+          Boolean(closed?.closedTime) &&
+          closed?.fieldChanges?.[0]?.executionStatus === 'CLOSED',
+        details: `changeId=${changeId}, status=${closed?.status}, verified=${closed?.verifiedTime}, closed=${closed?.closedTime}`
+      })
+
+      const duplicateChangeId = await createChangeFixture({
+        api,
+        projectId: fixture.projectId,
+        requesterId: fixture.ownerId,
+        marker: `${fixture.marker}_DUPLICATE`,
+        relatedType: 'TASK',
+        relatedId: taskId
+      })
+      await setChangeStatus(api, duplicateChangeId, 'ASSESSING')
+      await setChangeStatus(api, duplicateChangeId, 'PENDING_APPROVAL')
+      await setChangeStatus(api, duplicateChangeId, 'APPROVED', {
+        objectVersion: 1,
+        downstreamStrategy: 'MANUAL',
+        approvalOpinion: 'E2E 重复幂等键验证'
+      })
+      const duplicate = await api.put('/pm/change/status', {
+        id: duplicateChangeId,
+        status: 'EXECUTING',
+        executionIdempotencyKey: idempotencyKey
+      }, {
+        expectedBusinessRejection: {
+          code: 1055012002,
+          message: new RegExp(`change already executed with key ${idempotencyKey}`)
+        }
+      })
+      caseRecord.checks.push({
+        name: '重复幂等键被领域拒绝，不产生第二次执行',
+        passed: isBusinessRejected(
+          duplicate,
+          1055012002,
+          `change already executed with key ${idempotencyKey}`
+        ),
+        details: JSON.stringify(duplicate)
+      })
+      const duplicateAfter = dataOf(
+        await api.getBusiness(`/pm/change/get?id=${duplicateChangeId}`)
+      )
+      caseRecord.checks.push({
+        name: '重复执行拒绝后第二条变更仍停留在 APPROVED',
+        passed: duplicateAfter?.status === 'APPROVED' && !duplicateAfter?.executedTime,
+        details: `changeId=${duplicateChangeId}, status=${duplicateAfter?.status}`
+      })
+      caseRecord.evidence.push(
+        `PB-949 变更 ${changeId} 完成 DRAFT→CLOSED，幂等键 ${idempotencyKey} 在 ${duplicateChangeId} 上被拒绝`
+      )
+      await openRoute(page, '/project/execution/plan-change/list')
+      await saveScreenshot(page, outputDir, 'pb949-change-execution', record)
+    } finally {
+      await restoreDedicatedProject(api, fixture)
+    }
+    return { token, api }
+  }
+
+  if (caseId === 'PB951-001') {
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    try {
+      const workingDate = await findWorkingDate(api, dateOffset(-14))
+      await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
+        status: 'EXECUTING',
+        plannedStartDate: dateOffsetFrom(workingDate, -7),
+        plannedEndDate: dateOffsetFrom(workingDate, 90)
+      }))
+      const taskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      const missingGate = await createMilestoneFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: `${fixture.marker}_NO_GATE`,
+        withGates: false,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      await api.putBusiness(`/pm/milestone/confirm?id=${missingGate.milestoneId}`, undefined)
+      const invalidComplete = await api.put(
+        `/pm/milestone/complete?id=${missingGate.milestoneId}` +
+        `&manualConclusion=${encodeURIComponent('E2E 缺少准出条件')}`,
+        undefined,
+        {
+          expectedBusinessRejection: {
+            code: 1055004003,
+            message: '里程碑日期超出项目计划窗口或结束日期早于开始日期'
+          }
+        }
+      )
+      caseRecord.checks.push({
+        name: '里程碑缺少准出条件或必需交付物时不能完成',
+        passed: isBusinessRejected(
+          invalidComplete,
+          1055004003,
+          '里程碑日期超出项目计划窗口或结束日期早于开始日期'
+        ),
+        details: JSON.stringify(invalidComplete)
+      })
+
+      const milestone = await createMilestoneFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        withGates: true,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      const taskBefore = dataOf(await api.getBusiness(`/pm/task/get?id=${taskId}`))
+      await api.putBusiness(`/pm/milestone/confirm?id=${milestone.milestoneId}`, undefined)
+      await api.putBusiness(
+        `/pm/milestone/complete?id=${milestone.milestoneId}` +
+        `&manualConclusion=${encodeURIComponent('E2E 人工确认准出条件和交付物已满足')}`,
+        undefined
+      )
+      const completed = await getMilestone(api, fixture.projectId, milestone.milestoneId)
+      caseRecord.checks.push({
+        name: '具备准出条件和交付物的里程碑可人工确认完成',
+        passed:
+          completed?.confirmed === true &&
+          completed?.status === 'COMPLETED' &&
+          completed?.exitCondition === `${fixture.marker} 准出条件` &&
+          parseJson(completed?.requiredDeliverablesJson, []).length === 1 &&
+          completed?.manualConclusion === 'E2E 人工确认准出条件和交付物已满足' &&
+          Boolean(completed?.actualFinishDate),
+        details: `milestoneId=${milestone.milestoneId}, status=${completed?.status}, conclusion=${completed?.manualConclusion}`
+      })
+      const taskAfter = dataOf(await api.getBusiness(`/pm/task/get?id=${taskId}`))
+      caseRecord.checks.push({
+        name: '里程碑人工完成不代替任务责任人确认或改写任务状态',
+        passed:
+          taskAfter?.status === taskBefore?.status &&
+          String(taskAfter?.plannedEndDate) === String(taskBefore?.plannedEndDate),
+        details: `taskId=${taskId}, before=${taskBefore?.status}, after=${taskAfter?.status}`
+      })
+      caseRecord.evidence.push(
+        `PB-951 缺门禁里程碑 ${missingGate.milestoneId} 被拒绝；达标里程碑 ${milestone.milestoneId} 完成并保留人工结论`
+      )
+      await openRoute(page, '/project/execution/milestone-confirm/list')
+      await saveScreenshot(page, outputDir, 'pb951-milestone-complete', record)
+    } finally {
+      await restoreDedicatedProject(api, fixture)
+    }
+    return { token, api }
+  }
+
+  if (caseId === 'PB953-001') {
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    try {
+      const workingDate = await findWorkingDate(api, dateOffset(-14))
+      await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
+        status: 'EXECUTING',
+        plannedStartDate: dateOffsetFrom(workingDate, -7),
+        plannedEndDate: dateOffsetFrom(workingDate, 90)
+      }))
+      const taskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      await completeTaskFixture(api, taskId)
+      await createRiskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker
+      })
+      const query = {
+        projectId: fixture.projectId,
+        startDate: dateOffset(-1),
+        endDate: dateOffset(1)
+      }
+      for (const definition of PROJECT_REPORT_DEFINITIONS) {
+        const report = dataOf(await api.getBusiness(
+          `/pm/report/${definition.path}?${pushReportQuery({}, query)}`
+        ))
+        caseRecord.checks.push({
+          name: `${definition.reportType} 报表返回统一口径和同一筛选上下文`,
+          passed:
+            report?.reportType === definition.reportType &&
+            Number.isInteger(Number(report?.metricVersion)) &&
+            report?.calculationMode === 'RECHECKED' &&
+            Boolean(report?.generatedAt) &&
+            String(report?.appliedFilters?.projectId) === String(fixture.projectId) &&
+            String(report?.appliedFilters?.startDate) === query.startDate &&
+            String(report?.appliedFilters?.endDate) === query.endDate,
+          details:
+            `type=${report?.reportType}, version=${report?.metricVersion}, ` +
+            `mode=${report?.calculationMode}, filters=${JSON.stringify(report?.appliedFilters)}`
+        })
+      }
+      for (const definition of PROJECT_REPORT_DEFINITIONS.slice(0, 2)) {
+        const exportFile = await api.download(
+          `/pm/report/export-excel?${pushReportQuery({ reportType: definition.reportType }, query)}`
+        )
+        const workbook = XLSX.read(exportFile.buffer, { type: 'buffer' })
+        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {
+          defval: null
+        })
+        caseRecord.checks.push({
+          name: `${definition.reportType} 导出复用相同筛选并生成可解析 Excel`,
+          passed:
+            workbook.SheetNames.length > 0 &&
+            rows.length > 0 &&
+            String(rows[0]?.reportType) === definition.reportType &&
+            String(rows[0]?.calculationMode) === 'RECHECKED',
+          details: `contentType=${exportFile.contentType}, rows=${rows.length}, sheet=${workbook.SheetNames[0]}`
+        })
+      }
+      caseRecord.evidence.push(
+        `PB-953 对专属项目 ${fixture.projectId} 校验 11 类报表统一 projectId/startDate/endDate，并验证前两类 Excel 与查询口径一致`
+      )
+      await openRoute(page, '/project/statistics/overview')
+      await saveScreenshot(page, outputDir, 'pb953-project-reports', record)
+    } finally {
+      await restoreDedicatedProject(api, fixture)
+    }
+    return { token, api }
+  }
+
+  if (caseId === 'PB955-001') {
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    try {
+      const workingDate = await findWorkingDate(api, dateOffset(-14))
+      await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
+        status: 'EXECUTING',
+        plannedStartDate: dateOffsetFrom(workingDate, -7),
+        plannedEndDate: dateOffsetFrom(workingDate, 90)
+      }))
+      const taskId = await createTaskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      await completeTaskFixture(api, taskId)
+      const milestone = await createMilestoneFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker,
+        withGates: true,
+        plannedStartDate: workingDate,
+        plannedEndDate: workingDate
+      })
+      await api.putBusiness(`/pm/milestone/confirm?id=${milestone.milestoneId}`, undefined)
+      await api.putBusiness(
+        `/pm/milestone/complete?id=${milestone.milestoneId}` +
+        `&manualConclusion=${encodeURIComponent('E2E 绩效里程碑完成')}`,
+        undefined
+      )
+      const risk = await createRiskFixture({
+        api,
+        projectId: fixture.projectId,
+        ownerId: fixture.ownerId,
+        marker: fixture.marker
+      })
+      await api.postBusiness('/pm/risk/save', riskUpdatePayload(risk.detail, { level: 'HIGH' }))
+      await api.putBusiness('/pm/risk/status', { id: risk.riskId, status: 'MITIGATING' })
+      await api.putBusiness('/pm/risk/status', {
+        id: risk.riskId,
+        status: 'CLOSED',
+        verifierId: fixture.ownerId
+      })
+
+      const formula = dataOf(await api.getBusiness('/pm/report/performance/formula'))
+      caseRecord.checks.push({
+        name: '绩效公式、数据来源、剔除规则和可见角色公开可读',
+        passed:
+          Boolean(formula?.configCode) &&
+          Boolean(formula?.metricVersion) &&
+          typeof formula?.formula === 'string' &&
+          formula.formula.trim().length > 0 &&
+          Array.isArray(formula?.dataSource) &&
+          formula.dataSource.length > 0 &&
+          Array.isArray(formula?.excludeRules) &&
+          Array.isArray(formula?.visibleRoles) &&
+          Boolean(formula?.weightRules),
+        details: `config=${formula?.configCode}, version=${formula?.metricVersion}, sources=${formula?.dataSource?.join(',')}`
+      })
+      const query = {
+        projectId: fixture.projectId,
+        startDate: dateOffset(-1),
+        endDate: dateOffset(1)
+      }
+      const summary = dataOf(await api.getBusiness(
+        `/pm/report/performance/summary?${pushReportQuery({}, query)}`
+      ))
+      const row = (summary?.rows || []).find(
+        (item) => String(item.userId) === String(fixture.ownerId)
+      )
+      caseRecord.checks.push({
+        name: '绩效汇总按正式已验收任务和已完成里程碑计算权重与完成率',
+        passed:
+          summary?.reportType === 'PROJECT_PERFORMANCE' &&
+          Number(row?.acceptedTaskCount) >= 1 &&
+          Number(row?.completedMilestoneCount) >= 1 &&
+          Number(row?.plannedWeight) >= 18 &&
+          Number(row?.deliveredWeight) >= 18 &&
+          Number(row?.completionRate) === 100,
+        details: `row=${JSON.stringify(row)}`
+      })
+      const person = dataOf(await api.getBusiness(
+        `/pm/report/performance/person?${pushReportQuery({ userId: fixture.ownerId }, query)}`
+      ))
+      caseRecord.checks.push({
+        name: '个人绩效明细返回任务、里程碑和统一公式口径',
+        passed:
+          String(person?.userId) === String(fixture.ownerId) &&
+          Number(person?.acceptedTaskCount) >= 1 &&
+          Number(person?.completedMilestoneCount) >= 1 &&
+          (person?.tasks || []).some((item) => String(item.id) === String(taskId)) &&
+          (person?.milestones || []).some(
+            (item) => String(item.id) === String(milestone.milestoneId)
+          ) &&
+          Number(person?.metricVersion) === Number(summary?.metricVersion) &&
+          person?.formula === summary?.formula,
+        details: `user=${person?.userName}, tasks=${person?.tasks?.length}, milestones=${person?.milestones?.length}`
+      })
+      const trend = dataOf(await api.getBusiness(
+        `/pm/report/risk-trend?${pushReportQuery({}, query)}`
+      ))
+      const change = (trend?.changes || []).find(
+        (item) => String(item.riskId) === String(risk.riskId)
+      )
+      const handling = (trend?.handlingDurations || []).find(
+        (item) => String(item.riskId) === String(risk.riskId)
+      )
+      caseRecord.checks.push({
+        name: '风险趋势保留等级变化和验证关闭后的处置时长',
+        passed:
+          trend?.reportType === 'RISK_TREND' &&
+          change?.previousLevel === 'LOW' &&
+          change?.currentLevel === 'HIGH' &&
+          Boolean(change?.changedTime) &&
+          handling?.status === 'CLOSED' &&
+          Boolean(handling?.verifiedTime) &&
+          Number(handling?.durationDays) >= 0,
+        details: `change=${JSON.stringify(change)}, handling=${JSON.stringify(handling)}`
+      })
+      caseRecord.evidence.push(
+        `PB-955 专属项目 ${fixture.projectId} 完成任务 ${taskId}(8h)、里程碑 ${milestone.milestoneId}(权重10) 和风险 ${risk.riskId}，绩效完成率 100%`
+      )
+      await openRoute(page, '/project/ai/performance/dashboard')
+      await saveScreenshot(page, outputDir, 'pb955-performance', record)
+    } finally {
+      await restoreDedicatedProject(api, fixture)
+    }
     return { token, api }
   }
 

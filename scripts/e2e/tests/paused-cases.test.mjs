@@ -27,19 +27,19 @@ test('paused suite ids and case ids all exist in catalog', () => {
   }
 })
 
-test('project management scope stays paused (suite + explicit cases)', () => {
-  assert.ok(paused.suites.includes('project-after-sales'), 'project-after-sales suite paused')
+test('project management remains paused only for explicit legacy cases', () => {
+  assert.ok(!paused.suites.includes('project-after-sales'), 'project-after-sales suite is runnable')
   for (const caseId of ['PMS-001', 'WBF-004', 'WBF-008', 'WBF-012']) {
     assert.ok(paused.cases.includes(caseId), `${caseId} paused`)
   }
 })
 
-test('every case in a paused suite resolves the pause reason', () => {
+test('project-after-sales cases resolve to runnable while explicit legacy cases stay paused', () => {
   const suite = catalog.suites.find((item) => item.id === 'project-after-sales')
   assert.ok(suite.cases.length > 0, 'project-after-sales has cases')
   for (const item of suite.cases) {
-    assert.equal(pauseReasonFor({ ...item, suite: suite.id }, paused), paused.reason,
-      `${item.id} must be paused`)
+    assert.equal(pauseReasonFor({ ...item, suite: suite.id }, paused), '',
+      `${item.id} must stay runnable`)
   }
 })
 
