@@ -129,6 +129,28 @@ npm run test:e2e:request-ui
 该回归不代表完整请购状态机已经验收通过。
 打开新增表单会消耗编号，但不保存请购单、不生成来源单、不执行打印。
 
+## 定时巡检（GitHub Actions）
+
+`.github/workflows/e2e-nightly.yml`：每天 02:00（北京时间）自动跑冒烟（`--suite smoke --fresh`），
+全程 headless。
+
+- 仓库 Settings → Secrets → Actions 里加一个 secret：`CFOR_PASS`（测试账号密码，其它配置已写在 workflow 里）。
+- 每次运行的证据包（summary.md + 截图）自动上传为 Artifact，保留 30 天。
+- 失败时自动在仓库建 Issue（标签 `e2e-nightly`）并附上 summary；问题没修好之前的新失败会追加评论到同一个 Issue，不刷屏。
+- 想手动触发：Actions 页 → "CFOR E2E 定时巡检" → Run workflow，可选 smoke/init/all。
+
+## v1 → v2 修复清单
+
+1. runner 漏传 `caseId` 给 suite（SMOKE/FMS 分支走错）→ 必传。
+2. 登录成功判定解析加密响应体 `body.code`（前端实际加密了响应，必失败）→
+   改为页面状态判定（离开 /login + 用户标识可见）。
+3. checkpoint 只写不读 → 默认读断点续跑。
+4. `--reuse-session` 只解析不实现 → storageState 真正复用，默认登录一次。
+5. PARTIAL 空桩被记 PASS → 未实现只记 PARTIAL/SKIP。
+6. 登录是"租户校验 → 用户名密码"多步流程 → 先填租户名触发校验再填账号。
+7. 租户显示名陷阱：登录后右上角显示「乐之木电子科技」而非注册名「福奇科技」→
+   租户断言走 API 的 tenantId，不走页面显示名。
+
 ## 证据与基础测试
 
 每轮输出 `result.json`、`summary.md`、`screenshots/`、`trace/browser.zip`。

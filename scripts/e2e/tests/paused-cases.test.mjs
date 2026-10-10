@@ -27,9 +27,10 @@ test('paused suite ids and case ids all exist in catalog', () => {
   }
 })
 
-test('project management remains paused only for explicit legacy cases', () => {
+test('project management is runnable while explicit legacy workbench cases stay paused', () => {
   assert.ok(!paused.suites.includes('project-after-sales'), 'project-after-sales suite is runnable')
-  for (const caseId of ['PMS-001', 'WBF-004', 'WBF-008', 'WBF-012']) {
+  assert.ok(!paused.cases.includes('PMS-001'), 'PMS-001 is runnable')
+  for (const caseId of ['WBF-004', 'WBF-008', 'WBF-012']) {
     assert.ok(paused.cases.includes(caseId), `${caseId} paused`)
   }
 })
@@ -44,10 +45,11 @@ test('project-after-sales cases resolve to runnable while explicit legacy cases 
 })
 
 test('explicit paused cases resolve the pause reason, others do not', () => {
-  for (const caseId of ['PMS-001', 'WBF-004', 'WBF-008', 'WBF-012']) {
+  for (const caseId of ['WBF-004', 'WBF-008', 'WBF-012']) {
     const item = byId.get(caseId)
     assert.equal(pauseReasonFor(item, paused), paused.reason, `${caseId} paused`)
   }
+  assert.equal(pauseReasonFor(byId.get('PMS-001'), paused), '', 'PMS-001 stays runnable')
   assert.equal(pauseReasonFor(byId.get('WBF-005'), paused), '', 'non-paused case stays runnable')
   assert.equal(pauseReasonFor(byId.get('ERP-SALES-001'), paused), '', 'non-paused case stays runnable')
 })

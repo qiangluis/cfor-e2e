@@ -9,6 +9,40 @@ import { extractAccessToken, resolveLoginContext } from './session.mjs'
 import { isBusinessSuccess } from './assertions.mjs'
 import { resourceUrl } from './redact.mjs'
 
+/**
+ * 带重试的页面导航。jixu-ai.com 会从边缘节点拦截海外机房的
+ * 自动化浏览器流量（net::ERR_EMPTY_RESPONSE，curl 正常），
+ * 此时重试几次（应对间歇性拦截），最终失败则抛出可识别的
+ * 网络错误，方便与真正的测试断言失败区分开。
+ */
+export async function gotoSite (page, url, opts = {}) {
+  const tries = opts.tries ?? 3
+  let lastErr = null
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000, ...opts.goto })
+      return
+    } catch (err) {
+      lastErr = err
+      const msg = String(err?.message || err)
+      if (/ERR_EMPTY_RESPONSE|ERR_CONNECTION|ETIMEDOUT|ENOTFOUND|ERR_TUNNEL_CONNECTION_FAILED/i.test(msg)) {
+        if (i < tries) {
+          await new Promise(r => setTimeout(r, 10000))
+          continue
+        }
+        throw new Error(
+          `网站不可达（${i} 次重试均失败）：${url}。` +
+          `最后错误：${msg.split('\n')[0]}。` +
+          '疑似当前机房 IP 被站点边缘拦截（海外 runner 常见）；' +
+          '建议改用国内 self-hosted runner 跑此套件。'
+        )
+      }
+      throw err
+    }
+  }
+  throw lastErr
+}
+
 const SELECTORS = {
   loginCard: '.portal-login-card',
   accountTab: 'button:has-text("账密登录")',
@@ -269,8 +303,8 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
     // Visiting /login with an existing token redirects to the public portal.
     // Another page in this context may already have completed authentication.
     if (['/', '/login'].includes(new URL(page.url()).pathname)) {
-      await page.goto(`${config.webBase}/index`, {
-        waitUntil: 'domcontentloaded', timeout: config.browserTimeoutMs
+      await gotoSite(page, `${config.webBase}/index`, {
+        goto: { waitUntil: 'domcontentloaded', timeout: config.browserTimeoutMs }
       })
       await page.locator('[class*="-user-info"]').first().waitFor({
         state: 'visible', timeout: config.browserTimeoutMs
@@ -284,7 +318,9 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
   }
   const existingSession = await reuseSession()
   if (existingSession) return existingSession
-  await page.goto(`${config.webBase}/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
+  await gotoSite(page, `${config.webBase}/login`, {
+    goto: { waitUntil: 'domcontentloaded', timeout: 60000 }
+  })
 
   const redirectedSession = await reuseSession()
   if (redirectedSession) return redirectedSession
@@ -358,7 +394,9 @@ export const loginWithCredentials = async (page, credentials, options = {}) =>
   login(page, { ...options, credentials })
 
 export async function openRegistration (page) {
-  await page.goto(`${config.webBase}/login`, { waitUntil: 'domcontentloaded' })
+  await gotoSite(page, `${config.webBase}/login`, {
+    goto: { waitUntil: 'domcontentloaded' }
+  })
   await page.getByText('前往注册', { exact: true }).first().click()
   await page.getByPlaceholder('企业 / 团队名称').waitFor({ state: 'visible' })
 }
@@ -427,9 +465,8 @@ export async function openRoute (page, pathname, options = {}) {
   // Reserve one recovery attempt for warming the dynamic route registry from /index.
   for (let attempt = 0; attempt <= retries + 1; attempt++) {
     try {
-      await page.goto(target.toString(), {
-        waitUntil: 'domcontentloaded',
-        timeout: config.browserTimeoutMs
+      await gotoSite(page, target.toString(), {
+        goto: { waitUntil: 'domcontentloaded', timeout: config.browserTimeoutMs }
       })
       if (await isNotFoundPage()) {
         throw new Error(`动态路由尚未注册：${pathname}`)
@@ -441,9 +478,8 @@ export async function openRoute (page, pathname, options = {}) {
       lastError = error
       if (!warmedDynamicRoutes) {
         warmedDynamicRoutes = true
-        await page.goto(index.toString(), {
-          waitUntil: 'domcontentloaded',
-          timeout: config.browserTimeoutMs
+        await gotoSite(page, index.toString(), {
+          goto: { waitUntil: 'domcontentloaded', timeout: config.browserTimeoutMs }
         })
         await page.waitForFunction(
           (readyText) => {
@@ -497,6 +533,11 @@ export async function tableRows (page) {
       )
     )
   )
+}
+
+export async function bodyContainsAny (page, keywords) {
+  const text = await page.locator('body').innerText()
+  return keywords.filter((keyword) => text.includes(keyword))
 }
 
 export async function saveScreenshot (page, outputDir, name, record) {
