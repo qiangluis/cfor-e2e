@@ -283,7 +283,7 @@ export function observePage (page, record) {
     task.finally(() => responseTasks.delete(task))
   })
   const capture = {
-    async flushResponses ({ timeoutMs = 4500, quietMs = 50 } = {}) {
+    async flushResponses ({ timeoutMs = 12000, quietMs = 50 } = {}) {
       let timer
       let expired = false
       try {

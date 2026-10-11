@@ -1,7 +1,8 @@
 import { randomBytes } from 'node:crypto'
-import { createApiClient } from '../lib/api.mjs'
+import { createApiClient, matchesExpectedBusinessRejection } from '../lib/api.mjs'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
 import { runReadOnlySql } from '../lib/db.mjs'
+import { createProcurementPermissionReader } from '../fixtures/procurement-permission-reader.mjs'
 import {
   login,
   openRoute as defaultOpenRoute,
@@ -46,6 +47,127 @@ export const hasFormalMetricEvidence = ({ statusEvents, drilldown } = {}) =>
   statusEvents.length > 0 &&
   Array.isArray(drilldown) &&
   drilldown.length > 0
+
+export const hasDueTaskSnapshots = (task, runtimePlan, device) => {
+  try {
+    const config = JSON.parse(task.configSnapshot)
+    const cycle = JSON.parse(task.cycleRuleSnapshot)
+    const devices = JSON.parse(task.deviceSnapshot)
+    return String(task.planId) === String(runtimePlan.id) &&
+      String(task.sourcePlanId) === String(runtimePlan.sourcePlanId) &&
+      task.sourcePlanVersion === runtimePlan.sourcePlanVersion &&
+      String(task.assignmentId) === String(runtimePlan.assignmentId) &&
+      task.configSnapshot === runtimePlan.configSnapshot &&
+      task.cycleRuleSnapshot === runtimePlan.cycleRuleSnapshot &&
+      config.version === task.sourcePlanVersion &&
+      Array.isArray(config.items) && config.items.length === 1 &&
+      config.items[0].itemVersion === 1 &&
+      config.items[0].standard === 'E2E 目视无异常' &&
+      config.items[0].resultType === 'BOOLEAN' &&
+      config.items[0].execRequirement === 'E2E 按正式标准检查并记录结果' &&
+      config.items[0].standardHours === 0.5 &&
+      config.items[0].attachmentRequired === false &&
+      cycle.cycleType === 'TIME' && cycle.cycleValue === 1 &&
+      cycle.cycleUnit === 'DAY' && cycle.dataSource === 'CALENDAR' &&
+      Array.isArray(devices) && devices.length === 1 &&
+      String(devices[0].id) === String(device.id) &&
+      devices[0].deviceName === device.deviceName &&
+      String(devices[0].productId) === String(device.productId) &&
+      devices[0].deviceType === device.deviceType
+  } catch {
+    return false
+  }
+}
+
+export const hasRecordTaskSnapshots = (record, task) =>
+  String(record?.taskId) === String(task?.id) &&
+  String(record?.maintenancePlanId) === String(task?.sourcePlanId) &&
+  record?.maintenancePlanVersion === task?.sourcePlanVersion &&
+  String(record?.assignmentId) === String(task?.assignmentId) &&
+  ['configSnapshot', 'cycleRuleSnapshot', 'deviceSnapshot'].every((field) =>
+    typeof task?.[field] === 'string' && Boolean(task[field]) && record?.[field] === task[field])
+
+export const hasExactMaintenanceReadPermissions = (actual, expected, permission) =>
+  Array.isArray(actual) && actual.includes(permission) &&
+  actual.every((value) => typeof value === 'string' && !value.includes('*') &&
+    !/(?::|^)(?:create|update|delete|publish|disable|generate|approve|execute)(?::|$)/i.test(value)) &&
+  JSON.stringify(actual.filter(Boolean).sort()) === JSON.stringify([...expected].sort())
+
+const verifyDueGenerationPermission = async (api, fixtures, caseRecord, runtimePlanId, planDate, restrictedWriter = false) => {
+  const permission = restrictedWriter ? 'mes:maintenance-plan:update' : 'mes:maintenance-plan:query'
+  const reader = await createProcurementPermissionReader(api, caseRecord, {
+    permission, label: restrictedWriter ? 'M5SCOPE' : 'M5'
+  })
+  if (restrictedWriter) {
+    requireTrueResult(await api.postBusiness('/system/permission/assign-role-data-scope', {
+      roleId: reader.roleId, dataScope: 2, dataScopeDeptIds: []
+    }), '生成权限专属角色设置空自定义部门范围')
+  }
+  fixtures.track(reader.roleId, '到期生成权限专属角色', async (id) => {
+    requireTrueResult(await api.deleteBusiness(`/system/role/delete?id=${id}`), '生成权限角色清理')
+  })
+  fixtures.track(reader.userId, '到期生成权限专属账号', async (id) => {
+    const user = dataOf(await api.getBusiness(`/system/user/get?id=${id}`))
+    if (user?.username !== reader.username) throw new Error('生成权限账号清理所有权不一致')
+    requireTrueResult(await reader.deactivate(), '生成权限账号停用')
+    requireTrueResult(await api.postBusiness('/system/permission/assign-user-role', {
+      userId: id, roleIds: []
+    }), '生成权限账号解绑角色')
+    if (dataOf(await api.getBusiness(`/system/user/get?id=${id}`))?.status !== 1) {
+      throw new Error('生成权限账号停用回读失败')
+    }
+    return { retained: true, reason: '账号已停用解绑，保留操作审计主体' }
+  })
+  // Login through the official encrypted transport; never put credentials or tokens in evidence.
+  const anonymous = createApiClient()
+  const session = assertBusinessSuccess(await anonymous.request('POST', '/system/auth/login-encrypted', {
+    username: reader.username, password: reader.credentials.password,
+    captchaVerification: '', rememberMe: false
+  }, { encrypted: true }), '生成权限专属账号登录').data
+  if (!session?.accessToken || String(session.userId) !== String(reader.userId) ||
+      String(session.tenantId) !== '1') throw new Error('生成权限登录主体或租户不一致')
+  const readonly = createApiClient({ token: session.accessToken, tenantId: '1' })
+  const role = dataOf(await api.getBusiness(`/system/role/get?id=${reader.roleId}`))
+  const ownedAccount = caseRecord.accounts.find((account) =>
+    String(account.userId) === String(reader.userId))
+  const grantedMenus = new Set((ownedAccount?.menuIds || []).map(String))
+  const expectedPermissions = [...new Set(requiredRows(
+    await api.getBusiness('/system/menu/list'), '生成权限菜单'
+  ).filter((menu) => grantedMenus.has(String(menu.id)))
+    .map((menu) => menu.permission).filter(Boolean))].sort()
+  const info = restrictedWriter ? null : dataOf(await readonly.getBusiness('/system/auth/get-permission-info'))
+  const exactPermissions = restrictedWriter
+    ? role?.dataScope === 2 && Array.isArray(role.dataScopeDeptIds) && role.dataScopeDeptIds.length === 0
+    : hasExactMaintenanceReadPermissions(info?.permissions, expectedPermissions, permission)
+  if ((!restrictedWriter &&
+      (info?.user?.username !== reader.username || String(info?.user?.id) !== String(reader.userId) ||
+        !Array.isArray(info.roles) || info.roles.length !== 1 || info.roles[0] !== role?.code)) ||
+      !exactPermissions) {
+    throw new Error(`生成权限探针未保持精确只读授权：${JSON.stringify({
+      expectedPermissions, permissions: info?.permissions,
+      expectedRole: role?.code, roles: info?.roles,
+      identityMatched: info?.user?.username === reader.username &&
+        String(info?.user?.id) === String(reader.userId)
+    })}`)
+  }
+  const expected = {
+    code: 403,
+    message: restrictedWriter
+      ? /^运行计划包含不存在或不在当前数据范围内的设备$/
+      : /^没有该操作权限$/,
+    allowServiceCode: true
+  }
+  const response = await readonly.request('POST', '/mes/system/task/generate', {
+    planId: runtimePlanId, planDate
+  }, { expectedBusinessRejection: expected })
+  caseRecord.checks.push({
+    name: restrictedWriter
+      ? '真实账号虽有生成写权限但无设备部门范围仍被拒绝'
+      : '真实只读账号无法调用单计划生成入口且没有通配授权',
+    passed: matchesExpectedBusinessRejection(response, expected),
+    details: `user=${reader.userId}; permission=${permission}; code=${response?.code}`
+  })
+}
 
 export const hasRepairWorkflowAudit = (rows, operatorId, tenantId) => {
   const transitions = [
@@ -420,7 +542,11 @@ const createPlanFixture = async (api, fixtures, caseRecord, domain, planName, op
   const itemBody = {
     parentId: root.id, categoryRoot: domain, nodeType: 'ITEM',
     itemCode: unique('E2E-MI'), itemName: `E2E ${domain} 项目`,
-    resultType: 'BOOLEAN', status: 0
+    resultType: 'BOOLEAN', status: 0,
+    ...(options.freezeExecutionFields ? {
+      execRequirement: 'E2E 按正式标准检查并记录结果',
+      standardHours: 0.5, attachmentRequired: false
+    } : {})
   }
   let retainItem = false
   const itemId = fixtures.track(
@@ -1238,7 +1364,9 @@ const runAuthenticatedCase = async (
     const device = await createMaintenanceDevice(api, fixtures, caseRecord)
     if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置' }
     const planName = `E2E 巡检运行计划-${Date.now().toString(36).toUpperCase()}`
-    const fixture = await createPlanFixture(api, fixtures, caseRecord, 'INSPECT', planName)
+    const fixture = await createPlanFixture(api, fixtures, caseRecord, 'INSPECT', planName, {
+      freezeExecutionFields: true
+    })
     if (!fixture) return { token, api, partial: true, note: '缺少巡检项目根分类前置' }
     const { planId } = fixture
     // 先建立设备范围分配，再发布方案，发布时才会生成运行计划
@@ -1274,8 +1402,134 @@ const runAuthenticatedCase = async (
       fixtures.track(runtimePlan.id, '巡检运行计划', async (id) => {
         await api.deleteBusiness(`/mes/system/plan/${id}`)
       })
+      const planDate = formatLocalDateTime(new Date()).slice(0, 10)
+      const taskPath = `/mes/system/task/list?pageNo=1&pageSize=100&planId=${runtimePlan.id}`
+      const readTasks = async () => requiredRows(await api.getBusiness(taskPath), '巡检到期任务')
+      if ((await readTasks()).length !== 0) throw new Error('本轮新运行计划已存在任务，拒绝复用未知数据')
+      const generate = async (date) => dataOf(await api.postBusiness('/mes/system/task/generate', {
+        planId: runtimePlan.id, planDate: date
+      }))
+      await verifyDueGenerationPermission(api, fixtures, caseRecord, runtimePlan.id, planDate)
+      if ((await readTasks()).length !== 0) throw new Error('只读权限探针改变了专属计划任务事实')
+      await verifyDueGenerationPermission(api, fixtures, caseRecord, runtimePlan.id, planDate, true)
+      if ((await readTasks()).length !== 0) throw new Error('越范围权限探针改变了专属计划任务事实')
+      const futureDate = new Date()
+      futureDate.setDate(futureDate.getDate() + 1)
+      const expectedFuture = { code: 400, message: /^到期任务不允许提前生成未来日期$/, allowServiceCode: true }
+      const future = await api.request('POST', '/mes/system/task/generate', {
+        planId: runtimePlan.id, planDate: formatLocalDateTime(futureDate).slice(0, 10)
+      }, { expectedBusinessRejection: expectedFuture })
+      caseRecord.checks.push({
+        name: '启用计划拒绝提前生成未来任务且不占用计划日期唯一键',
+        passed: matchesExpectedBusinessRejection(future, expectedFuture) && (await readTasks()).length === 0,
+        details: `runtime=${runtimePlan.id}; code=${future?.code}`
+      })
+      const created = await generate(planDate)
+      const generated = await readTasks()
+      for (const task of generated) trackInspectionTask(fixtures, api, task.id)
+      caseRecord.checks.push({
+        name: '受限单计划正式到期生成一条任务并固化完整来源快照',
+        passed: created === 1 && generated.length === 1 &&
+          hasDueTaskSnapshots(generated[0], runtimePlan, device),
+        details: `runtime=${runtimePlan.id}; count=${created}; tasks=${generated.length}`
+      })
+      if (generated.length !== 1) throw new Error('专属运行计划未生成唯一任务')
+      const task = dataOf(await api.getBusiness(`/mes/system/task/${generated[0].id}`))
+      const repeated = await generate(planDate)
+      const afterRepeat = await readTasks()
+      caseRecord.checks.push({
+        name: '单计划同日重复生成幂等且原始任务配置快照不变',
+        passed: repeated === 0 && afterRepeat.length === 1 &&
+          String(afterRepeat[0].id) === String(task.id) &&
+          hasDueTaskSnapshots(afterRepeat[0], runtimePlan, device),
+        details: `task=${task.id}; repeated=${repeated}; count=${afterRepeat.length}`
+      })
+      const inspection = dataOf(await api.postBusiness('/mes/system/record/add', {
+        taskId: task.id, inspectionMode: 'NORMAL', inspectionStatus: '1',
+        inspectionTime: formatLocalDateTime(new Date()),
+        abnormalFlag: '0', inspectionRemark: 'E2E MAINT-005 按正式计划完成巡检'
+      }))
+      if (!inspection?.id) throw new Error('正式巡检完成未返回记录 ID')
+      trackInspectionRecord(fixtures, api, inspection.id)
+      const savedRecord = dataOf(await api.getBusiness(`/mes/system/record/${inspection.id}`))
+      const completedTask = dataOf(await api.getBusiness(`/mes/system/task/${task.id}`))
+      caseRecord.checks.push({
+        name: '正式巡检记录继承任务完整快照并回写任务完成状态',
+        passed: hasRecordTaskSnapshots(savedRecord, task) &&
+          completedTask?.inspectionStatus === '1' &&
+          String(completedTask?.inspectionRecordId) === String(inspection.id),
+        details: `task=${task.id}; record=${inspection.id}; version=${savedRecord.maintenancePlanVersion}`
+      })
+      await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
+      const disabled = dataOf(await api.getBusiness(`/mes/system/plan/${runtimePlan.id}`))
+      const tomorrow = new Date()
+      tomorrow.setDate(tomorrow.getDate() + 1)
+      const skipped = await generate(formatLocalDateTime(tomorrow).slice(0, 10))
+      caseRecord.checks.push({
+        name: '停用方案同步停用运行计划且后续日期不生成任务',
+        passed: disabled?.status === '0' && skipped === 0 && (await readTasks()).length === 1 &&
+          hasRecordTaskSnapshots(
+            dataOf(await api.getBusiness(`/mes/system/record/${inspection.id}`)), task),
+        details: `plan=${planId}; runtimeStatus=${disabled?.status}; created=${skipped}`
+      })
+      caseRecord.evidence.push(
+        `正式方案 ${planId}/v1 → 分配 ${assignmentId} → 运行计划 ${runtimePlan.id} → ` +
+        `单计划到期生成任务 ${task.id} → 完成巡检记录 ${inspection.id}；来源及完整配置由服务端固化。`
+      )
+      await openRoute(page, MAINT_009_INSPECTION_RECORD_ROUTE, {
+        readySelector: 'input[placeholder="请输入计划名称"]', readyText: '巡检记录中心'
+      })
+      await page.getByPlaceholder('请输入计划名称', { exact: true }).fill(planName)
+      const loaded = page.waitForResponse((response) => {
+        const url = new URL(response.url())
+        return url.pathname.endsWith('/mes/system/record/list') &&
+          url.searchParams.get('planName') === planName
+      })
+      await page.getByRole('button', { name: '查询', exact: true }).click()
+      await loaded
+      const recordRow = page.locator('.vxe-body--row').filter({ hasText: planName }).first()
+      await recordRow.waitFor({ state: 'visible' })
+      caseRecord.checks.push({
+        name: '巡检记录页面按专属计划筛选并实际展示本轮执行记录',
+        passed: (await recordRow.innerText()).includes('E2E MAINT-005 按正式计划完成巡检'),
+        details: `record=${inspection.id}; plan=${planName}`
+      })
+      await saveScreenshot(page, outputDir, 'maint-005-due-task-record', record)
+      // VXE keeps fixed action cells in a sibling table; bind them by the same row ID.
+      const rowKey = await recordRow.getAttribute('rowid')
+      if (!rowKey || !/^[a-zA-Z0-9_-]+$/.test(rowKey)) throw new Error('巡检记录表格缺少稳定行标识')
+      const actionRow = page.locator(
+        `.vxe-table--fixed-right-wrapper .vxe-body--row[rowid="${rowKey}"]`
+      )
+      await actionRow.getByRole('button', { name: '详情', exact: true }).click()
+      const drawer = page.locator('.el-drawer').filter({ hasText: planName }).last()
+      await drawer.waitFor({ state: 'visible' })
+      caseRecord.checks.push({
+        name: '本轮巡检记录详情真实打开且计划名称和执行备注非空',
+        passed: (await drawer.innerText()).includes(planName) &&
+          await drawer.locator('textarea').filter({ visible: true })
+            .evaluateAll((elements) => elements.some((element) =>
+              element.value === 'E2E MAINT-005 按正式计划完成巡检')),
+        details: `record=${inspection.id}`
+      })
+      const summary = drawer.locator('.summary-list')
+      caseRecord.checks.push({
+        name: '详情展示本轮设备范围、完成状态和本地计划日期且文字不溢出',
+        passed: (await drawer.locator('.hero-metric--amber').innerText()).includes('1 台') &&
+          (await summary.innerText()).includes('已完成') &&
+          (await drawer.locator('.hero-metric--indigo').innerText()).includes(planDate) &&
+          await drawer.locator('.hero-metric__value').evaluateAll((elements) =>
+            elements.every((element) => element.scrollWidth <= element.clientWidth + 1)) &&
+          !(await drawer.innerText()).includes(`${planDate}T`),
+        details: `device=${device.id}; planDate=${planDate}; status=1`
+      })
+      await saveScreenshot(page, outputDir, 'maint-005-due-record-detail', record)
+      await drawer.getByRole('button', { name: /取\s*消/ }).click()
     }
-    return { token, api }
+    return {
+      token, api, partial: true,
+      note: '已补单计划到期生成、防重、正式巡检记录及停用验证；新方案版本发布与旧任务执行仍待版本分配策略确认，不宣称完整通过。'
+    }
   }
 
   if (caseId === 'MAINT-006') {
