@@ -223,6 +223,23 @@ export const trackOwnedStatusEvent = (fixtures, api, response, deviceId) =>
     return { retained: true, reason: '已结束；正式 API 无历史删除入口，未删除审计事实' }
   })
 
+export const trackDeviceRuntimeCleanup = (fixtures, api, deviceId) =>
+  fixtures.track(deviceId, '指标设备运行状态历史', async (id) => {
+    const active = dataOf(await api.getBusiness(
+      `/mes/device-status-event/active?deviceId=${id}&coreLayer=RUNTIME`
+    ))
+    if (!active) return { retained: true, reason: '专属设备无有效运行事件' }
+    if (String(active.deviceId) !== String(id) || active.coreLayer !== 'RUNTIME' || !active.id) {
+      throw new Error(`指标事件所有权不一致，禁止结束 deviceId=${id}`)
+    }
+    await endFixtureEvent(api, active.id, 'E2E MAINT-011 fixture cleanup')
+    const ended = dataOf(await api.getBusiness(`/mes/device-status-event/get?id=${active.id}`))
+    if (String(ended?.deviceId) !== String(id) || ended?.active !== false || !ended?.endTime) {
+      throw new Error(`指标设备事件未安全结束 id=${active.id}`)
+    }
+    return { retained: true, reason: `事件 ${active.id} 已结束，保留正式状态审计历史` }
+  })
+
 export const retainInventoryMaster = async (api, field, id) => {
   if (!['materialId', 'warehouseId'].includes(field)) throw new Error('Unsupported inventory master')
   const rows = requiredRows(dataOf(await api.getBusiness(
@@ -251,6 +268,11 @@ export const hasTaskTypeSnapshot = (task, rule) => {
     return false
   }
 }
+
+export const hasExactTypeRule = (actual, expected) =>
+  actual != null &&
+  ['coreDomain', 'subTypeCode', 'subTypeName', 'approvalRequired', 'slaHours', 'status', 'version']
+    .every((field) => actual[field] === expected[field])
 
 export const createDedicatedMaintenanceMaterial = async (api, fixtures) => {
   const units = requiredRows(
@@ -974,37 +996,92 @@ const runAuthenticatedCase = async (
   }
 
   if (caseId === 'MAINT-001') {
-    const suffix = unique('MT')
-    const created = trackDeletable(fixtures, api, await api.postBusiness('/mes/maintenance-type-rule/create', {
+    const ruleBody = {
       coreDomain: 'UPKEEP',
-      subTypeCode: suffix,
-      subTypeName: '日常保养',
+      subTypeCode: unique('E2E-MT'),
+      subTypeName: unique('E2E 日常保养'),
       approvalRequired: true,
       slaHours: 24,
       status: 0
-    }), '/mes/maintenance-type-rule', '维保类型规则')
-    caseRecord.checks.push({
-      name: '保养子类型映射固定核心域 UPKEEP',
-      passed: Boolean(created),
-      details: `id=${created}`
-    })
-    let invalidRejected = false
-    try {
-      await api.postBusiness('/mes/maintenance-type-rule/create', {
-        coreDomain: 'NOT_A_DOMAIN',
-        subTypeCode: unique('BAD'),
-        subTypeName: '非法域',
-        status: 0
-      })
-    } catch (error) {
-      invalidRejected = true
     }
+    const ruleId = trackRuleFixture(fixtures, api,
+      await api.postBusiness('/mes/maintenance-type-rule/create', ruleBody), caseRecord)
+    const rule = dataOf(await api.getBusiness(`/mes/maintenance-type-rule/get?id=${ruleId}`))
     caseRecord.checks.push({
-      name: '非固定核心维保域被拒绝',
-      passed: invalidRejected,
-      details: '核心域固定为维修/保养/巡检'
+      name: '正式规则精确回读核心域、企业子类型、审批、SLA 和 v1',
+      passed: String(rule?.id) === String(ruleId) &&
+        hasExactTypeRule(rule, { ...ruleBody, version: 1 }),
+      details: `ruleId=${ruleId}, domain=${rule?.coreDomain}, approval=${rule?.approvalRequired}, sla=${rule?.slaHours}, version=${rule?.version}`
     })
-    return { token, api }
+    const invalidCode = unique('E2E-BAD')
+    const invalid = await api.post('/mes/maintenance-type-rule/create', {
+      coreDomain: 'NOT_A_DOMAIN', subTypeCode: invalidCode, subTypeName: 'E2E 非法域', status: 0
+    })
+    const invalidPage = dataOf(await api.getBusiness(
+      `/mes/maintenance-type-rule/page?pageNo=1&pageSize=100&subTypeCode=${encodeURIComponent(invalidCode)}`
+    ))
+    caseRecord.checks.push({
+      name: '非法核心域精确返回领域拒绝且未持久化',
+      passed: isExpectedRejection(invalid, '核心维保域必须是 REPAIR/UPKEEP/INSPECT') &&
+        Number(invalidPage?.total) === 0 && requiredRows(invalidPage, '非法域查询').length === 0,
+      details: `code=${invalid?.code}, persisted=${invalidPage?.total}`
+    })
+    const device = await createMaintenanceDevice(api, fixtures, caseRecord)
+    if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品，正式类型任务快照未验证' }
+    const planName = unique('E2E-MAINT-001')
+    const plan = await createPlanFixture(api, fixtures, caseRecord, 'UPKEEP', planName, {
+      subTypeCode: ruleBody.subTypeCode
+    })
+    if (!plan) return { token, api, partial: true, note: '缺少 UPKEEP 根项目，正式类型任务快照未验证' }
+    const assignmentId = trackDeletable(fixtures, api,
+      await api.postBusiness('/mes/maintenance-plan-assignment/create', {
+        targetType: 'DEVICE', targetId: device.id, planId: plan.planId,
+        planVersion: 1, priority: 1, status: 0
+      }), '/mes/maintenance-plan-assignment', 'MAINT-001 专属分配')
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${plan.planId}`)
+    const runtimeRows = requiredRows(await api.getBusiness(
+      `/mes/system/plan/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(planName)}`
+    ), 'MAINT-001 运行计划')
+    const matches = runtimeRows.filter((row) =>
+      String(row.sourcePlanId) === String(plan.planId) &&
+      String(row.assignmentId) === String(assignmentId))
+    if (matches.length !== 1) throw new Error(`MAINT-001 运行计划数量异常 count=${matches.length}`)
+    const runtime = matches[0]
+    fixtures.track(runtime.id, 'MAINT-001 运行计划', async (id) => {
+      assertBusinessSuccess(await api.deleteBusiness(`/mes/system/plan/${id}`), 'MAINT-001 运行计划清理')
+    })
+    // Do not inject type snapshots: the formal task must inherit them from the published plan.
+    const task = dataOf(await api.postBusiness('/mes/system/task/add', {
+      planId: runtime.id, deviceId: device.id, deviceIds: [String(device.id)],
+      planDate: formatLocalDateTime(new Date()).slice(0, 10),
+      inspectionStatus: '0', abnormalFlag: '0'
+    }))
+    if (!task?.id) throw new Error('MAINT-001 正式任务未返回 ID')
+    trackInspectionTask(fixtures, api, task.id)
+    const savedTask = dataOf(await api.getBusiness(`/mes/system/task/${task.id}`))
+    const runtimeConfig = JSON.parse(runtime.configSnapshot)
+    const savedRule = JSON.parse(savedTask.maintenanceTypeRuleSnapshot)
+    caseRecord.checks.push({
+      name: '正式任务由发布方案自动固化核心域、企业子类型及完整规则版本快照',
+      passed: hasTaskTypeSnapshot(savedTask, rule) && hasExactTypeRule(savedRule, rule) &&
+        savedTask.maintenanceTypeRuleSnapshot === runtimeConfig.typeRuleSnapshot &&
+        String(savedTask.planId) === String(runtime.id) &&
+        String(savedTask.deviceId) === String(device.id),
+      details: `task=${task.id}, runtime=${runtime.id}, rule=${ruleId}/v${savedTask.maintenanceTypeRuleVersion}`
+    })
+    await openRoute(page, '/settings/iot/device-maintenance', { readyText: '维保类型' })
+    await page.locator('.el-tabs__item').filter({ hasText: '维保类型' }).first().click()
+    await page.getByText(ruleBody.subTypeName, { exact: true }).first().waitFor({ state: 'visible' })
+    caseRecord.checks.push({
+      name: '维保类型页面真实显示本轮子类型',
+      passed: true,
+      details: ruleBody.subTypeName
+    })
+    await saveScreenshot(page, outputDir, 'maint-001-formal-type-rule', record)
+    caseRecord.evidence.push(
+      `正式规则 ${ruleId}/v1 → 专属方案 ${plan.planId} → 分配 ${assignmentId} → 运行计划 ${runtime.id} → 正式任务 ${task.id}；规则快照由服务端回填。`
+    )
+    return { token, api, acceptanceComplete: true }
   }
 
   if (caseId === 'MAINT-002') {
@@ -1365,6 +1442,7 @@ const runAuthenticatedCase = async (
       return url.pathname.endsWith('/mes/device-status-event/page') &&
         url.searchParams.get('deviceId') === String(deviceId)
     })
+    responsePromise.catch(() => {})
     await searchForm.getByRole('button', { name: '搜索', exact: true }).click()
     const response = await responsePromise
     await page.waitForFunction(({ id, name }) => {
@@ -2161,6 +2239,7 @@ const runAuthenticatedCase = async (
     })
     if (!device) return { token, api, partial: true, note: '缺少启用 IoT 产品前置，无法创建指标专属设备' }
     const deviceId = device.id
+    trackDeviceRuntimeCleanup(fixtures, api, deviceId)
     const permission = dataOf(await api.get('/system/auth/get-permission-info'))
     const assigneeUserId = permission?.user?.id
     if (assigneeUserId == null) throw new Error('BLOCKED: 权限信息未返回当前用户 ID')
@@ -2298,24 +2377,100 @@ const runAuthenticatedCase = async (
     await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, {
       readySelector: '.statistics-metrics'
     })
-    await page.waitForTimeout(1200)
-    const pageText = await page.locator('body').innerText()
+    const queryMetrics = async () => {
+      const toolbar = page.locator('.statistics-toolbar')
+      await toolbar.getByPlaceholder('请输入设备ID', { exact: true }).fill(String(deviceId))
+      await toolbar.getByPlaceholder('开始时间', { exact: true }).fill(startTime.replace('T', ' '))
+      await toolbar.getByPlaceholder('结束时间', { exact: true }).fill(endTime.replace('T', ' '))
+      await toolbar.getByPlaceholder('结束时间', { exact: true }).press('Tab')
+      const metricsResponse = page.waitForResponse((response) =>
+        response.url().includes('/mes/device-status-event/metrics?') &&
+        new URL(response.url()).searchParams.get('deviceId') === String(deviceId)
+      ).catch(() => null)
+      await toolbar.getByRole('button', { name: '统计', exact: true }).click()
+      const displayedResponse = await metricsResponse
+      if (!displayedResponse?.ok()) throw new Error('设备页面统计未成功请求专属设备指标')
+      await waitForPageReady(page)
+    }
+    await queryMetrics()
+    const expectedCards = [
+      ['故障次数', metrics.failureCount], ['修复次数', metrics.repairCount],
+      ['MTBF（h）', metrics.mtbfHours], ['MTTR（h）', metrics.mttrHours],
+      ['维修费用', metrics.repairCost]
+    ]
+    const cards = []
+    for (const [label, expected] of expectedCards) {
+      const value = page.locator('.statistics-metric').filter({
+        has: page.locator('span').filter({ hasText: label })
+      }).locator('strong')
+      await value.filter({ hasText: String(expected) }).waitFor({ state: 'visible' })
+      cards.push({ label, expected, actual: (await value.innerText()).trim() })
+    }
     caseRecord.checks.push({
-      name: '设备状态页展示 MTBF/MTTR/维修费用/保养达成率指标',
-      passed:
-        pageText.includes('MTBF') &&
-        pageText.includes('MTTR') &&
-        pageText.includes('维修费用') &&
-        pageText.includes('保养达成率'),
-      details: '设备状态与统计页指标卡'
+      name: '页面实际统计后显示专属设备的非空指标且与 API 一致',
+      passed: cards.every(({ actual, expected }) => actual !== '--' && Number(actual) === Number(expected)),
+      details: JSON.stringify(cards)
+    })
+    const maintenanceRate = page.locator('.statistics-metric').filter({
+      has: page.locator('span').filter({ hasText: '保养达成率' })
+    }).locator('strong')
+    const expectedMaintenanceText = metrics.maintenanceRate == null
+      ? '暂无到期任务' : `${metrics.maintenanceRate}%`
+    caseRecord.checks.push({
+      name: '保养指标区分未统计和无到期任务，不误报待接入',
+      passed: (await maintenanceRate.innerText()).trim() === expectedMaintenanceText,
+      details: expectedMaintenanceText
     })
     await saveScreenshot(page, outputDir, 'maint-011-device-metrics', record)
-    const finalActive = dataOf(await api.getBusiness(
-      `/mes/device-status-event/active?deviceId=${deviceId}&coreLayer=RUNTIME`
-    ))
-    if (finalActive?.id) {
-      await endFixtureEvent(api, finalActive.id, 'E2E MAINT-011 fixture cleanup')
-    }
+    await page.getByRole('button', { name: '钻取明细', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: '设备维修明细钻取' })
+    await dialog.waitFor({ state: 'visible' })
+    await waitForPageReady(page)
+    const rows = dialog.locator('.el-table__row')
+    const rowText = await rows.allInnerTexts()
+    caseRecord.checks.push({
+      name: '页面钻取显示本轮 CLOSED 工单和维修费用',
+      passed: rowText.length === 1 && rowText[0].includes(orderMarker) &&
+        rowText[0].includes('已关闭') && rowText[0].includes('120'),
+      details: rowText.join(' | ')
+    })
+    await saveScreenshot(page, outputDir, 'maint-011-repair-drilldown', record)
+    const desktopViewport = page.viewportSize()
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+    await page.setViewportSize({ width: 390, height: 844 })
+    // The responsive app shell remounts the route, so repeat the actual query.
+    await openRoute(page, MAINT_011_DEVICE_STATUS_ROUTE, { readySelector: '.statistics-metrics' })
+    await queryMetrics()
+    const rangeBounds = await page.locator('.statistics-toolbar .el-date-editor').boundingBox()
+    caseRecord.checks.push({
+      name: '窄屏统计日期控件不溢出视口',
+      passed: rangeBounds != null && rangeBounds.x >= 0 &&
+        rangeBounds.x + rangeBounds.width <= 390,
+      details: JSON.stringify(rangeBounds)
+    })
+    await saveScreenshot(page, outputDir, 'maint-011-device-metrics-mobile', record)
+    await page.getByRole('button', { name: '钻取明细', exact: true }).click()
+    await dialog.waitFor({ state: 'visible' })
+    await waitForPageReady(page)
+    const mobileBounds = await dialog.boundingBox()
+    caseRecord.checks.push({
+      name: '维修钻取弹窗在窄视口内保持边界，明细在表体内横向滚动',
+      passed: mobileBounds != null && mobileBounds.x >= 0 &&
+        mobileBounds.x + mobileBounds.width <= 390,
+      details: JSON.stringify(mobileBounds)
+    })
+    const tableScroll = await dialog.locator('.el-table__body-wrapper .el-scrollbar__wrap').evaluate(
+      (element) => ({ width: element.clientWidth, scrollWidth: element.scrollWidth })
+    )
+    caseRecord.checks.push({
+      name: '窄屏维修明细表体保留横向滚动和本轮工单',
+      passed: tableScroll.width > 0 && tableScroll.scrollWidth > tableScroll.width &&
+        (await rows.allInnerTexts()).some((text) => text.includes(orderMarker) && text.includes('已关闭')),
+      details: JSON.stringify(tableScroll)
+    })
+    await saveScreenshot(page, outputDir, 'maint-011-repair-drilldown-mobile', record)
+    await dialog.getByRole('button', { name: '关闭', exact: true }).click()
+    await page.setViewportSize(desktopViewport)
     caseRecord.evidence.push(
       `专属设备 ${device.id} 与 CLOSED 工单 ${orderId} 生成正式指标；初始状态事件 ${initialRunningEventId}`
     )

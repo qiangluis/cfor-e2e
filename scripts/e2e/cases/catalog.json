@@ -4828,12 +4828,16 @@
         },
         {
           "id": "MAINT-001",
-          "status": "PARTIAL",
-          "acceptanceGaps": [
-            "PB-107：尚未通过正式规则查询精确回读 coreDomain、subType、审批、SLA 和规则版本",
-            "非法核心域尚缺领域错误码及未持久化断言，不能把 500 或网络异常算作映射校验通过",
-            "尚未生成正式任务或工单并核对核心域、企业子类型及规则版本快照"
-          ],
+          "status": "READY",
+          "acceptanceEvidence": {
+            "verifiedOn": "2026-10-11",
+            "runId": "20261011064621779-86524",
+            "checks": [
+              "正式规则精确回读核心域、企业子类型、审批、SLA 和 v1",
+              "非法核心域精确返回领域拒绝且未持久化",
+              "正式任务由发布方案自动固化核心域、企业子类型及完整规则版本快照"
+            ]
+          },
           "title": "维保类型子类型必须映射维修/保养/巡检固定核心域",
           "assertions": [
             "保养子类型映射固定核心域 UPKEEP",
@@ -5302,12 +5306,26 @@
         {
           "id": "PMS-001",
           "title": "项目成员、工作项、评论和工时",
-          "status": "PARTIAL",
+          "status": "READY",
           "preconditions": ["PMS 项目模板、知识模板和建模配置完成"],
-          "routes": ["/pms/project", "/pms/work-item"],
+          "routes": ["/pms/pm/project/list", "/pms/pm/project/detail/:id", "/pms/pm/project/config/:id"],
           "assertions": ["成员权限", "状态流转", "评论参与权", "实际工时非负", "跨租户不可见"],
-          "database": ["pms_project", "pms_work_item", "pms_project_member", "pms_work_log"],
-          "reverse": ["回收站恢复而非直接删除"]
+          "database": ["pms_project", "pms_work_item", "pms_project_member", "pms_work_item_work_log"],
+          "reverse": ["回收站恢复而非直接删除"],
+          "acceptanceEvidence": {
+            "verifiedOn": "2026-10-11",
+            "runId": "20261011064621779-86524",
+            "checks": [
+              "PMS 普通成员与非成员权限矩阵完整通过",
+              "PMS 工作项从未开始、进行中流转至已完成",
+              "PMS 编辑成员不能修改他人评论且原文不变",
+              "PMS 编辑成员不能删除他人评论且原文不变",
+              "PMS 负工时精确校验拒绝且汇总记录不变",
+              "PMS 第二租户真实登录后不可读取 tenant 1 专属项目",
+              "PMS 项目回收站恢复而非直接删除",
+              "PMS 项目详情真实展示本轮完成工作项"
+            ]
+          }
         },
         {
           "id": "OA-001",

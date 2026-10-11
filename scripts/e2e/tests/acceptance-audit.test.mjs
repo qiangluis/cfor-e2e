@@ -322,6 +322,17 @@ const catalog = JSON.parse(fs.readFileSync(
 ))
 const cases = catalog.suites.flatMap((suite) => suite.cases)
 const auditedIds = new Set(auditBaseline.map((item) => item.id))
+const closedAcceptance = {
+  'MAINT-001': {
+    verifiedOn: '2026-10-11',
+    runId: '20261011064621779-86524',
+    checks: [
+      '正式规则精确回读核心域、企业子类型、审批、SLA 和 v1',
+      '非法核心域精确返回领域拒绝且未持久化',
+      '正式任务由发布方案自动固化核心域、企业子类型及完整规则版本快照'
+    ]
+  }
+}
 
 test('acceptance audit contains exactly 32 unique target cases, excluding PB123/PB124', () => {
   assert.equal(auditBaseline.length, 32, 'actual audit manifest count')
@@ -333,19 +344,25 @@ test('acceptance audit contains exactly 32 unique target cases, excluding PB123/
 })
 
 for (const baseline of auditBaseline) {
-  test(`${baseline.id} remains PARTIAL with explicit gaps and unchanged acceptance text`, () => {
+  test(`${baseline.id} preserves acceptance text and explicit gaps or verified closure evidence`, () => {
     const matches = cases.filter((item) => item.id === baseline.id)
     assert.equal(matches.length, 1, `${baseline.id}: catalog occurrence count`)
     const item = matches[0]
-    assert.equal(item.status, 'PARTIAL', `${baseline.id}: incomplete original acceptance`)
-    assert.ok(Array.isArray(item.acceptanceGaps) && item.acceptanceGaps.length > 0,
-      `${baseline.id}: acceptanceGaps must be a non-empty array`)
-    for (const gap of item.acceptanceGaps) {
-      assert.ok(typeof gap === 'string' && gap.trim().length > 0,
-        `${baseline.id}: each acceptance gap must be non-blank text`)
+    if (closedAcceptance[baseline.id]) {
+      assert.equal(item.status, 'READY', `${baseline.id}: completed original acceptance`)
+      assert.equal(item.acceptanceGaps?.length ?? 0, 0, `${baseline.id}: no remaining acceptance gap`)
+      assert.deepEqual(item.acceptanceEvidence, closedAcceptance[baseline.id])
+    } else {
+      assert.equal(item.status, 'PARTIAL', `${baseline.id}: incomplete original acceptance`)
+      assert.ok(Array.isArray(item.acceptanceGaps) && item.acceptanceGaps.length > 0,
+        `${baseline.id}: acceptanceGaps must be a non-empty array`)
+      for (const gap of item.acceptanceGaps) {
+        assert.ok(typeof gap === 'string' && gap.trim().length > 0,
+          `${baseline.id}: each acceptance gap must be non-blank text`)
+      }
+      assert.equal(new Set(item.acceptanceGaps.map((gap) => gap.trim())).size,
+        item.acceptanceGaps.length, `${baseline.id}: acceptance gaps must not be duplicates`)
     }
-    assert.equal(new Set(item.acceptanceGaps.map((gap) => gap.trim())).size,
-      item.acceptanceGaps.length, `${baseline.id}: acceptance gaps must not be duplicates`)
     assert.equal(item.title, baseline.title, `${baseline.id}: original title`)
     assert.deepEqual(item.assertions, baseline.assertions,
       `${baseline.id}: preserve every original assertion, its text and order`)

@@ -20,6 +20,7 @@ export async function gotoSite (page, url, opts = {}) {
   let lastErr = null
   for (let i = 1; i <= tries; i++) {
     try {
+      await pageObservers.get(page)?.flushResponses()
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000, ...opts.goto })
       return
     } catch (err) {
@@ -64,6 +65,7 @@ const SELECTORS = {
   loggedIn: ['.avatar', '.user-info', '[class*="user"]', 'text=工作台']
 }
 const loginContexts = new WeakMap()
+const pageObservers = new WeakMap()
 
 export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
   error === 'net::ERR_ABORTED' &&
@@ -202,7 +204,27 @@ export async function launchBrowser ({ headed = false, record } = {}) {
 }
 
 export function observePage (page, record) {
-  const responseTasks = new Set()
+  const existing = pageObservers.get(page)
+  if (existing) return existing
+  const responseTasks = new Map()
+  const pendingRequests = new Map()
+  const trackRequest = (request) => {
+    if (!/\/(?:admin|app)-api\//.test(request.url())) return
+    if (!pendingRequests.has(request)) {
+      let resolve
+      const finished = new Promise((settle) => { resolve = settle })
+      pendingRequests.set(request, {
+        finished, resolve, startedAt: Date.now(),
+        method: request.method(), url: resourceUrl(request.url())
+      })
+    }
+    return pendingRequests.get(request)
+  }
+  const finishRequest = (request, completed) => {
+    pendingRequests.get(request)?.resolve(completed)
+    pendingRequests.delete(request)
+  }
+  page.on('request', trackRequest)
   page.on('console', (message) => {
     if (message.type() !== 'error') return
     record?.consoleErrors?.push(message.text())
@@ -213,6 +235,7 @@ export function observePage (page, record) {
     })
   })
   page.on('requestfailed', (request) => {
+    finishRequest(request, false)
     const failure = {
       url: resourceUrl(request.url()), method: request.method(),
       resourceType: request.resourceType(), error: request.failure()?.errorText
@@ -220,34 +243,79 @@ export function observePage (page, record) {
     if (isExpectedRequestFailure(failure)) return
     record?.requestFailures?.push(failure)
   })
+  page.on('requestfinished', (request) => finishRequest(request, true))
   page.on('pageerror', (error) => record?.pageErrors?.push(error.message))
   page.on('response', (response) => {
     if (!/\/(?:admin|app)-api\//.test(response.url())) return
+    const entry = {
+      status: response.status(), method: response.request().method(),
+      url: resourceUrl(response.url())
+    }
+    if (response.status() >= 400) {
+      record?.failedApiResponses?.push(entry)
+      finishRequest(response.request(), false)
+      return
+    }
+    const headers = response.headers()
+    if (!headers['content-type']?.includes('json') &&
+      headers[ENCRYPT_HEADER.toLowerCase()] !== 'true') {
+      finishRequest(response.request(), false)
+      return
+    }
+    const { finished } = trackRequest(response.request())
     const task = (async () => {
-      const entry = {
-        status: response.status(), method: response.request().method(),
-        url: resourceUrl(response.url())
-      }
-      if (response.status() >= 400) {
-        record?.failedApiResponses?.push(entry)
-        return
-      }
-      const headers = response.headers()
-      if (!headers['content-type']?.includes('json') &&
-        headers[ENCRYPT_HEADER.toLowerCase()] !== 'true') return
       try {
+        // Reading before requestfinished can leave a body read pending across navigations.
+        if (!await finished) return
         const text = await response.text()
         const body = headers[ENCRYPT_HEADER.toLowerCase()] === 'true'
           ? decryptResponse(text) : JSON.parse(text)
         if (typeof body?.code === 'number' && !isBusinessSuccess(body)) {
           record?.failedApiResponses?.push({ ...entry, code: body.code })
         }
-      } catch {}
+      } catch (error) {
+        record?.failedApiResponses?.push({
+          ...entry, responseError: true, error: String(error.message || error)
+        })
+      }
     })()
-    responseTasks.add(task)
+    responseTasks.set(task, { ...entry, startedAt: Date.now() })
     task.finally(() => responseTasks.delete(task))
   })
-  return { flushResponses: () => Promise.all([...responseTasks]) }
+  const capture = {
+    async flushResponses ({ timeoutMs = 4500, quietMs = 50 } = {}) {
+      let timer
+      let expired = false
+      try {
+        await Promise.race([
+          (async () => {
+            do {
+              await Promise.all([
+                ...responseTasks.keys(),
+                ...[...pendingRequests.values()].map((entry) => entry.finished)
+              ])
+              // Drain events queued during body reads before freezing case evidence or navigating.
+              await new Promise((resolve) => setTimeout(resolve, quietMs))
+            } while (!expired && (responseTasks.size || pendingRequests.size))
+          })(),
+          new Promise((resolve, reject) => {
+            timer = setTimeout(() => {
+              expired = true
+              const pending = [...responseTasks.values(), ...pendingRequests.values()]
+                .map(({ startedAt, finished, resolve, ...entry }) => ({
+                ...entry, pendingMs: Date.now() - startedAt
+              }))
+              reject(new Error(`响应检查未完成，禁止复用当前上下文: ${JSON.stringify(pending)}`))
+            }, timeoutMs)
+          })
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+  }
+  pageObservers.set(page, capture)
+  return capture
 }
 
 async function readToken (page) {
