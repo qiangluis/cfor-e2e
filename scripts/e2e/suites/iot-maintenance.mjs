@@ -87,6 +87,35 @@ export const hasRecordTaskSnapshots = (record, task) =>
   ['configSnapshot', 'cycleRuleSnapshot', 'deviceSnapshot'].every((field) =>
     typeof task?.[field] === 'string' && Boolean(task[field]) && record?.[field] === task[field])
 
+export const hasVersionTransitionSnapshots = ({
+  draft, originalRuntime, runtime, assignment, originalTask, task, record, newTask, device
+}) => {
+  try {
+    const config = JSON.parse(newTask.configSnapshot)
+    const cycle = JSON.parse(newTask.cycleRuleSnapshot)
+    return draft?.status === 'DRAFT' &&
+      Number(draft.currentVersion) === 2 && Number(draft.publishedVersion) === 1 &&
+      String(runtime.id) === String(originalRuntime.id) &&
+      String(runtime.sourcePlanId) === String(originalRuntime.sourcePlanId) &&
+      Number(runtime.sourcePlanVersion) === 2 &&
+      String(runtime.assignmentId) === String(assignment.id) && Number(assignment.planVersion) === 2 &&
+      runtime.configSnapshot !== originalRuntime.configSnapshot &&
+      runtime.cycleRuleSnapshot !== originalRuntime.cycleRuleSnapshot &&
+      Number(newTask.sourcePlanVersion) === 2 && String(newTask.planId) === String(runtime.id) &&
+      String(newTask.assignmentId) === String(assignment.id) &&
+      newTask.configSnapshot === runtime.configSnapshot &&
+      newTask.cycleRuleSnapshot === runtime.cycleRuleSnapshot &&
+      config.version === 2 && config.items?.[0]?.standard === 'E2E V2 目视无异常' &&
+      cycle.cycleValue === 2 &&
+      String(task.id) === String(originalTask.id) &&
+      ['configSnapshot', 'cycleRuleSnapshot', 'deviceSnapshot'].every((field) =>
+        task[field] === originalTask[field]) &&
+      hasDueTaskSnapshots(task, originalRuntime, device) && hasRecordTaskSnapshots(record, task)
+  } catch {
+    return false
+  }
+}
+
 export const hasExactMaintenanceReadPermissions = (actual, expected, permission) =>
   Array.isArray(actual) && actual.includes(permission) &&
   actual.every((value) => typeof value === 'string' && !value.includes('*') &&
@@ -580,7 +609,7 @@ const createPlanFixture = async (api, fixtures, caseRecord, domain, planName, op
     cycles: [{ cycleType: 'TIME', cycleValue: 1, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
   }), '维保方案', async (id) => {
     const plan = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${id}`))
-    if (plan?.status === 'DRAFT') {
+    if (plan?.status === 'DRAFT' && plan?.publishedVersion == null) {
       requireTrueResult(await api.deleteBusiness(`/mes/maintenance-plan/delete?id=${id}`), '草稿方案删除')
       return
     }
@@ -1435,6 +1464,42 @@ const runAuthenticatedCase = async (
       details: '发布版本只能停用，保留任务快照'
     })
     await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
+    const disabled = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    await api.putBusiness('/mes/maintenance-plan/update', {
+      id: planId,
+      planCode: disabled.planCode,
+      planName: disabled.planName,
+      coreDomain: disabled.coreDomain,
+      items: disabled.items.map((item) => ({
+        itemId: item.itemId,
+        itemVersion: item.itemVersion,
+        seq: item.seq,
+        frequency: item.frequency,
+        standard: 'E2E V2 标准',
+        abnormalAction: item.abnormalAction,
+        responsibleRole: item.responsibleRole
+      })),
+      cycles: disabled.cycles
+    })
+    const draftV2 = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    caseRecord.checks.push({
+      name: '停用后编辑已发布方案自动创建 V2 草稿而不复用 V1',
+      passed: draftV2?.status === 'DRAFT' &&
+        Number(draftV2.currentVersion) === 2 &&
+        Number(draftV2.publishedVersion) === 1 &&
+        draftV2.items?.[0]?.standard === 'E2E V2 标准',
+      details: `status=${draftV2?.status}; current=${draftV2?.currentVersion}; published=${draftV2?.publishedVersion}`
+    })
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const publishedV2 = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    caseRecord.checks.push({
+      name: 'V2 草稿发布后已发布版本自动跟随为 V2',
+      passed: publishedV2?.status === 'PUBLISHED' &&
+        Number(publishedV2.currentVersion) === 2 &&
+        Number(publishedV2.publishedVersion) === 2,
+      details: `status=${publishedV2?.status}; current=${publishedV2?.currentVersion}; published=${publishedV2?.publishedVersion}`
+    })
+    await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
     return { token, api }
   }
 
@@ -1451,7 +1516,6 @@ const runAuthenticatedCase = async (
     const fixture = await createPlanFixture(api, fixtures, caseRecord, 'REPAIR', 'E2E 分配方案')
     if (!fixture) return { token, api, partial: true, note: '缺少维修项目根分类前置' }
     const { planId } = fixture
-    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
     const trackAssignment = async (body, label) => {
       const response = await api.postBusiness('/mes/maintenance-plan-assignment/create', body)
       const id = fixtures.track(response, label, async (assignmentId) => {
@@ -1491,6 +1555,30 @@ const runAuthenticatedCase = async (
       priority: 20,
       status: 0
     }, '产品型号方案分配')
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const publishedPlan = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    const generatedOrders = requiredRows(dataOf(await api.getBusiness(
+      '/mes/system/order/list?pageNo=1&pageSize=100'
+    )), '三级分配发布生成的维修工单').filter((row) =>
+      String(row?.projectName) === String(publishedPlan?.planName) &&
+      String(row?.deviceId) === String(device.id)
+    )
+    for (const row of generatedOrders) trackRepairOrder(fixtures, api, row.id, caseRecord)
+    const sourceEvidence = await runReadOnlySql(`
+      SELECT source_plan_version, source_assignment_id, idempotent_key
+      FROM repair_order
+      WHERE tenant_id = 1 AND source_plan_id = '${planId}' AND device_id = '${device.id}'
+      ORDER BY create_time DESC
+    `)
+    const sourceRow = sourceEvidence.available ? sourceEvidence.rows[0] : null
+    caseRecord.checks.push({
+      name: '真实发布生成器按最终命中分配生成唯一维修工单并固化 V1 来源',
+      passed: generatedOrders.length === 1 &&
+        Boolean(sourceRow) &&
+        Number(sourceRow[0]) === 1 &&
+        String(sourceRow[1]) === String(deviceAssignment),
+      details: `orders=${generatedOrders.length}; source=${sourceRow ? sourceRow.join('/') : 'unavailable'}`
+    })
     const hit = dataOf(await api.getBusiness(
       `/mes/maintenance-plan-assignment/resolve?deviceId=${device.id}&productId=${device.productId}&deviceType=${deviceTypeKey}`
     ))
@@ -1538,7 +1626,7 @@ const runAuthenticatedCase = async (
     })
     caseRecord.evidence.push(
       `专属产品 ${product.id}、设备 ${device.id} 与三个启用分配 ${deviceAssignment}/${productAssignment}/${typeAssignment} ` +
-        '依次验证 DEVICE、PRODUCT、DEVICE_TYPE 回退'
+        '依次验证 DEVICE、PRODUCT、DEVICE_TYPE 回退；发布生成器只生成最终命中的 DEVICE 工单'
     )
     const now = new Date()
     const atOffset = (days) => {
@@ -1600,7 +1688,7 @@ const runAuthenticatedCase = async (
     })
     return {
       token, api, partial: true,
-      note: '层级与数值优先级冲突、同层有效期/优先级及无命中已验证；发布生成器未使用统一命中解析，实际任务分配快照闭环仍缺失。'
+      note: '真实发布已验证 DEVICE 优先于 PRODUCT，保留类型文本键与真实设备类型展开、无命中配置告警及巡检任务分配缺口。'
     }
   }
 
@@ -1613,7 +1701,19 @@ const runAuthenticatedCase = async (
     })
     if (!fixture) return { token, api, partial: true, note: '缺少巡检项目根分类前置' }
     const { planId } = fixture
-    // 先建立设备范围分配，再发布方案，发布时才会生成运行计划
+    // Exercise the existing workflow: publish first, add a scope, then reconcile the same version.
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const firstPublished = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    const readPublishedVersions = () => runReadOnlySql(`
+      SELECT id, version, snapshot_json, published_time
+      FROM mes_maintenance_plan_version
+      WHERE tenant_id = 1 AND deleted = 0 AND plan_id = '${planId}'
+      ORDER BY version
+    `)
+    const originalVersions = await readPublishedVersions()
+    if (!originalVersions.available || originalVersions.rows.length !== 1) {
+      throw new Error('缺少正式 V1 版本表证据，不能验收版本快照不变')
+    }
     const assignmentId = fixtures.track(await api.postBusiness('/mes/maintenance-plan-assignment/create', {
       targetType: 'DEVICE',
       targetId: device.id,
@@ -1628,6 +1728,13 @@ const runAuthenticatedCase = async (
       )
     })
     await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const reconciledPublished = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+    caseRecord.checks.push({
+      name: '先发布再新增分配，同版本重复发布补齐运行计划且发布时间不漂移',
+      passed: reconciledPublished.publishedTime === firstPublished.publishedTime &&
+        Number(reconciledPublished.publishedVersion) === 1,
+      details: `plan=${planId}; assignment=${assignmentId}; version=1`
+    })
     const runtimePage = dataOf(await api.getBusiness(
       `/mes/system/plan/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(planName)}`
     ))
@@ -1703,6 +1810,87 @@ const runAuthenticatedCase = async (
           String(completedTask?.inspectionRecordId) === String(inspection.id),
         details: `task=${task.id}; record=${inspection.id}; version=${savedRecord.maintenancePlanVersion}`
       })
+      const plan = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+      await api.putBusiness('/mes/maintenance-plan/update', {
+        id: plan.id,
+        planCode: plan.planCode,
+        planName: plan.planName,
+        coreDomain: 'INSPECT',
+        items: [{
+          itemId: fixture.itemId,
+          itemVersion: plan.items?.[0]?.itemVersion,
+          seq: 1,
+          standard: 'E2E V2 目视无异常'
+        }],
+        cycles: [{ cycleType: 'TIME', cycleValue: 2, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
+      })
+      const draftV2 = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+      await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+      const runtimeV2Rows = requiredRows(dataOf(await api.getBusiness(
+        `/mes/system/plan/list?pageNo=1&pageSize=100&planName=${encodeURIComponent(planName)}`
+      )), 'V2 巡检运行计划')
+      const runtimeV2 = runtimeV2Rows.find((row) => String(row.sourcePlanId) === String(planId))
+      if (!runtimeV2?.id) throw new Error('V2 发布后未找到原运行计划')
+      const v2TaskResponse = await api.postBusiness('/mes/system/task/add', {
+        planId: runtimeV2.id,
+        inspectionPlanId: runtimeV2.id,
+        planName: runtimeV2.planName,
+        planContent: 'E2E MAINT-005 V2 方案任务',
+        projectName: runtimeV2.projectName,
+        deviceId: device.id,
+        deviceIds: [String(device.id)],
+        planDate: formatLocalDateTime(new Date(Date.now() + 86400000)).slice(0, 10),
+        maintenanceDomain: 'INSPECT',
+        inspectionStatus: '0',
+        abnormalFlag: '0'
+      })
+      const v2TaskId = dataOf(v2TaskResponse)?.id
+      if (!v2TaskId) throw new Error('V2 巡检任务创建未返回 ID')
+      trackInspectionTask(fixtures, api, v2TaskId)
+      const v2Task = dataOf(await api.getBusiness(`/mes/system/task/${v2TaskId}`))
+      const oldTaskAfterV2 = dataOf(await api.getBusiness(`/mes/system/task/${task.id}`))
+      const oldRecordAfterV2 = dataOf(await api.getBusiness(`/mes/system/record/${inspection.id}`))
+      const assignmentAfterV2 = dataOf(await api.getBusiness(
+        `/mes/maintenance-plan-assignment/get?id=${assignmentId}`))
+      const versionsAfterV2 = await readPublishedVersions()
+      caseRecord.database = [...(caseRecord.database || []),
+        { stage: 'published-v1', ...originalVersions },
+        { stage: 'published-v2', ...versionsAfterV2 }]
+      caseRecord.checks.push({
+        name: 'V2 发布新增独立版本行且 V1 版本表完整快照与发布时间不变',
+        passed: versionsAfterV2.available && versionsAfterV2.rows.length === 2 &&
+          String(versionsAfterV2.rows[1]?.[1]) === '2' &&
+          JSON.stringify(versionsAfterV2.rows[0]) === JSON.stringify(originalVersions.rows[0]),
+        details: `plan=${planId}; versions=${versionsAfterV2.rows.length}`
+      })
+      caseRecord.checks.push({
+        name: '发布 V2 后运行计划自动跟随 V2，新任务使用 V2，旧任务和记录保持 V1 快照',
+        passed: hasVersionTransitionSnapshots({
+          draft: draftV2, originalRuntime: runtimePlan, runtime: runtimeV2,
+          assignment: assignmentAfterV2, originalTask: task, task: oldTaskAfterV2,
+          record: oldRecordAfterV2, newTask: v2Task, device
+        }),
+        details: `draft=${draftV2?.currentVersion}/published=${draftV2?.publishedVersion}; ` +
+          `runtime=${runtimeV2.id}/v${runtimeV2.sourcePlanVersion}; ` +
+          `oldTask=${oldTaskAfterV2?.id}/v${oldTaskAfterV2?.sourcePlanVersion}; ` +
+          `newTask=${v2Task.id}/v${v2Task.sourcePlanVersion}`
+      })
+      const beforeRepublish = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+      await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+      const afterRepublish = dataOf(await api.getBusiness(`/mes/maintenance-plan/get?id=${planId}`))
+      const afterRepeatRuntime = dataOf(await api.getBusiness(`/mes/system/plan/${runtimeV2.id}`))
+      const versionsAfterRepeat = await readPublishedVersions()
+      caseRecord.database.push({ stage: 'repeated-v2', ...versionsAfterRepeat })
+      caseRecord.checks.push({
+        name: '同一 V2 重复发布不改写发布时间、运行配置和已生成任务',
+        passed: afterRepublish.publishedTime === beforeRepublish.publishedTime &&
+          afterRepeatRuntime.configSnapshot === runtimeV2.configSnapshot &&
+          afterRepeatRuntime.cycleRuleSnapshot === runtimeV2.cycleRuleSnapshot &&
+          versionsAfterRepeat.available &&
+          JSON.stringify(versionsAfterRepeat.rows) === JSON.stringify(versionsAfterV2.rows) &&
+          (await readTasks()).length === 2,
+        details: `plan=${planId}; version=2; tasks=2`
+      })
       await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
       const disabled = dataOf(await api.getBusiness(`/mes/system/plan/${runtimePlan.id}`))
       const tomorrow = new Date()
@@ -1710,14 +1898,15 @@ const runAuthenticatedCase = async (
       const skipped = await generate(formatLocalDateTime(tomorrow).slice(0, 10))
       caseRecord.checks.push({
         name: '停用方案同步停用运行计划且后续日期不生成任务',
-        passed: disabled?.status === '0' && skipped === 0 && (await readTasks()).length === 1 &&
+        passed: disabled?.status === '0' && skipped === 0 && (await readTasks()).length === 2 &&
           hasRecordTaskSnapshots(
             dataOf(await api.getBusiness(`/mes/system/record/${inspection.id}`)), task),
         details: `plan=${planId}; runtimeStatus=${disabled?.status}; created=${skipped}`
       })
       caseRecord.evidence.push(
         `正式方案 ${planId}/v1 → 分配 ${assignmentId} → 运行计划 ${runtimePlan.id} → ` +
-        `单计划到期生成任务 ${task.id} → 完成巡检记录 ${inspection.id}；来源及完整配置由服务端固化。`
+        `单计划到期生成任务 ${task.id} → 完成巡检记录 ${inspection.id} → 发布 V2 后生成任务 ${v2TaskId}；` +
+        'V1 历史任务/记录保持原始快照。'
       )
       const filterOwnedRecord = async () => {
         await openRoute(page, MAINT_009_INSPECTION_RECORD_ROUTE, {
@@ -1816,10 +2005,7 @@ const runAuthenticatedCase = async (
         '窄屏验证在布局切换完成后重新筛选并打开同一专属记录；跨断点保持已打开抽屉或未保存编辑状态未作为通过项。'
       )
     }
-    return {
-      token, api, partial: true,
-      note: '已补单计划到期生成、防重、正式巡检记录及停用验证；新方案版本发布与旧任务执行仍待版本分配策略确认，不宣称完整通过。'
-    }
+    return { token, api, acceptanceComplete: true }
   }
 
   if (caseId === 'MAINT-006') {
@@ -3196,6 +3382,48 @@ const runAuthenticatedCase = async (
       passed: generated.length === 1 && retriedGenerated.length === 1 &&
         String(retriedGenerated[0]?.id) === String(generated[0]?.id),
       details: `first=${generated.length}, retry=${retriedGenerated.length}`
+    })
+    if (generated.length !== 1) throw new Error('REPAIR V1 未生成唯一工单，无法验证版本升级')
+    const originalOrder = dataOf(await api.getBusiness(`/mes/system/order/${generated[0].id}`))
+    await api.putBusiness('/mes/maintenance-plan/update', {
+      id: planId, planCode: publishedPlan.planCode, planName: publishedPlan.planName,
+      coreDomain: 'REPAIR',
+      items: [{ itemId: fixture.itemId, seq: 1, standard: 'E2E REPAIR V2 标准' }],
+      cycles: [{ cycleType: 'TIME', cycleValue: 2, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
+    })
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const v2Rows = requiredRows(await api.getBusiness(
+      '/mes/system/order/list?pageNo=1&pageSize=100'
+    ), 'REPAIR V2 工单').filter((row) =>
+      String(row.projectName) === String(publishedPlan.planName) && String(row.deviceId) === String(device.id))
+    const v2Orders = v2Rows.filter((row) => String(row.id) !== String(originalOrder.id))
+    for (const row of v2Orders) trackRepairOrder(fixtures, api, row.id, caseRecord)
+    const oldOrderAfter = dataOf(await api.getBusiness(`/mes/system/order/${originalOrder.id}`))
+    const newOrder = v2Orders.length === 1
+      ? dataOf(await api.getBusiness(`/mes/system/order/${v2Orders[0].id}`)) : null
+    const assignmentAfter = dataOf(await api.getBusiness(
+      `/mes/maintenance-plan-assignment/get?id=${assignmentId}`))
+    caseRecord.checks.push({
+      name: 'REPAIR 发布 V2 新增唯一 V2 工单且 V1 工单来源与周期快照不回溯',
+      passed: v2Rows.length === 2 && v2Orders.length === 1 &&
+        Number(newOrder?.sourcePlanVersion) === 2 && Number(oldOrderAfter.sourcePlanVersion) === 1 &&
+        String(newOrder?.sourceAssignmentId) === String(assignmentId) &&
+        newOrder?.idempotentKey === `MP:${planId}:2:${assignmentId}:${device.id}` &&
+        ['sourcePlanId', 'sourcePlanVersion', 'sourceAssignmentId', 'cycleRuleSnapshot', 'idempotentKey']
+          .every((field) => oldOrderAfter[field] === originalOrder[field]) &&
+        Number(assignmentAfter?.planVersion) === 2,
+      details: `old=${originalOrder.id}/v${oldOrderAfter.sourcePlanVersion}; new=${newOrder?.id}/v${newOrder?.sourcePlanVersion}`
+    })
+    await api.putBusiness(`/mes/maintenance-plan/publish?id=${planId}`)
+    const afterV2Retry = requiredRows(await api.getBusiness(
+      '/mes/system/order/list?pageNo=1&pageSize=100'
+    ), 'REPAIR V2 重复发布').filter((row) =>
+      String(row.projectName) === String(publishedPlan.planName) && String(row.deviceId) === String(device.id))
+    caseRecord.checks.push({
+      name: 'REPAIR V2 重复发布仍只有 V1、V2 各一张工单',
+      passed: afterV2Retry.length === 2 &&
+        afterV2Retry.every((row) => v2Rows.some((existing) => String(existing.id) === String(row.id))),
+      details: `orders=${afterV2Retry.length}`
     })
     // 反向：停用方案，避免遗留已发布状态
     await api.putBusiness(`/mes/maintenance-plan/disable?id=${planId}`)
