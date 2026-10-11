@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   dataOf,
   hasFormalMetricEvidence,
+  hasExactDeviceStatusMapping,
   MAINT_008_REPAIR_ORDER_ROUTE,
   MAINT_009_INSPECTION_RECORD_ROUTE,
   MAINT_011_DEVICE_STATUS_ROUTE
@@ -35,4 +36,18 @@ test('MAINT-011 does not treat empty status and repair facts as complete evidenc
     }),
     true
   )
+})
+
+test('IOT-006 requires exact mapping identity, layer, core state, subtype and enabled status', () => {
+  const expected = {
+    id: '9007199254740993', coreLayer: 'RUNTIME', coreState: 'RUNNING',
+    subStateCode: 'E2E-RUN', subStateName: '正常运行', status: 0
+  }
+  assert.equal(hasExactDeviceStatusMapping({ ...expected }, expected), true)
+  assert.equal(hasExactDeviceStatusMapping(null, expected), false)
+  for (const field of Object.keys(expected)) {
+    assert.equal(hasExactDeviceStatusMapping({ ...expected, [field]: null }, expected), false, field)
+  }
+  assert.equal(hasExactDeviceStatusMapping({ ...expected, coreLayer: 'ASSET' }, expected), false)
+  assert.equal(hasExactDeviceStatusMapping({ ...expected, status: '0' }, expected), false)
 })

@@ -209,7 +209,7 @@ async function closeBrowserHandle (handle, tracePath, label = 'browser') {
   await closeWithTimeout(
     handle.flushResponses().catch(() => {}),
     `${label} response flush`,
-    5000
+    15000
   )
   await closeWithTimeout(
     handle.context.tracing.stop({ path: tracePath }).catch(() => {}),
@@ -412,7 +412,7 @@ async function main () {
           await closeWithTimeout(
             browserHandle.flushResponses(),
             'response flush',
-            5000
+            15000
           )
           const hasAssertions = caseRecord.checks.length + check.steps.length > 0
           const runtimeErrors = caseRuntimeErrors(record, errorsBefore)
@@ -439,7 +439,7 @@ async function main () {
             await closeWithTimeout(
               browserHandle.flushResponses().catch(() => {}),
               'response flush after failure',
-              5000
+              15000
             )
           }
           caseRecord.runtimeErrors = caseRuntimeErrors(record, errorsBefore)

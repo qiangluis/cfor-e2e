@@ -93,16 +93,16 @@ export const hasExactMaintenanceReadPermissions = (actual, expected, permission)
     !/(?::|^)(?:create|update|delete|publish|disable|generate|approve|execute)(?::|$)/i.test(value)) &&
   JSON.stringify(actual.filter(Boolean).sort()) === JSON.stringify([...expected].sort())
 
+export const hasExactDeviceStatusMapping = (actual, expected) =>
+  Boolean(actual) && String(actual.id) === String(expected.id) &&
+  ['coreLayer', 'coreState', 'subStateCode', 'subStateName', 'status'].every((field) =>
+    actual[field] === expected[field])
+
 const verifyDueGenerationPermission = async (api, fixtures, caseRecord, runtimePlanId, planDate, restrictedWriter = false) => {
   const permission = restrictedWriter ? 'mes:maintenance-plan:update' : 'mes:maintenance-plan:query'
   const reader = await createProcurementPermissionReader(api, caseRecord, {
     permission, label: restrictedWriter ? 'M5SCOPE' : 'M5'
   })
-  if (restrictedWriter) {
-    requireTrueResult(await api.postBusiness('/system/permission/assign-role-data-scope', {
-      roleId: reader.roleId, dataScope: 2, dataScopeDeptIds: []
-    }), '生成权限专属角色设置空自定义部门范围')
-  }
   fixtures.track(reader.roleId, '到期生成权限专属角色', async (id) => {
     requireTrueResult(await api.deleteBusiness(`/system/role/delete?id=${id}`), '生成权限角色清理')
   })
@@ -118,15 +118,22 @@ const verifyDueGenerationPermission = async (api, fixtures, caseRecord, runtimeP
     }
     return { retained: true, reason: '账号已停用解绑，保留操作审计主体' }
   })
+  if (restrictedWriter) {
+    requireTrueResult(await api.postBusiness('/system/permission/assign-role-data-scope', {
+      roleId: reader.roleId, dataScope: 2, dataScopeDeptIds: []
+    }), '生成权限专属角色设置空自定义部门范围')
+  }
   // Login through the official encrypted transport; never put credentials or tokens in evidence.
   const anonymous = createApiClient()
   const session = assertBusinessSuccess(await anonymous.request('POST', '/system/auth/login-encrypted', {
     username: reader.username, password: reader.credentials.password,
     captchaVerification: '', rememberMe: false
   }, { encrypted: true }), '生成权限专属账号登录').data
-  if (!session?.accessToken || String(session.userId) !== String(reader.userId) ||
-      String(session.tenantId) !== '1') throw new Error('生成权限登录主体或租户不一致')
+  if (!session?.accessToken) throw new Error('生成权限登录未返回会话')
   const readonly = createApiClient({ token: session.accessToken, tenantId: '1' })
+  trackMaintenanceProbeSession(fixtures, readonly, reader.userId)
+  if (String(session.userId) !== String(reader.userId) ||
+      String(session.tenantId) !== '1') throw new Error('生成权限登录主体或租户不一致')
   const role = dataOf(await api.getBusiness(`/system/role/get?id=${reader.roleId}`))
   const ownedAccount = caseRecord.accounts.find((account) =>
     String(account.userId) === String(reader.userId))
@@ -645,6 +652,81 @@ export const trackDeletable = (fixtures, api, response, path, label) =>
     )
   })
 
+export const trackMaintenanceProbeSession = (fixtures, api, userId) =>
+  fixtures.track(userId, '到期生成权限专属会话', async () => {
+    requireTrueResult(await api.postBusiness('/system/auth/logout'), '生成权限会话退出')
+    const expected = { code: 401, message: /^账号未登录$/, allowServiceCode: true }
+    const result = await api.request('GET', '/system/auth/get-permission-info', undefined, {
+      expectedBusinessRejection: expected
+    })
+    if (!matchesExpectedBusinessRejection(result, expected)) {
+      throw new Error('生成权限会话退出后仍可认证')
+    }
+  })
+
+const maintenanceTaskTotal = (page) => {
+  const total = page?.total
+  if (!(typeof total === 'number' || (typeof total === 'string' && /^\d+$/.test(total))) ||
+      !Number.isSafeInteger(Number(total)) || Number(total) < 0) {
+    throw new Error('残余任务总数无效，拒绝删除')
+  }
+  return Number(total)
+}
+
+export const trackGeneratedTaskCleanup = (fixtures, api, runtimePlanId) =>
+  fixtures.track(runtimePlanId, '专属运行计划残余任务', async (id) => {
+    const path = (pageNo) => `/mes/system/task/list?pageNo=${pageNo}&pageSize=100&planId=${id}`
+    const first = dataOf(await api.getBusiness(path(1)))
+    const tasks = [...requiredRows(first, '专属运行计划残余任务')]
+    const total = maintenanceTaskTotal(first)
+    if (total < tasks.length) {
+      throw new Error('残余任务总数无效，拒绝删除')
+    }
+    for (let pageNo = 2; tasks.length < total; pageNo += 1) {
+      const next = dataOf(await api.getBusiness(path(pageNo)))
+      const rows = requiredRows(next, '专属运行计划残余任务分页')
+      if (maintenanceTaskTotal(next) !== total || rows.length === 0 || tasks.length + rows.length > total) {
+        throw new Error('残余任务分页发生变化，拒绝删除')
+      }
+      tasks.push(...rows)
+    }
+    if (tasks.some((task) => String(task.planId) !== String(id))) {
+      throw new Error('残余任务清理发现其他计划任务，拒绝删除')
+    }
+    const taskIds = tasks.map((task) => fixtureId(task.id, '残余任务'))
+    if (new Set(taskIds.map(String)).size !== total) {
+      throw new Error('残余任务分页数量或 ID 不一致，拒绝删除')
+    }
+    const errors = []
+    for (const taskId of taskIds) {
+      try {
+        assertBusinessSuccess(await api.deleteBusiness(`/mes/system/task/${encodeURIComponent(taskId)}`),
+          '专属运行计划残余任务清理')
+      } catch (error) {
+        errors.push(new Error(`残余任务 id=${taskId} 删除失败`, { cause: error }))
+      }
+    }
+    const after = dataOf(await api.getBusiness(path(1)))
+    const remaining = requiredRows(after, '专属运行计划清理回读')
+    if (remaining.length !== 0 || maintenanceTaskTotal(after) !== 0) {
+      errors.push(new Error(`专属运行计划清理后仍有任务 total=${after.total}, ids=${remaining.map((task) => task.id).join(',')}`))
+    }
+    if (errors.length) throw new AggregateError(errors, errors.map((error) => error.message).join('; '))
+  })
+
+export const trackInspectionRuntimePlan = (fixtures, api, runtimePlanId) =>
+  fixtures.track(runtimePlanId, '巡检运行计划', async (id) => {
+    const remaining = dataOf(await api.getBusiness(
+      `/mes/system/task/list?pageNo=1&pageSize=100&planId=${id}`
+    ))
+    const rows = requiredRows(remaining, '运行计划删除前任务回读')
+    if (rows.length !== 0 || maintenanceTaskTotal(remaining) !== 0) {
+      throw new Error(`保留运行计划，仍有任务 total=${remaining.total}, ids=${rows.map((task) => task.id).join(',')}`)
+    }
+    assertBusinessSuccess(await api.deleteBusiness(`/mes/system/plan/${encodeURIComponent(id)}`),
+      '巡检运行计划清理')
+  })
+
 const trackRuleFixture = (fixtures, api, response, caseRecord) =>
   fixtures.track(response, '维保类型规则', async (id) => {
     requireTrueResult(
@@ -1029,35 +1111,57 @@ const runAuthenticatedCase = async (
 
   if (caseId === 'IOT-006') {
     const suffix = unique('DSM')
-    const created = trackDeletable(fixtures, api, await api.postBusiness('/mes/device-status-mapping/create', {
+    const body = {
       coreLayer: 'RUNTIME',
       coreState: 'RUNNING',
       subStateCode: suffix,
       subStateName: '正常运行',
       status: 0
-    }), '/mes/device-status-mapping', '设备状态映射')
-    caseRecord.checks.push({
-      name: '运行状态子状态映射到固定核心状态 RUNNING',
-      passed: Boolean(created),
-      details: `id=${created}`
-    })
-    let invalidRejected = false
-    try {
-      await api.postBusiness('/mes/device-status-mapping/create', {
-        coreLayer: 'RUNTIME',
-        coreState: 'NOT_A_CORE_STATE',
-        subStateCode: unique('BAD'),
-        subStateName: '非法映射',
-        status: 0
+    }
+    const created = fixtures.track(await api.postBusiness('/mes/device-status-mapping/create', body),
+      '设备状态映射', async (id) => {
+        requireTrueResult(await api.deleteBusiness(`/mes/device-status-mapping/delete?id=${id}`), '状态映射清理')
+        const after = dataOf(await api.getBusiness(
+          `/mes/device-status-mapping/page?pageNo=1&pageSize=100&coreLayer=RUNTIME&subStateCode=${encodeURIComponent(suffix)}`
+        ))
+        if (requiredRows(after, '状态映射清理回读').length !== 0 || Number(after.total) !== 0) {
+          throw new Error('状态映射删除后仍可回读')
+        }
       })
-    } catch (error) {
-      invalidRejected = true
-      caseRecord.notes.push(`非法核心状态被拒绝：${error.message}`)
+    const saved = dataOf(await api.getBusiness(`/mes/device-status-mapping/get?id=${created}`))
+    caseRecord.checks.push({
+      name: '运行状态子状态映射到固定核心状态 RUNNING 且完整字段精确回读',
+      passed: hasExactDeviceStatusMapping(saved, { ...body, id: created }),
+      details: `id=${created}; layer=${saved?.coreLayer}; state=${saved?.coreState}; code=${saved?.subStateCode}`
+    })
+    const invalidCode = unique('BAD')
+    const expected = {
+      code: 400,
+      message: /^核心状态编码 NOT_A_CORE_STATE 不属于 RUNTIME 层，企业子状态必须映射平台固定核心状态$/,
+      allowServiceCode: true
+    }
+    const invalid = await api.request('POST', '/mes/device-status-mapping/create', {
+      coreLayer: 'RUNTIME',
+      coreState: 'NOT_A_CORE_STATE',
+      subStateCode: invalidCode,
+      subStateName: '非法映射',
+      status: 0
+    }, { expectedBusinessRejection: expected })
+    const invalidPage = dataOf(await api.getBusiness(
+      `/mes/device-status-mapping/page?pageNo=1&pageSize=100&coreLayer=RUNTIME&subStateCode=${encodeURIComponent(invalidCode)}`
+    ))
+    const invalidRows = requiredRows(invalidPage, '非法状态映射查询')
+    for (const row of invalidRows) {
+      if (row.coreLayer !== 'RUNTIME' || row.subStateCode !== invalidCode) {
+        throw new Error('非法状态映射查询返回非专属夹具')
+      }
+      trackDeletable(fixtures, api, row.id, '/mes/device-status-mapping', '异常写入的专属映射')
     }
     caseRecord.checks.push({
       name: '非平台固定核心状态被拒绝',
-      passed: invalidRejected,
-      details: '字典页不能自定义核心运行状态'
+      passed: matchesExpectedBusinessRejection(invalid, expected) &&
+        invalidRows.length === 0 && Number(invalidPage.total) === 0,
+      details: `code=${invalid?.code}; persisted=${invalidPage.total}`
     })
 
     const layeredDeviceId = await isolatedDeviceId(api, ['RUNTIME', 'ASSET', 'CONNECTION'])
@@ -1118,7 +1222,10 @@ const runAuthenticatedCase = async (
       details: '设置 - 设备与 IoT 下的统一维保设置页'
     })
     await saveScreenshot(page, outputDir, 'iot-006-device-maintenance-settings', record)
-    return { token, api }
+    return {
+      token, api, partial: true,
+      note: '映射字段、非法核心状态精确拒绝和手动三层事件隔离已验证；真实 IoT 心跳、生产报工及资产来源联动仍待跨模块闭环。'
+    }
   }
 
   if (caseId === 'MAINT-001') {
@@ -1211,30 +1318,101 @@ const runAuthenticatedCase = async (
   }
 
   if (caseId === 'MAINT-002') {
-    const tree = dataOf(await api.getBusiness('/mes/maintenance-item/tree'))
-    const roots = (tree || []).map((node) => node.categoryRoot)
+    const tree = requiredRows(await api.getBusiness('/mes/maintenance-item/tree'), '维保项目根分类')
+    const rootNodes = tree.filter((node) => node.systemRoot === true)
+    const roots = rootNodes.map((node) => node.categoryRoot)
     caseRecord.checks.push({
       name: '三类固定根分类自动就绪',
-      passed: ['REPAIR', 'UPKEEP', 'INSPECT'].every((root) => roots.includes(root)),
+      passed: roots.length === 3 && ['REPAIR', 'UPKEEP', 'INSPECT'].every((root) =>
+        rootNodes.filter((node) => node.categoryRoot === root).length === 1),
       details: `roots=${roots.join(',')}`
     })
-    const rootId = (tree || []).find((node) => node.categoryRoot === 'INSPECT')?.id
+    for (const root of rootNodes) {
+      const path = `/mes/maintenance-item/get?id=${root.id}`
+      const before = dataOf(await api.getBusiness(path))
+      const expected = {
+        code: 400, message: /^维修、保养、巡检为不可删除根分类$/, allowServiceCode: true
+      }
+      const rejected = await api.request('DELETE', `/mes/maintenance-item/delete?id=${root.id}`,
+        undefined, { expectedBusinessRejection: expected })
+      const after = dataOf(await api.getBusiness(path))
+      caseRecord.checks.push({
+        name: `${root.categoryRoot} 系统根分类删除精确拒绝且原始事实不变`,
+        passed: matchesExpectedBusinessRejection(rejected, expected) &&
+          JSON.stringify(before) === JSON.stringify(after) &&
+          after?.systemRoot === true && after?.categoryRoot === root.categoryRoot,
+        details: `root=${root.id}; code=${rejected?.code}`
+      })
+    }
+    const rootId = rootNodes.find((node) => node.categoryRoot === 'INSPECT')?.id
+    if (!rootId) throw new Error('缺少唯一巡检根分类')
     const suffix = unique('MI')
-    const created = trackDeletable(fixtures, api, await api.postBusiness('/mes/maintenance-item/create', {
+    const body = {
       parentId: rootId,
       categoryRoot: 'INSPECT',
       nodeType: 'ITEM',
       itemCode: suffix,
-      itemName: '巡检项目',
+      itemName: `E2E 巡检项目-${suffix}`,
       resultType: 'BOOLEAN',
+      execRequirement: 'E2E 检查仪表、记录读数并确认无泄漏',
+      standardHours: 0.75,
+      attachmentRequired: true,
+      abnormalAction: 'REPAIR_ORDER',
       status: 0
-    }), '/mes/maintenance-item', '维保项目')
+    }
+    const created = fixtures.track(
+      await api.postBusiness('/mes/maintenance-item/create', body), '维保项目', async (id) => {
+        requireTrueResult(await api.deleteBusiness(`/mes/maintenance-item/delete?id=${id}`), '维保项目清理')
+        const expected = { code: 400, message: /^维保项目不存在$/, allowServiceCode: true }
+        const after = await api.request('GET', `/mes/maintenance-item/get?id=${id}`, undefined, {
+          expectedBusinessRejection: expected
+        })
+        if (!matchesExpectedBusinessRejection(after, expected)) throw new Error('维保项目删除后仍可回读')
+      })
+    const saved = dataOf(await api.getBusiness(`/mes/maintenance-item/get?id=${created}`))
     caseRecord.checks.push({
-      name: '可在固定根分类下创建项目',
-      passed: Boolean(created),
-      details: `id=${created}`
+      name: '可在固定根分类下创建项目且完整标准字段精确回读',
+      passed: String(saved?.id) === String(created) && saved?.systemRoot === false &&
+        saved?.version === 1 && saved?.publishStatus === 0 &&
+        Object.entries(body).every(([field, value]) => field === 'parentId'
+          ? String(saved[field]) === String(value) : saved[field] === value),
+      details: `id=${created}; code=${saved?.itemCode}; version=${saved?.version}`
     })
-    return { token, api }
+    await openRoute(page, '/settings/iot/device-maintenance', { readyText: '维保项目' })
+    await page.locator('.el-tabs__item').filter({ hasText: '维保项目' }).first().click()
+    const ownedNode = page.locator('.el-tree-node__content').filter({ hasText: body.itemName }).first()
+    await ownedNode.waitFor({ state: 'visible' })
+    await ownedNode.scrollIntoViewIfNeeded()
+    caseRecord.checks.push({
+      name: '维保项目树真实显示本轮专属项目及结果类型',
+      passed: (await ownedNode.innerText()).includes(body.itemName) &&
+        (await ownedNode.innerText()).includes('是否'),
+      details: body.itemName
+    })
+    await saveScreenshot(page, outputDir, 'maint-002-root-and-master', record)
+    await ownedNode.getByRole('button', { name: '编辑', exact: true }).click()
+    const dialog = page.getByRole('dialog').filter({ hasText: '编辑维保节点' })
+    await dialog.waitFor({ state: 'visible' })
+    const field = (label) => dialog.locator('.el-form-item').filter({
+      has: page.locator('.el-form-item__label').filter({ hasText: label })
+    })
+    caseRecord.checks.push({
+      name: '项目编辑弹窗展示完整稳定编码、标准工时、附件要求与异常动作',
+      passed: await field('项目编码').locator('input').inputValue() === body.itemCode &&
+        await field('名称').locator('input').inputValue() === body.itemName &&
+        await field('执行要求').locator('textarea').inputValue() === body.execRequirement &&
+        Number(await field('标准工时').locator('input').inputValue()) === body.standardHours &&
+        await field('需要附件').getByRole('switch').getAttribute('aria-checked') === 'true' &&
+        (await field('结果类型').innerText()).includes('是否') &&
+        (await field('异常动作').innerText()).includes('生成维修工单'),
+      details: `item=${created}; readOnlyPreview=true`
+    })
+    await saveScreenshot(page, outputDir, 'maint-002-master-fields', record)
+    await dialog.getByRole('button', { name: /取\s*消/ }).click()
+    return {
+      token, api, partial: true,
+      note: '三个系统根分类删除拒绝及完整项目标准回读已验证；项目发布入口与标准新版本治理尚未闭环。'
+    }
   }
 
   if (caseId === 'MAINT-003') {
@@ -1281,6 +1459,10 @@ const runAuthenticatedCase = async (
           await api.deleteBusiness(`/mes/maintenance-plan-assignment/delete?id=${assignmentId}`),
           `${label}清理`
         )
+        const expected = { code: 400, message: /^维保方案分配不存在$/, allowServiceCode: true }
+        const after = await api.request('GET', `/mes/maintenance-plan-assignment/get?id=${assignmentId}`,
+          undefined, { expectedBusinessRejection: expected })
+        if (!matchesExpectedBusinessRejection(after, expected)) throw new Error(`${label}删除后仍可回读`)
       })
       return id
     }
@@ -1290,7 +1472,7 @@ const runAuthenticatedCase = async (
       targetKey: deviceTypeKey,
       planId,
       planVersion: 1,
-      priority: 1,
+      priority: 300,
       status: 0
     }, '设备类型方案分配')
     const deviceAssignment = await trackAssignment({
@@ -1298,7 +1480,7 @@ const runAuthenticatedCase = async (
       targetId: device.id,
       planId,
       planVersion: 1,
-      priority: 30,
+      priority: 1,
       status: 0
     }, '单设备方案分配')
     const productAssignment = await trackAssignment({
@@ -1315,6 +1497,7 @@ const runAuthenticatedCase = async (
     caseRecord.checks.push({
       name: '单设备分配优先于产品型号和设备类型',
       passed: String(hit?.id) === String(deviceAssignment) &&
+        hit?.priority === 1 &&
         String(deviceAssignment) !== String(productAssignment) &&
         String(productAssignment) !== String(typeAssignment),
       details: `hit=${hit?.id} device=${deviceAssignment} product=${productAssignment} type=${typeAssignment}`
@@ -1325,7 +1508,7 @@ const runAuthenticatedCase = async (
       targetId: device.id,
       planId,
       planVersion: 1,
-      priority: 30,
+      priority: 1,
       status: 1
     })
     const productHit = dataOf(await api.getBusiness(
@@ -1357,7 +1540,68 @@ const runAuthenticatedCase = async (
       `专属产品 ${product.id}、设备 ${device.id} 与三个启用分配 ${deviceAssignment}/${productAssignment}/${typeAssignment} ` +
         '依次验证 DEVICE、PRODUCT、DEVICE_TYPE 回退'
     )
-    return { token, api }
+    const now = new Date()
+    const atOffset = (days) => {
+      const value = new Date(now)
+      value.setDate(value.getDate() + days)
+      return formatLocalDateTime(value).replace(' ', 'T')
+    }
+    const sameLevelBody = {
+      targetType: 'DEVICE', targetId: device.id, planId, planVersion: 1, status: 0
+    }
+    // Creation order conflicts with effective time, and the lowest priority starts last.
+    const activeLatest = await trackAssignment({
+      ...sameLevelBody, priority: 50, effectiveStart: atOffset(-2), effectiveEnd: atOffset(2)
+    }, '同级较晚生效分配')
+    const activeHigh = await trackAssignment({
+      ...sameLevelBody, priority: 50, effectiveStart: atOffset(-3), effectiveEnd: atOffset(3)
+    }, '同级较高优先级分配')
+    const activeLow = await trackAssignment({
+      ...sameLevelBody, priority: 5, effectiveStart: atOffset(-1), effectiveEnd: atOffset(4)
+    }, '同级较低优先级分配')
+    await trackAssignment({
+      ...sameLevelBody, priority: 999, effectiveStart: atOffset(2), effectiveEnd: atOffset(3)
+    }, '未生效高优先级分配')
+    await trackAssignment({
+      ...sameLevelBody, priority: 999, effectiveStart: atOffset(-3), effectiveEnd: atOffset(-2)
+    }, '已过期高优先级分配')
+    const resolve = async () => dataOf(await api.getBusiness(
+      `/mes/maintenance-plan-assignment/resolve?deviceId=${device.id}&productId=${device.productId}&deviceType=${deviceTypeKey}`
+    ))
+    const latestHit = await resolve()
+    await api.putBusiness('/mes/maintenance-plan-assignment/update', {
+      ...sameLevelBody, id: activeLatest, priority: 50, status: 1,
+      effectiveStart: atOffset(-2), effectiveEnd: atOffset(2)
+    })
+    const highHit = await resolve()
+    await api.putBusiness('/mes/maintenance-plan-assignment/update', {
+      ...sameLevelBody, id: activeHigh, priority: 50, status: 1,
+      effectiveStart: atOffset(-3), effectiveEnd: atOffset(3)
+    })
+    const lowHit = await resolve()
+    caseRecord.checks.push({
+      name: '同层先排除未来与过期分配，再按显式优先级及较晚生效时间命中',
+      passed: String(latestHit?.id) === String(activeLatest) &&
+        String(highHit?.id) === String(activeHigh) && String(lowHit?.id) === String(activeLow),
+      details: `latest=${latestHit?.id}; high=${highHit?.id}; low=${lowHit?.id}`
+    })
+    await api.putBusiness('/mes/maintenance-plan-assignment/update', {
+      ...sameLevelBody, id: activeLow, priority: 5, status: 1,
+      effectiveStart: atOffset(-1), effectiveEnd: atOffset(4)
+    })
+    await api.putBusiness('/mes/maintenance-plan-assignment/update', {
+      id: typeAssignment, targetType: 'DEVICE_TYPE', targetKey: deviceTypeKey,
+      planId, planVersion: 1, priority: 300, status: 1
+    })
+    caseRecord.checks.push({
+      name: '全部有效分配停用后明确无命中，不误用未来或过期分配',
+      passed: (await resolve()) === null,
+      details: `device=${device.id}`
+    })
+    return {
+      token, api, partial: true,
+      note: '层级与数值优先级冲突、同层有效期/优先级及无命中已验证；发布生成器未使用统一命中解析，实际任务分配快照闭环仍缺失。'
+    }
   }
 
   if (caseId === 'MAINT-005') {
@@ -1399,13 +1643,12 @@ const runAuthenticatedCase = async (
       details: `runtimePlan=${runtimePlan?.id}, assignment=${assignmentId}, version=${runtimePlan?.sourcePlanVersion}`
     })
     if (runtimePlan?.id) {
-      fixtures.track(runtimePlan.id, '巡检运行计划', async (id) => {
-        await api.deleteBusiness(`/mes/system/plan/${id}`)
-      })
+      trackInspectionRuntimePlan(fixtures, api, runtimePlan.id)
       const planDate = formatLocalDateTime(new Date()).slice(0, 10)
       const taskPath = `/mes/system/task/list?pageNo=1&pageSize=100&planId=${runtimePlan.id}`
       const readTasks = async () => requiredRows(await api.getBusiness(taskPath), '巡检到期任务')
       if ((await readTasks()).length !== 0) throw new Error('本轮新运行计划已存在任务，拒绝复用未知数据')
+      trackGeneratedTaskCleanup(fixtures, api, runtimePlan.id)
       const generate = async (date) => dataOf(await api.postBusiness('/mes/system/task/generate', {
         planId: runtimePlan.id, planDate: date
       }))
@@ -1476,32 +1719,39 @@ const runAuthenticatedCase = async (
         `正式方案 ${planId}/v1 → 分配 ${assignmentId} → 运行计划 ${runtimePlan.id} → ` +
         `单计划到期生成任务 ${task.id} → 完成巡检记录 ${inspection.id}；来源及完整配置由服务端固化。`
       )
-      await openRoute(page, MAINT_009_INSPECTION_RECORD_ROUTE, {
-        readySelector: 'input[placeholder="请输入计划名称"]', readyText: '巡检记录中心'
-      })
-      await page.getByPlaceholder('请输入计划名称', { exact: true }).fill(planName)
-      const loaded = page.waitForResponse((response) => {
-        const url = new URL(response.url())
-        return url.pathname.endsWith('/mes/system/record/list') &&
-          url.searchParams.get('planName') === planName
-      })
-      await page.getByRole('button', { name: '查询', exact: true }).click()
-      await loaded
-      const recordRow = page.locator('.vxe-body--row').filter({ hasText: planName }).first()
-      await recordRow.waitFor({ state: 'visible' })
+      const filterOwnedRecord = async () => {
+        await openRoute(page, MAINT_009_INSPECTION_RECORD_ROUTE, {
+          readySelector: 'input[placeholder="请输入计划名称"]', readyText: '巡检记录中心'
+        })
+        await page.getByPlaceholder('请输入计划名称', { exact: true }).fill(planName)
+        const loaded = page.waitForResponse((response) => {
+          const url = new URL(response.url())
+          return url.pathname.endsWith('/mes/system/record/list') &&
+            url.searchParams.get('planName') === planName
+        })
+        await page.getByRole('button', { name: '查询', exact: true }).click()
+        await loaded
+        const row = page.locator('.vxe-body--row').filter({ hasText: planName }).first()
+        await row.waitFor({ state: 'visible' })
+        return row
+      }
+      const openOwnedDetail = async (row) => {
+        // VXE keeps fixed action cells in a sibling table; bind them by the same row ID.
+        const rowKey = await row.getAttribute('rowid')
+        if (!rowKey || !/^[a-zA-Z0-9_-]+$/.test(rowKey)) throw new Error('巡检记录表格缺少稳定行标识')
+        const actionRow = page.locator(
+          `.vxe-table--fixed-right-wrapper .vxe-body--row[rowid="${rowKey}"]`
+        )
+        await actionRow.getByRole('button', { name: '详情', exact: true }).click()
+      }
+      const recordRow = await filterOwnedRecord()
       caseRecord.checks.push({
         name: '巡检记录页面按专属计划筛选并实际展示本轮执行记录',
         passed: (await recordRow.innerText()).includes('E2E MAINT-005 按正式计划完成巡检'),
         details: `record=${inspection.id}; plan=${planName}`
       })
       await saveScreenshot(page, outputDir, 'maint-005-due-task-record', record)
-      // VXE keeps fixed action cells in a sibling table; bind them by the same row ID.
-      const rowKey = await recordRow.getAttribute('rowid')
-      if (!rowKey || !/^[a-zA-Z0-9_-]+$/.test(rowKey)) throw new Error('巡检记录表格缺少稳定行标识')
-      const actionRow = page.locator(
-        `.vxe-table--fixed-right-wrapper .vxe-body--row[rowid="${rowKey}"]`
-      )
-      await actionRow.getByRole('button', { name: '详情', exact: true }).click()
+      await openOwnedDetail(recordRow)
       const drawer = page.locator('.el-drawer').filter({ hasText: planName }).last()
       await drawer.waitFor({ state: 'visible' })
       caseRecord.checks.push({
@@ -1524,7 +1774,47 @@ const runAuthenticatedCase = async (
         details: `device=${device.id}; planDate=${planDate}; status=1`
       })
       await saveScreenshot(page, outputDir, 'maint-005-due-record-detail', record)
-      await drawer.getByRole('button', { name: /取\s*消/ }).click()
+      const dateFits = () => drawer.locator('.hero-metric--indigo .hero-metric__value')
+        .evaluate((element, date) => {
+          const text = element.firstChild
+          const index = text?.textContent?.indexOf(date) ?? -1
+          if (text?.nodeType !== Node.TEXT_NODE || index < 0) return false
+          const range = document.createRange()
+          range.setStart(text, index)
+          range.setEnd(text, index + date.length)
+          return range.getClientRects().length === 1 &&
+            element.scrollWidth <= element.clientWidth + 1
+        }, planDate)
+      caseRecord.checks.push({
+        name: '桌面详情计划日期完整成行，不以任意断词隐藏日期拥挤',
+        passed: await dateFits(),
+        details: planDate
+      })
+      const viewport = page.viewportSize()
+      try {
+        await drawer.getByRole('button', { name: /取\s*消/ }).click()
+        await page.setViewportSize({ width: 390, height: 844 })
+        // Crossing 768px switches the app layout and remounts the page.
+        await openOwnedDetail(await filterOwnedRecord())
+        await drawer.waitFor({ state: 'visible' })
+        await drawer.locator('.hero-metric--indigo .hero-metric__value').scrollIntoViewIfNeeded()
+        caseRecord.checks.push({
+          name: '390px 窄屏详情抽屉不越界且计划日期完整成行',
+          passed: await dateFits() && await drawer.evaluate((element) => {
+            const bounds = element.getBoundingClientRect()
+            return bounds.left >= -1 && bounds.right <= window.innerWidth + 1 &&
+              bounds.width <= window.innerWidth + 1
+          }),
+          details: 'viewport=390x844'
+        })
+        await saveScreenshot(page, outputDir, 'maint-005-due-record-detail-mobile', record)
+        await drawer.getByRole('button', { name: /取\s*消/ }).click()
+      } finally {
+        if (viewport) await page.setViewportSize(viewport)
+      }
+      caseRecord.evidence.push(
+        '窄屏验证在布局切换完成后重新筛选并打开同一专属记录；跨断点保持已打开抽屉或未保存编辑状态未作为通过项。'
+      )
     }
     return {
       token, api, partial: true,
