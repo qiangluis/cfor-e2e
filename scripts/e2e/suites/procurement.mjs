@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { createPendingRequestBrowserFixture, generatePendingRequestInBrowser, verifyGeneratedRequestList } from '../fixtures/procurement-pending-browser.mjs'
 import { randomBytes } from 'node:crypto'
 import { createApiClient } from '../lib/api.mjs'
 import { launchBrowser, login, loginWithCredentials, openRoute, saveScreenshot } from '../lib/browser.mjs'
@@ -19,6 +22,48 @@ import {
   cases as procurementFoundationReadonlyCases,
   runProcurementFoundationReadonlyContract
 } from './procurement-foundation-readonly.mjs'
+
+export function procurementCatalogEvidence (caseId, caseRecord, evidence = {}) {
+  // Unit tests may load this module through a data: URL, where import.meta.url
+  // cannot resolve repository files. Prefer the real module URL, then the
+  // conventional cfor-e2e working-directory path.
+  let moduleCatalog
+  try {
+    moduleCatalog = new URL('../cases/catalog.json', import.meta.url)
+  } catch {
+    moduleCatalog = null
+  }
+  const catalogUrl = moduleCatalog?.protocol === 'file:'
+    ? moduleCatalog
+    : path.resolve(process.cwd(), 'scripts/e2e/cases/catalog.json')
+  const catalog = JSON.parse(fs.readFileSync(catalogUrl, 'utf8'))
+  const definition = catalog.suites.flatMap((suite) => suite.cases).find((item) => item.id === caseId)
+  if (!definition) throw new Error(`缺少原 catalog 案例 ${caseId}`)
+  caseRecord.catalogAssertions = (definition.assertions || []).map((assertion, index) => {
+    const item = evidence[index] || {}
+    const names = Array.isArray(item) ? item : item.checks || []
+    const checks = names.map((name) => caseRecord.checks.find((check) => check.name === name))
+    const verified = names.length > 0 && checks.every((check) => check?.passed === true)
+    return {
+      index,
+      assertion,
+      status: verified ? 'VERIFIED' : 'GAP',
+      evidenceChecks: names,
+      details: item.details || (verified
+        ? checks.map((check) => `${check.name}: ${check.details || ''}`).join('; ')
+        : (item.gap || '本轮未形成完整证据'))
+    }
+  })
+  caseRecord.remainingAssertions = caseRecord.catalogAssertions
+    .filter((item) => item.status === 'GAP').map((item) => item.assertion)
+  caseRecord.passCandidate = caseRecord.remainingAssertions.length === 0 &&
+    caseRecord.checks.length > 0 && caseRecord.checks.every((check) => check.passed !== false)
+  caseRecord.notes.push(
+    `原 catalog 未修改；PASS候选=${caseRecord.passCandidate}；` +
+    `剩余=${caseRecord.remainingAssertions.join('；') || '无'}`
+  )
+  return caseRecord
+}
 
 export const procurementReadOnlyViews = Object.freeze({
   'PROC-006': {
@@ -1926,6 +1971,87 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     await saveScreenshot(page, outputDir, 'erp-purchase-request-pending-sources', record)
     caseRecord.evidence.push('真实登录、请购单列表待生成入口、四类来源标签与 MRP 历史接口契约截图')
+    const env = dependencies.env || process.env
+    if (env.CFOR_E2E_WRITE_FIXTURES === 'true') {
+      if (config.target !== 'local') {
+        throw new Error('BLOCKED: PROC-017 写侧验收仅允许 local target')
+      }
+      if (!databaseConfigured()) {
+        throw new Error('BLOCKED: PROC-017 写侧验收需要配置本地数据库只读证据，尚未生成请购')
+      }
+      await assertLocalWriteSafety(caseRecord)
+      const write = await createPendingRequestBrowserFixture(api, caseRecord,
+        (source) => generatePendingRequestInBrowser(page, source, {
+          caseRecord,
+          capture: (name) => saveScreenshot(page, outputDir, name, record)
+        })
+      )
+      await verifyGeneratedRequestList(page, write, {
+        caseRecord,
+        capture: (name) => saveScreenshot(page, outputDir, name, record)
+      })
+      const snapshot = await runReadOnlySql(`
+        SELECT r.id, r.src_bill_type, r.src_bill_id, r.bill_stage, r.is_effective,
+               r.is_closed, r.total_count, i.product_id, i.product_unit_id, i.in_count
+        FROM erp_purchase_order_request r
+        JOIN erp_purchase_order_request_items i ON i.mid=r.id AND i.deleted=0
+        WHERE r.id='${write.requestId}' AND r.tenant_id=1 AND r.deleted=0 AND i.tenant_id=1
+      `)
+      caseRecord.database = [...(caseRecord.database || []), {
+        stage: 'browser-generated-request', ...snapshot
+      }]
+      const row = snapshot.rows?.[0]
+      caseRecord.checks.push({
+        name: 'Chrome 生成请购的来源及待提审数量在既有主子表准确落库',
+        passed: snapshot.available && snapshot.rows.length === 1 &&
+          row[0] === write.requestId && row[1] === 'sale' && row[2] === write.saleOrderId &&
+          row[3] === '14' && Number(row[4]) === 0 && Number(row[5]) === 0 &&
+          Number(row[6]) === 2 && row[7] === String(write.material.id) &&
+          row[8] === String(write.material.unitId) && Number(row[9]) === 2,
+        details: JSON.stringify(snapshot.rows)
+      })
+      caseRecord.checks.push({
+        name: 'PROC-017 销售订单来源复用既有创建接口生成未审核请购',
+        passed:
+          write.fixture.generatedViaBrowser === true &&
+          String(write.request?.srcBillType) === 'sale' &&
+          String(write.request?.srcBillId) === write.saleOrderId &&
+          Number(write.request?.isEffective) === 0 &&
+          write.request?.itemsList?.length === 1 &&
+          Number(write.request?.itemsList?.[0]?.inCount) === 2,
+        details: `saleOrderId=${write.saleOrderId}; requestId=${write.requestId}; ` +
+          `effective=${write.request?.isEffective}; items=${write.request?.itemsList?.length || 0}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-017 待生成请购不新增前置事实表',
+        passed:
+          write.requestPayload?.srcBillType === 'sale' &&
+          write.requestPayload?.srcBillId === write.saleOrderId &&
+          !Object.prototype.hasOwnProperty.call(write.requestPayload, 'pendingSourceId'),
+        details: `requestId=${write.requestId}; source=${write.requestPayload?.srcBillType}/` +
+          `${write.requestPayload?.srcBillId}`
+      })
+      procurementCatalogEvidence('PROC-017', caseRecord, {
+        0: ['请购单列表提供待生成请购入口'],
+        1: ['待生成请购弹窗聚合四类来源'],
+        2: [
+          'Chrome 选择专属销售来源明细并确认一键生成请购',
+          'Chrome 按生成单号唯一回读本轮未审核请购和数量',
+          'PROC-017 销售订单来源复用既有创建接口生成未审核请购',
+          'Chrome 生成请购的来源及待提审数量在既有主子表准确落库'
+        ],
+        3: ['PROC-017 待生成请购不新增前置事实表',
+          'Chrome 生成请购的来源及待提审数量在既有主子表准确落库']
+      })
+      return { token, api, acceptanceComplete: caseRecord.passCandidate,
+        partial: !caseRecord.passCandidate }
+    }
+    procurementCatalogEvidence('PROC-017', caseRecord, {
+      0: ['请购单列表提供待生成请购入口'],
+      1: ['待生成请购弹窗聚合四类来源'],
+      2: { gap: '未启用本地写侧夹具，未选择真实来源并生成未审核请购' },
+      3: { gap: '现有只读接口无法证明未新增前置事实表' }
+    })
     return {
       token,
       api,
