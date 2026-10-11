@@ -51,9 +51,24 @@ export function addCheck (caseRecord, name, passed, details = '') {
   return Boolean(passed)
 }
 
+export function acceptanceIsComplete ({
+  failedChecks = [], remainingAssertions, candidates = []
+} = {}) {
+  const noRemaining = remainingAssertions === undefined ||
+    (Array.isArray(remainingAssertions) && remainingAssertions.length === 0)
+  return failedChecks.length === 0 && noRemaining &&
+    candidates.some((candidate) => candidate === true)
+}
+
 export function caseOutcome ({ failedChecks, partial, hasAssertions, result } = {}) {
   if (failedChecks?.length) {
     return { status: 'FAIL', note: `失败断言 ${failedChecks.length} 个` }
+  }
+  if (result?.acceptanceComplete === true) {
+    if (!hasAssertions) {
+      return { status: 'PARTIAL', note: '完整验收标记缺少有效断言，不能登记通过' }
+    }
+    return { status: 'PASS', note: '' }
   }
   if (result?.notImplemented || result?.designed || result?.partial) {
     return { status: 'PARTIAL', note: result.note || '步骤尚未实现' }
@@ -93,7 +108,8 @@ export async function writeReport (record) {
 
   const passed = record.cases.filter((item) => item.status === 'PASS').length
   const partial = record.cases.filter((item) => item.status === 'PARTIAL').length
-  const failed = record.cases.filter((item) => ['FAIL', 'BLOCKED'].includes(item.status)).length
+  const failed = record.cases.filter((item) => item.status === 'FAIL').length
+  const blocked = record.cases.filter((item) => item.status === 'BLOCKED').length
   const skipped = record.cases.filter((item) => item.status === 'SKIPPED').length
   const lines = [
     `# CFOR E2E 回归报告（${record.runId}）`,
@@ -102,7 +118,7 @@ export async function writeReport (record) {
     `- 前端：${record.environment.webBase || config.webBase}`,
     `- 后端：${record.environment.apiBase || config.apiUrl}`,
     `- 时间：${record.finishedAt}`,
-    `- 用例：${record.cases.length}，通过 ${passed}，部分 ${partial}，失败 ${failed}，跳过 ${skipped}`,
+    `- 用例：${record.cases.length}，通过 ${passed}，部分 ${partial}，失败 ${failed}，阻塞 ${blocked}，跳过 ${skipped}`,
     '',
     '| 用例 | 套件 | 状态 | 耗时(ms) | 备注 |',
     '|---|---|---|---:|---|'

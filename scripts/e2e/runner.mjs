@@ -15,6 +15,7 @@ import {
 import {
   createCaseRecord,
   createRunRecord,
+  acceptanceIsComplete,
   caseOutcome,
   caseErrorStatus,
   finishCase,
@@ -427,9 +428,44 @@ async function main () {
           })
           caseRecord.checks.push(...check.steps)
           const failedChecks = caseRecord.checks.filter((item) => item.passed === false)
-          const partial = declaredStatus === 'PARTIAL' || Boolean(definition.acceptanceGaps?.length) ||
-            result?.notImplemented || result?.designed || result?.partial
-          const outcome = caseOutcome({ failedChecks, partial, hasAssertions, result })
+          const catalogAcceptanceComplete =
+            Array.isArray(caseRecord.catalogAssertions) &&
+            caseRecord.catalogAssertions.length > 0 &&
+            caseRecord.catalogAssertions.every((item) =>
+              item.status === 'VERIFIED' &&
+              (
+                (Array.isArray(item.evidenceChecks) && item.evidenceChecks.length > 0) ||
+                (typeof item.evidence === 'string' && item.evidence.trim() !== '') ||
+                result?.status === 'PASS'
+              )
+            )
+          const acceptanceComplete = acceptanceIsComplete({
+            failedChecks,
+            remainingAssertions: caseRecord.remainingAssertions,
+            candidates: [
+              result?.acceptanceComplete,
+              caseRecord.acceptanceComplete,
+              caseRecord.passCandidate,
+              catalogAcceptanceComplete
+            ]
+          })
+          const partial = !acceptanceComplete && (
+            Boolean(caseRecord.remainingAssertions?.length) ||
+            declaredStatus === 'PARTIAL' ||
+            Boolean(definition.acceptanceGaps?.length) ||
+            result?.notImplemented ||
+            result?.designed ||
+            result?.partial
+          )
+          const outcome = caseOutcome({
+            failedChecks,
+            partial,
+            hasAssertions,
+            result: {
+              ...(result || {}),
+              acceptanceComplete
+            }
+          })
           finishCase(caseRecord, outcome.status, outcome.note)
           if (outcome.status === 'PASS') saveCheckpoint(definition.id)
           caseRecord.durationMs = Date.now() - startedAt
