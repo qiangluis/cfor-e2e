@@ -4741,11 +4741,23 @@
           "id": "IOT-013",
           "title": "设备资产状态三层解耦与产品模型/接入配置版本快照（PB-103/PB-104/PB-105）",
           "status": "READY",
+          "acceptanceEvidence": {
+            "verifiedOn": "2026-10-11",
+            "runId": "20261011065719697-12469",
+            "checks": [
+              "四个接入字段分别修改时版本精确加一，恢复字段到 v6，同值更新版本不变",
+              "专属设备保存 v6 模型，产品变为 v7 后设备版本与快照保持不变",
+              "非法资产状态精确拒绝且完整事实不变，合法停用不覆盖连接及非空 MES RUNTIME 状态",
+              "真实设备详情分别展示停用、接入版本 6 和保存的 v6 mqtt/json 快照",
+              "正式结束 RUNTIME 并回读活动键释放，恢复资产状态，设备及产品删除后回读不存在"
+            ]
+          },
           "preconditions": [
-            "已登录且具备 iot:device:query 与 iot:device:update 权限",
-            "存在可编辑的 iot_device 设备档案（无设备时仅做接口与页面可用性断言）"
+            "本地 48083/9151 与租户 1 / CFOR 标准平台，真实授权有效",
+            "账号具备产品与设备创建/编辑/删除、MES 状态事件开始/结束权限",
+            "仅操作本轮专属产品、设备和非空 RUNTIME 事件，不依赖 IoT 消息总线"
           ],
-          "routes": ["/iot/device"],
+          "routes": ["/iot/device/detail/:id"],
           "assertions": [
             "设备台账返回资产状态 asset_status，与 IoT 连接状态 state 解耦",
             "非法资产状态提交被拒绝，合法状态可切换并在用例末尾恢复原值",
@@ -4753,13 +4765,19 @@
             "产品接入配置（设备形态/联网方式/协议/序列化）变化时 iot_product.access_config_version 递增"
           ],
           "api": [
+            "/iot/product/create",
+            "/iot/product/update",
+            "/iot/product/get",
             "/iot/device/page",
             "/iot/device/get",
-            "/iot/device/asset-status"
+            "/iot/device/asset-status",
+            "/mes/device-status-event/start",
+            "/mes/device-status-event/active",
+            "/mes/device-status-event/end"
           ],
           "database": ["iot_device", "iot_product", "mes_device_status_event"],
           "reverse": [
-            "资产状态变更只驱动 ASSET 层，不覆盖 CONNECTION/RUNTIME；E2E 结束后恢复设备原始资产状态"
+            "资产状态不覆盖 CONNECTION/RUNTIME；正式结束专属运行事件并保留审计，恢复资产状态后清理设备及产品并回读"
           ]
         }
       ]

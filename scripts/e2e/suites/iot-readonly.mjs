@@ -245,8 +245,9 @@ export async function runIotReadonlyContract({ caseId, api, caseRecord }) {
             object(capacity) &&
               ['id', 'routeSubId', 'equipmentId', 'unitId', 'standardOutput',
                 'standardDuration', 'changeoverMinutes', 'calendarCode',
-                'effectiveFrom', 'effectiveTo', 'capacityVersion', 'status']
-                .every((key) => Object.hasOwn(capacity, key)),
+                'effectiveFrom', 'effectiveTo', 'capacityVersion', 'publishStatus']
+                .every((key) => Object.hasOwn(capacity, key)) &&
+              [0, 1, 2].includes(capacity.publishStatus),
             `capacityId=${capacity.id}`)
         }
       }

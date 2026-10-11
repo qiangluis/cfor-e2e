@@ -1,8 +1,17 @@
 import { createApiClient } from '../lib/api.mjs'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { config } from '../config/index.mjs'
 import { runIotReadonlyCase } from './iot-readonly.mjs'
 import { runIotFoundationReadonlyCase } from './iot-foundation-readonly.mjs'
+import {
+  assertIotLocalTarget,
+  assertIotMessageRuntimeEnabled,
+  createIotFixtureCleanup,
+  finalizeIotCatalogAssertions,
+  initializeIotCatalogAssertions,
+  runIotSecurityE2e
+} from '../fixtures/iot-write-closure.mjs'
 
 export const cases = [
   'IOT-001',
@@ -39,16 +48,59 @@ export const containsE2eMarker = (value) => /(?:^|[^a-z0-9])E2E(?:[^a-z0-9]|$)/i
 
 export const nicknameBeforeChange = (device) => device?.nickname ?? null
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+export const createDomContentLoadedPage = (page) => new Proxy(page, {
+  get (target, property, receiver) {
+    if (property === 'waitForURL') {
+      return (urlOrPredicate, options = {}) => target.waitForURL(
+        urlOrPredicate,
+        { ...options, waitUntil: 'domcontentloaded' }
+      )
+    }
+    const value = Reflect.get(target, property, receiver)
+    return typeof value === 'function' ? value.bind(target) : value
+  }
+})
+
+const runFoundationReadonlyCase = async (
+  { caseId, page, record, caseRecord, outputDir },
+  dependencies
+) => runIotFoundationReadonlyCase({
+  caseId,
+  page: createDomContentLoadedPage(page),
+  record,
+  caseRecord,
+  outputDir
+}, dependencies)
+
+export const runCase = async (
+  { caseId, page, record, caseRecord, outputDir },
+  dependencies = {}
+) => {
   caseRecord.notes.push('案例已锁定 iot_device 唯一设备档案事实源，旧 MES 设备档案只允许兼容读取。')
   caseRecord.notes.push(
     '设备产能复用 APS 工艺路线工序设备产能并增加版本与发布状态，设备三层状态不得由字典页面直接改运行事实。'
   )
 
   if (caseId === 'IOT-001') {
-    return await runIotFoundationReadonlyCase({ caseId, page, record, caseRecord, outputDir })
+    const helpers = {
+      login,
+      createApiClient,
+      openRoute,
+      saveScreenshot,
+      ...dependencies
+    }
+    return await runFoundationReadonlyCase(
+      { caseId, page, record, caseRecord, outputDir },
+      helpers
+    )
   }
-  if (caseId === 'IOT-002' || caseId === 'IOT-003') {
+  if (caseId === 'IOT-002') {
+    return await runIotWriteCase(
+      { caseId, page, record, caseRecord, outputDir },
+      dependencies
+    )
+  }
+  if (caseId === 'IOT-003') {
     return await runIotReadonlyCase({ caseId, page, record, caseRecord, outputDir })
   }
   if (caseId === 'IOT-007') {
@@ -58,26 +110,89 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     return await runPointVersionCase({ page, record, caseRecord, outputDir })
   }
   if (caseId === 'IOT-009') {
-    return await runDataAnomalyCase({ page, record, caseRecord, outputDir })
+    return await runIotWriteCase(
+      { caseId, page, record, caseRecord, outputDir },
+      dependencies
+    )
   }
   if (caseId === 'IOT-010') {
-    return await runAlertLifecycleCase({ page, record, caseRecord, outputDir })
+    return await runIotWriteCase(
+      { caseId, page, record, caseRecord, outputDir },
+      dependencies
+    )
   }
   if (caseId === 'IOT-011') {
-    return await runWriteBackDeadLetterCase({ page, record, caseRecord, outputDir })
+    return await runIotWriteCase(
+      { caseId, page, record, caseRecord, outputDir },
+      dependencies
+    )
   }
   if (caseId === 'IOT-012') {
     return await runDeviceChangeAuditCase({ page, record, caseRecord, outputDir })
   }
   if (caseId === 'IOT-013') {
-    return await runDeviceAssetModelCase({ page, record, caseRecord, outputDir })
+    return await runIotWriteCase(
+      { caseId, page, record, caseRecord, outputDir },
+      dependencies
+    )
   }
   return { designed: true }
 }
 
-/** PB-103/PB-104/PB-105：设备资产状态三层解耦与产品模型/接入配置版本快照。 */
-const runDeviceAssetModelCase = async (context) =>
-  runIotReadonlyCase({ ...context, caseId: 'IOT-013' })
+const runIotWriteCase = async (
+  { caseId, page, record, caseRecord, outputDir },
+  dependencies
+) => {
+  const helpers = {
+    login,
+    createApiClient,
+    openRoute,
+    saveScreenshot,
+    runIotSecurityE2e,
+    ...dependencies
+  }
+  const runtime = dependencies.runtime || config
+  assertIotLocalTarget(runtime, { requireTenantId: false })
+  assertIotMessageRuntimeEnabled(runtime, caseId)
+  const auth = await helpers.login(page, { returnContext: true })
+  const token = auth?.token
+  const tenantId = auth?.tenantId
+  if (!token || tenantId == null) {
+    throw new Error('BLOCKED: IoT 写侧登录缺少可验证的 token/tenantId 上下文')
+  }
+  assertIotLocalTarget({ ...runtime, tenantId })
+  const api = helpers.createApiClient({ token, tenantId, record })
+  const fixtures = createIotFixtureCleanup({ caseId, caseRecord })
+  initializeIotCatalogAssertions(caseRecord, caseId)
+  let executionFailed = true
+  let result
+  try {
+    result = await helpers.runIotSecurityE2e({
+      caseId,
+      api,
+      fixtures,
+      caseRecord,
+      page,
+      outputDir,
+      record,
+      openRoute: helpers.openRoute,
+      saveScreenshot: helpers.saveScreenshot
+    })
+    executionFailed = caseRecord.checks.some((check) => check.passed === false)
+  } finally {
+    await fixtures.cleanup(executionFailed)
+  }
+  const conclusion = finalizeIotCatalogAssertions(caseRecord)
+  return {
+    token,
+    api,
+    ...result,
+    ...conclusion,
+    partial: result?.partial === true || conclusion.partial,
+    acceptanceComplete: result?.acceptanceComplete === true &&
+      conclusion.acceptanceComplete === true
+  }
+}
 
 /** PB-320：设备台账关键字段变更审计与审批。 */
 const runDeviceChangeAuditCase = async ({ page, record, caseRecord, outputDir }) => {

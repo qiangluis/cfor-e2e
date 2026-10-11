@@ -52,10 +52,22 @@ const capacity = () => ({
   effectiveFrom: '2026-01-01',
   effectiveTo: null,
   capacityVersion: 1,
-  status: 'PUBLISHED'
+  publishStatus: 2
 })
 const dict = () => ({
   id: '2106401100222222222', label: '生产设备', value: '1', dictType: 'equipment_type'
+})
+
+test('IOT-003 uses only official numeric capacity publish states', async () => {
+  for (const publishStatus of [undefined, 'PUBLISHED', 99]) {
+    const f = fixture('IOT-003', true, {
+      '/mes/wmsTechRoute/capacity/list?routeSubId=2106401100999999999&equipmentId=2106401100798558209':
+        ok([{ ...capacity(), publishStatus }])
+    })
+    await assert.rejects(runIotReadonlyContract({
+      caseId: 'IOT-003', api: f.api, caseRecord: record()
+    }), /产能版本/)
+  }
 })
 
 // Unit fixtures never substitute API responses in real Chrome runs.

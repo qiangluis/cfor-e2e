@@ -94,6 +94,12 @@ export const config = Object.freeze({
   chromePath: env('CFOR_CHROME_PATH', ''),
   headless: bool(process.env.CFOR_HEADLESS ?? process.env.CFOR_E2E_HEADLESS, true),
   reuseSession: bool(process.env.CFOR_REUSE_SESSION, true),
+  // The local dev profile disables the IoT message runtime by default. Set
+  // CFOR_IOT_RUNTIME_ENABLED=true only when the running backend has it enabled.
+  iotRuntimeEnabled: bool(
+    process.env.CFOR_IOT_RUNTIME_ENABLED,
+    target !== 'local'
+  ),
   evidenceDir: env('CFOR_EVIDENCE_DIR', env('CFOR_E2E_OUT', '/tmp/cfor-e2e')),
   outputRoot: env('CFOR_E2E_OUT', env('CFOR_EVIDENCE_DIR', '/tmp/cfor-e2e')),
   requestTimeoutMs: number('CFOR_E2E_REQUEST_TIMEOUT_MS', 30000),
