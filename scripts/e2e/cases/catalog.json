@@ -4357,7 +4357,96 @@
           "database": ["cost_rule_hit", "cost_control_rule_catalog"],
           "reverse": ["只读校验阶段命中记录，不产生正式单据"]
         }
-      ]
+,
+        {
+          "id": "COST-035",
+          "title": "PB-433 企业管理全成本正式报表",
+          "status": "READY",
+          "preconditions": ["存在已发布经营结果与正式成本的成本期间", "账号具备 cost:report:query 权限"],
+          "routes": ["/cost-management/results/enterprise-full-cost", "/reports/cost/results/enterprise-full-cost"],
+          "assertions": [
+            "正式接口返回 reportKey=enterprise-full-cost 的成本路径行",
+            "运营费用/收入/经营利润取正式经营发布冻结值，未发布时留空而不是零",
+            "指标包含正式成本、运营费用与企业全成本",
+            "页面渲染正式报表工作区，不再是通用模板占位（无演示数据标签）"
+          ],
+          "api": ["/cost/reports/enterprise-full-cost/{periodId}"],
+          "database": ["cost_publication", "cost_publication_object", "cost_operating_publication"],
+          "reverse": [
+            "只读校验正式报表接口与页面，不触发发布、回退或反月结写操作"
+          ]
+        },
+        {
+          "id": "COST-036",
+          "title": "PB-434/435 商品成本正式报表与贸易型隔离",
+          "status": "READY",
+          "preconditions": ["存在已发布的生产型成本期间", "本地 tenant 1 开启写侧夹具后可创建贸易型模型与期间"],
+          "routes": ["/cost-management/results/goods-cost"],
+          "assertions": [
+            "生产型期间查询商品成本被后端以贸易型专属拒绝",
+            "贸易型期间通过企业类型门禁，由正式成本发布约束兜底提示",
+            "贸易型夹具使用远期空月，不污染真实成本期间",
+            "页面入口在生产型视角落到产品/商品成本表或商品成本页，不空白也不 404"
+          ],
+          "api": ["/cost/reports/goods-cost/{periodId}", "/cost/model-versions", "/cost/periods"],
+          "database": ["cost_period", "cost_model_version", "cost_publication_source_fact"],
+          "reverse": [
+            "贸易型模型与期间落在 allocateCostMonth 分配的远期空月，保留夹具记录供复验"
+          ]
+        },
+        {
+          "id": "COST-037",
+          "title": "PB-428 自产与外购比较接入正式报表工作区",
+          "status": "READY",
+          "preconditions": ["存在已发布正式成本的生产型成本期间", "账号具备 cost:report:query 权限"],
+          "routes": ["/cost-management/analysis/make-buy"],
+          "assertions": [
+            "正式接口返回 reportKey=make-buy 的比较行",
+            "不可比较对象必须给出原因，不伪造成本结论",
+            "页面绑定正式期间并渲染正式报表工作区，不再落到通用模板占位",
+            "页面列包含自产全成本与外购到岸成本"
+          ],
+          "api": ["/cost/reports/make-buy/{periodId}"],
+          "database": ["cost_publication_object", "cost_publication_source_fact"],
+          "reverse": [
+            "只读校验正式报表接口与页面渲染，不写入正式成本"
+          ]
+        },
+        {
+          "id": "COST-038",
+          "title": "成本菜单收敛：占位页摘除与追溯入口收敛",
+          "status": "READY",
+          "preconditions": ["Flyway V202610161330__align_cost_report_menus.sql 已执行", "账号具备菜单查询权限"],
+          "routes": ["/cost-management"],
+          "assertions": [
+            "企业管理全成本、商品成本、异常处理队列菜单补齐且可见",
+            "追溯、成本设置与情景模拟占位页从菜单摘除",
+            "成本试算与成本发布仍作为可见的追溯入口",
+            "成本工作台常用入口不再暴露隐藏的占位追溯页"
+          ],
+          "api": ["/system/menu/list"],
+          "database": ["system_menu", "system_role_menu", "system_tenant_package"],
+          "reverse": [
+            "占位页只隐藏菜单可见性，不删除菜单与权限记录，保证深链与授权可回滚"
+          ]
+        },
+        {
+          "id": "COST-039",
+          "title": "报表组成本别名对齐新报表",
+          "status": "READY",
+          "preconditions": ["Flyway V202610161330__align_cost_report_menus.sql 已执行", "存在已发布正式成本的期间"],
+          "routes": ["/reports/cost/results/enterprise-full-cost"],
+          "assertions": [
+            "报表组成本别名标题与成本结果/成本分析新报表名一致",
+            "别名指向新报表页键而不是旧占位键",
+            "报表到成本结果入口可打开并渲染企业管理全成本正式报表"
+          ],
+          "api": ["/system/menu/list"],
+          "database": ["system_menu"],
+          "reverse": [
+            "只更新既有别名菜单的名称、路径与组件指向，不改变权限与授权记录"
+          ]
+        }      ]
     },
     {
       "id": "plm",
