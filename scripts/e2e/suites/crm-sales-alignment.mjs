@@ -178,5 +178,15 @@ export const runCase = async ({ caseId, page, record, caseRecord }) => {
   caseRecord.evidence.push(
     `菜单-页面-权限对齐回归：可见销售协同菜单 ${visibleInScope.length} 条，权限键 ${REQUIRED_PERMISSIONS.length} 个`
   )
-  return { token, api }
+  return {
+    token,
+    api,
+    // 生产首页内嵌百度统计脚本；执行机网络到 hm.baidu.com 会被拒绝，
+    // 该失败与本批次页面/菜单/权限无关，单独放行第三方统计域。
+    allowRuntimeErrors: {
+      request: (entry) => /(^|\.)(hm|push\.zhanzhang)\.baidu\.com$/.test(new URL(entry?.url || 'https://invalid').hostname),
+      console: (message) =>
+        /Failed to load resource: net::ERR_CONNECTION_CLOSED/.test(String(message))
+    }
+  }
 }

@@ -55,6 +55,27 @@ CFOR_PASSWORD=admin123 node scripts/e2e/parallel-runner.mjs \
 | `CFOR_API_ENCRYPT_REQUEST_KEY` / `CFOR_API_ENCRYPT_RESPONSE_KEY` | API 加密工具使用的环境参数，必须与目标环境一致，不提交实际值 |
 | `CFOR_WEB_ROOT` | Vite 检查专项使用的前端源码目录，默认相邻 `cfor/cfor-admin-vue3` |
 
+### 生产只读复核
+
+只有登记为只读的案例允许打到生产；不要在生产运行任何写侧套件。生产执行需显式切目标、
+置空就绪探测地址并注入目标环境自己的加密密钥（与仓库 `.env` 的开发密钥不同，
+沿用开发密钥会在 harness 侧解不开响应而误报 `bad decrypt`）：
+
+```bash
+cd /Users/liuqiang/code/cfor-standard/cfor-e2e
+CFOR_TARGET=production \
+CFOR_WEB_BASE=https://jixu-ai.com CFOR_API_BASE=https://jixu-ai.com \
+CFOR_API_HEALTH_URL= \
+CFOR_TENANT_ID=1 CFOR_TENANT_NAME=福奇科技 \
+CFOR_USERNAME=admin CFOR_PASSWORD=<生产密码> \
+CFOR_API_ENCRYPT_REQUEST_KEY=<生产请求密钥> \
+CFOR_API_ENCRYPT_RESPONSE_KEY=<生产响应密钥> \
+node scripts/e2e/runner.mjs --suite crm-sales-alignment
+```
+
+生产不暴露 `/actuator/health`，`CFOR_API_HEALTH_URL` 必须显式置空，否则 runner 会等待探活超时。
+生产首页内嵌百度统计脚本，验收机通常不可达；`crm-sales-alignment` 已对该第三方统计域单独放行。
+
 ## 执行规则
 
 - 默认从头执行；显式 `--resume` 才跳过同环境、租户、账号、数据库、用例目录及脚本指纹此前已完整通过的案例。
