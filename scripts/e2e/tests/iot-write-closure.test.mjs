@@ -12,6 +12,8 @@ import {
   createIotRuntimeStatusFixture,
   dataOf,
   finalizeIotCatalogAssertions,
+  hasIotAlertTransferHandlingEvidence,
+  hasIotDeadLetterDedupEvidence,
   initializeIotCatalogAssertions,
   isExactIotForbidden,
   markIotAssertion,
@@ -527,6 +529,51 @@ test('IoT fixture response helpers reject failed or malformed business facts', (
   }), false)
 })
 
+test('IOT-010 transfer evidence requires persisted operator, time, and remark', () => {
+  const remark = 'E2E-IOT-010 已转工单'
+  assert.equal(hasIotAlertTransferHandlingEvidence({
+    workOrderId: '701', transferUserId: '802', transferTime: '2026-10-12T10:00:00', transferRemark: remark
+  }, remark), true)
+  for (const change of [
+    { transferUserId: null },
+    { transferTime: null },
+    { transferRemark: 'other' },
+    { workOrderId: null }
+  ]) {
+    assert.equal(hasIotAlertTransferHandlingEvidence({
+      workOrderId: '701', transferUserId: '802', transferTime: '2026-10-12T10:00:00', transferRemark: remark,
+      ...change
+    }, remark), false)
+  }
+})
+
+test('IOT-011 dead-letter dedup evidence requires one exact row and source facts', () => {
+  const expected = {
+    id: '705',
+    idempotentKey: 'd:703:m:thing.property.post:i:signal:s:11001',
+    sourceTime: '2026-10-12T10:00:00',
+    sourceVersion: '1'
+  }
+  const row = {
+    ...expected,
+    sourceTime: '2026-10-12T10:00:00',
+    sourceVersion: '1',
+    lastError: 'connection refused'
+  }
+  assert.equal(hasIotDeadLetterDedupEvidence([row], expected), true)
+  assert.equal(hasIotDeadLetterDedupEvidence([row, { ...row }], expected), false)
+  for (const field of ['sourceTime', 'sourceVersion', 'lastError']) {
+    assert.equal(hasIotDeadLetterDedupEvidence([{ ...row, [field]: null }], expected), false)
+  }
+  assert.equal(hasIotDeadLetterDedupEvidence([{ ...row, idempotentKey: 'other' }], expected), false)
+  for (const [field, value] of [
+    ['id', '706'], ['sourceTime', '2026-10-12T10:00:01'], ['sourceVersion', '2']
+  ]) {
+    assert.equal(hasIotDeadLetterDedupEvidence([{ ...row, [field]: value }], expected), false)
+  }
+  assert.equal(hasIotDeadLetterDedupEvidence([row], {}), false)
+})
+
 test('IOT-009 first message evidence requires device, identifier, sequence, and quality together', () => {
   const expected = anomalyExpectations[0]
   const actual = {
@@ -657,11 +704,10 @@ test('IOT-009 simulated complete evidence is registered only after successful ex
   assert.ok(caseRecord.catalogAssertions.every((row) => row.status === 'VERIFIED'))
 })
 
-test('IOT-002 isolation/alert and IOT-010 lifecycle gaps are preserved without a stale IOT-009 gap', async () => {
+test('IOT-002 scope and IOT-010 lifecycle gaps are explicit without a stale IOT-009 gap', async () => {
   assert.equal(Object.prototype.hasOwnProperty.call(IOT_CONTRACT_GAPS, 'IOT-009'), false)
   assert.ok(IOT_CONTRACT_GAPS['IOT-002'].some((gap) => /租户.*权限隔离/.test(gap)))
-  assert.ok(IOT_CONTRACT_GAPS['IOT-010'].some((gap) => /真实工单/.test(gap)))
-  assert.ok(IOT_CONTRACT_GAPS['IOT-010'].some((gap) => /非严格线性状态机/.test(gap)))
+  assert.ok(IOT_CONTRACT_GAPS['IOT-010'].some((gap) => /单向推进/.test(gap)))
   const caseRecord = record('IOT-002')
   initializeIotCatalogAssertions(caseRecord, 'IOT-002')
   await runSimulatedAnomalyClosure(simulateAnomalyApi(), caseRecord)

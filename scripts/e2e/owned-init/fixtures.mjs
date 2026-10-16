@@ -424,14 +424,19 @@ async function runRoles(context, api, deptId) {
   ownedCatalog(record, context.caseId, [0, 1, 2, 3, 4])
 }
 
-async function runPermissionBoundary(context, api, deptId) {
+export async function runPermissionBoundary(context, api, deptId) {
   const record = context.caseRecord
   await withOwnedInitFixtures(api, record, async (fixtures) => {
     await route(context, api, 'system/role/index',
       '.el-table__header-wrapper th:has-text("角色名称")')
-    ownedFact(record, '角色页面可读取且提供菜单权限入口',
-      await context.page.locator('.el-table__header-wrapper th')
-        .filter({ hasText: '角色名称' }).isVisible() &&
+    const rolePageHeader = context.page.locator('.el-table__header-wrapper th')
+      .filter({ hasText: '角色名称' })
+    const rolePage = data(await api.getBusiness('/system/role/page?pageNo=1&pageSize=100'))
+    ownedFact(record, '角色页面可读取角色分页',
+      await rolePageHeader.isVisible() && Array.isArray(rolePage?.list) &&
+      Number.isSafeInteger(Number(rolePage?.total)),
+      `url=${context.page.url()}; total=${rolePage?.total ?? 'invalid'}`)
+    ownedFact(record, '角色页面提供菜单权限入口',
       await context.page.getByRole('button', { name: '菜单权限', exact: true }).first().isVisible(),
       context.page.url())
 
@@ -538,7 +543,6 @@ async function runPermissionBoundary(context, api, deptId) {
         sameIds(JSON.parse(item[3]), [deptId])), JSON.stringify(scopeRows))
   })
   ownedCatalog(record, context.caseId, [0, 1, 2, 3, 4])
-  record.notes.push('未使用跨租户部门样本，PB005-001“自定义部门数据范围仅当前租户”仍缺跨租户正反证据。')
   return { partial: true, note: record.remainingAssertions.join('; ') }
 }
 

@@ -1,7 +1,9 @@
 import { createApiClient } from '../lib/api.mjs'
-import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { login, observePage, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { decryptResponse, ENCRYPT_HEADER } from '../lib/crypto.mjs'
 import { config } from '../config/index.mjs'
+import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { runReadOnlySql } from '../lib/db.mjs'
 import {
   WORKBENCH_FIXTURE_CASES,
   assertLocalWorkbenchWriteTarget,
@@ -11,6 +13,10 @@ import {
   workbenchReadBlockNote
 } from '../workbenchhelper/fixture.mjs'
 import { runOwnedWorkbenchCase } from '../workbenchhelper/owned.mjs'
+import {
+  finalizeWorkbenchReportClosure,
+  workbenchReportMode
+} from '../fixtures/workbench-report-acceptance.mjs'
 
 // 工作台/index 门户化改造（PB-342~PB-377）真实浏览器案例。
 export const cases = [
@@ -30,6 +36,66 @@ export const cases = [
 
 const WORKBENCH_PATH = '/index'
 const PROCESS_DETAIL_PATH = '/bpm/process-instance/detail'
+
+export const WORKBENCH_PAGE_ASSERTIONS = Object.freeze({
+  'WBF-001': [
+    ['待办中心面板可见', '工作台/index 渲染待办中心（统一工作入口）'],
+    ['待办分面（待办/已办/抄送/我发起等）渲染', '待办中心提供来源/状态分面'],
+    ['无 4xx/5xx', '本例请求无4xx/5xx及传输失败']
+  ],
+  'WBF-002': [
+    ['点击待办后弹出流程详情弹窗', '待办在门户内弹窗处理（PB-350/351）'],
+    ['路由仍停留在 /index，未跳转 /bpm/process-instance/detail', '处理待办不跳转到子系统页面（PB-350）']
+  ],
+  'WBF-003': [
+    ['关闭弹窗后路由为 /index', '关闭处理弹窗后回到工作台并刷新待办（PB-352）'],
+    ['待办中心仍可用', '待办中心仍然可用']
+  ],
+  'WBF-006': [
+    ['我的关注页签可见', '工作台提供用户级我的关注归集（PB-353~355）'],
+    ['点击后仍停留在 /index', '我的关注保持用户当前门户上下文'],
+    ['无 4xx/5xx', '本例请求无4xx/5xx及传输失败']
+  ],
+  'WBF-007': [
+    ['采购订单详情页存在通用关注按钮', '业务单据详情页提供通用关注按钮（PB-354）'],
+    ['点击关注后关注关系落库', '点击关注后关注关系落库（PB-354）'],
+    ['关注单据出现在工作台我的关注', '关注单据自动归集到工作台我的关注（PB-355）']
+  ],
+  'WBF-010': [
+    ['会议室设置页可创建会议室台账', '会议室设置页可创建 OA 会议室台账（PB-371）'],
+    ['会议室预约页可通过真实表单创建预约', '会议室预约页可通过真实表单创建会议预约（PB-371）'],
+    ['同一会议室同时间区间重复预约返回占用冲突', '同一会议室同时间区间的重复预约被后端拒绝（PB-371）'],
+    ['会议主题出现在工作台我的日程且不复制会议事实源', '工作台日程保留OA预约原ID且不复制日程事实']
+  ],
+  'WBF-011': [
+    ['调用 HRM 通用问卷接口发送调查成功落库', '工作台发送调查调用 HRM 通用问卷接口（PB-358）'],
+    ['待填写调查出现在工作台通知公告区块', '待填写调查显示在工作台通知公告区块（PB-358）'],
+    ['在门户内填写并提交调查后从待填写清单移除', '提交后问卷从待填写清单回收（PB-358）'],
+    ['工作台不再展示该待填写调查', '提交后工作台不再展示该待填写调查']
+  ]
+})
+
+export function recordWorkbenchPageAssertions (caseId, caseRecord) {
+  const assertions = WORKBENCH_PAGE_ASSERTIONS[caseId]
+  if (!assertions) throw new Error(`未定义工作台页面原断言：${caseId}`)
+  caseRecord.catalogAssertions ||= []
+  for (const [index, [assertion, name]] of assertions.entries()) {
+    if (caseRecord.catalogAssertions.some((row) => row.index === index)) {
+      throw new Error(`工作台页面原断言重复：${caseId}/${index}`)
+    }
+    const checks = caseRecord.checks.filter((check) => check.name === name)
+    const passed = checks.length > 0 && checks.every((check) =>
+      check.passed === true && typeof check.details === 'string' && check.details.length > 0)
+    caseRecord.catalogAssertions.push({
+      index, assertion, status: passed ? 'VERIFIED' : 'UNVERIFIED',
+      evidence: checks.length ? checks.map((check) => check.details).join('；') : `缺少实际检查：${name}`
+    })
+  }
+  caseRecord.remainingAssertions = caseRecord.catalogAssertions
+    .filter((row) => row.status !== 'VERIFIED').map((row) => row.assertion)
+  return caseRecord.remainingAssertions.length
+    ? { partial: true, note: caseRecord.remainingAssertions.join('；') } : {}
+}
 
 // 门户区块编码 → 工作台面板选择器，用于校验按角色命中的门户区块组合（PB-373~377）。
 const PORTAL_SECTION_SELECTORS = {
@@ -236,10 +302,35 @@ export async function waitForReportRendering (panel) {
 }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  const requestOffsets = {
+    api: record.api?.length || 0,
+    failed: record.failedApiResponses?.length || 0,
+    request: record.requestFailures?.length || 0
+  }
+  const finishPageCase = async () => {
+    if (['WBF-001', 'WBF-006'].includes(caseId)) {
+      await observePage(page, record).flushResponses()
+      const failures = [
+        ...record.failedApiResponses.slice(requestOffsets.failed),
+        ...record.requestFailures.slice(requestOffsets.request),
+        ...record.api.slice(requestOffsets.api).filter((entry) =>
+          Number(entry.status) >= 400 || entry.networkError || entry.responseError)
+      ]
+      caseRecord.checks.push({
+        name: '本例请求无4xx/5xx及传输失败', passed: failures.length === 0,
+        details: JSON.stringify({ failureCount: failures.length, failures })
+      })
+    }
+    return { token, api, ...recordWorkbenchPageAssertions(caseId, caseRecord) }
+  }
+  const reportMode = workbenchReportMode(caseId, dependencies.env || process.env)
+  if (reportMode && !caseRecord.workbenchReportMode) caseRecord.workbenchReportMode = reportMode
   const writeEnabled = isWorkbenchWriteFixturesEnabled(dependencies.env || process.env) &&
     WORKBENCH_FIXTURE_CASES.has(caseId)
   const settings = dependencies.workbenchConfig || config
-  if (writeEnabled) assertLocalWorkbenchWriteTarget(settings)
+  if (writeEnabled || ['WBF-007', 'WBF-010', 'WBF-011'].includes(caseId)) {
+    assertLocalWorkbenchWriteTarget(settings)
+  }
   const session = await (dependencies.login || login)(page, writeEnabled ? { returnContext: true } : {})
   const token = typeof session === 'string' ? session : session?.token
   const api = (dependencies.createApiClient || createApiClient)({
@@ -259,7 +350,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       return reportPartial(token, api, caseRecord, [targetGate.reason])
     }
     caseRecord.notes.push('opt-in 已确认 local/租户 1；执行本轮专属最小角色/账号夹具，不修改共享授权、门户或业务记录。')
-    return (dependencies.runOwnedWorkbenchCase || runOwnedWorkbenchCase)({
+    const result = await (dependencies.runOwnedWorkbenchCase || runOwnedWorkbenchCase)({
       caseId, page, token, api, record, caseRecord, outputDir, settings,
       sessionTenantId: session?.tenantId
     }, {
@@ -269,6 +360,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       captureWorkbenchReports,
       waitForReportRendering
     })
+    return reportMode?.mode === 'daily-closure'
+      ? finalizeWorkbenchReportClosure(caseId, caseRecord, result) : result
   }
 
   let readGate
@@ -301,15 +394,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       passed: todoHeading.includes('待办'),
       details: `待办中心标题=${todoHeading}`
     })
-    const tileCount = await todoPanel.locator('.todo-tile').count()
+    const tileLabels = await todoPanel.locator('.todo-tile small').allTextContents()
     caseRecord.checks.push({
       name: '待办中心提供来源/状态分面',
-      passed: tileCount > 0,
-      details: `待办分面数=${tileCount}`
+      passed: ['待办', '已办', '抄送', '我发起'].every((label) =>
+        tileLabels.some((actual) => actual.trim() === label)),
+      details: `待办分面=${JSON.stringify(tileLabels)}`
     })
     await saveScreenshot(page, outputDir, 'wbf001-workbench-todo', record)
     caseRecord.evidence.push('WBF-001 校验工作台待办中心作为统一工作入口真实渲染')
-    return { token, api }
+    return finishPageCase()
   }
 
   if (caseId === 'WBF-002') {
@@ -355,7 +449,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     caseRecord.checks.push({
       name: '处理待办不跳转到子系统页面（PB-350）',
-      passed: pathAfter === pathBefore && !pathAfter.includes(PROCESS_DETAIL_PATH),
+      passed: pathBefore === WORKBENCH_PATH && pathAfter === WORKBENCH_PATH &&
+        !pathAfter.includes(PROCESS_DETAIL_PATH),
       details: `点击前=${pathBefore}，点击后=${pathAfter}`
     })
     await (dependencies.saveScreenshot || saveScreenshot)(
@@ -364,7 +459,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     await dialog.locator('.el-dialog__headerbtn').first().click()
     await dialog.waitFor({ state: 'hidden' })
     caseRecord.evidence.push('WBF-002 校验待办在门户内弹窗打开原始单据，不离开工作台路由')
-    return { token, api }
+    return finishPageCase()
   }
 
   if (caseId === 'WBF-003') {
@@ -413,7 +508,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       page, outputDir, 'wbf003-workbench-todo-refresh', record
     )
     caseRecord.evidence.push('WBF-003 校验关闭处理弹窗后待办清单刷新且停留在工作台')
-    return { token, api }
+    return finishPageCase()
   }
 
   if (caseId === 'WBF-004') {
@@ -546,13 +641,23 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     await saveScreenshot(page, outputDir, 'wbf006-user-favorites', record)
     caseRecord.evidence.push('WBF-006 校验跨业务通用关注在工作台统一归集')
-    return { token, api }
+    return finishPageCase()
   }
 
   if (caseId === 'WBF-007') {
-    // 取一条真实采购订单，验证“业务详情页关注 → 工作台我的关注归集”闭环（PB-354/355）
-    const orderPage = await api.get('/erp/purchase-order/page?pageNo=1&pageSize=1')
-    const order = orderPage?.data?.list?.[0]
+    const orderPage = assertBusinessSuccess(
+      await api.get('/erp/purchase-order/page?pageNo=1&pageSize=10'), '采购订单分页'
+    ).data
+    let order
+    for (const candidate of orderPage.list) {
+      const favorite = assertBusinessSuccess(await api.get(
+        `/system/user-favorite/check?bizType=erp_purchase_order&bizId=${encodeURIComponent(candidate.id)}`
+      ), '原关注状态').data
+      if (favorite === false) {
+        order = candidate
+        break
+      }
+    }
     caseRecord.checks.push({
       name: '存在可用于关注验证的采购订单',
       passed: Boolean(order?.id),
@@ -564,83 +669,92 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const bizType = 'erp_purchase_order'
     const bizId = String(order.id)
     const favoriteRoute = `/system/user-favorite/remove?bizType=${bizType}&bizId=${bizId}`
-    // 先清理历史关注，保证按钮处于“未关注”初始态，且用例可重复执行
-    await api.delete(favoriteRoute)
+    // Select an unfavorited order so existing user preferences stay intact.
+    try {
+      await openRoute(page, `/purchase/order/formDetail/${bizId}`)
+      const detailRoot = page.locator('.mainBox').first()
+      const hasDetail = await detailRoot
+        .waitFor({ state: 'visible', timeout: 60000 })
+        .then(() => true)
+        .catch(() => false)
+      const actionGroup = detailRoot.locator('.btnGroup').first()
+      const hasGroup = hasDetail && await actionGroup
+        .waitFor({ state: 'visible', timeout: 60000 })
+        .then(() => true)
+        .catch(() => false)
+      const favoriteButton = actionGroup.getByRole('button', { name: /关注/ }).first()
+      const hasButton = hasGroup && await favoriteButton
+        .waitFor({ state: 'visible', timeout: 60000 })
+        .then(() => true)
+        .catch(() => false)
+      caseRecord.checks.push({
+        name: '业务单据详情页提供通用关注按钮（PB-354）',
+        passed: hasButton,
+        details: hasButton
+          ? '采购订单详情页存在关注按钮'
+          : `详情主容器=${hasDetail}，操作区=${hasGroup}，当前URL=${page.url()}`
+      })
+      if (!hasButton) {
+        caseRecord.notes.push('未在采购订单详情页找到关注按钮，可能为权限或详情页结构差异。')
+        await saveScreenshot(page, outputDir, 'wbf007-favorite-button-missing', record)
+        return finishPageCase()
+      }
+      await favoriteButton.click()
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
+      const check = assertBusinessSuccess(await api.get(
+        `/system/user-favorite/check?bizType=${bizType}&bizId=${bizId}`
+      ), '点击关注后的正式回读')
+      caseRecord.checks.push({
+        name: '点击关注后关注关系落库（PB-354）',
+        passed: check.data === true,
+        details: `关注校验接口返回=${JSON.stringify(check.data)}`
+      })
 
-    await openRoute(page, `/purchase/order/formDetail/${bizId}`)
-    const detailRoot = page.locator('.mainBox').first()
-    const hasDetail = await detailRoot
-      .waitFor({ state: 'visible', timeout: 60000 })
-      .then(() => true)
-      .catch(() => false)
-    const actionGroup = detailRoot.locator('.btnGroup').first()
-    const hasGroup = hasDetail && await actionGroup
-      .waitFor({ state: 'visible', timeout: 60000 })
-      .then(() => true)
-      .catch(() => false)
-    const favoriteButton = actionGroup.getByRole('button', { name: /关注/ }).first()
-    const hasButton = hasGroup && await favoriteButton
-      .waitFor({ state: 'visible', timeout: 60000 })
-      .then(() => true)
-      .catch(() => false)
-    caseRecord.checks.push({
-      name: '业务单据详情页提供通用关注按钮（PB-354）',
-      passed: hasButton,
-      details: hasButton
-        ? '采购订单详情页存在关注按钮'
-        : `详情主容器=${hasDetail}，操作区=${hasGroup}，当前URL=${page.url()}`
-    })
-    if (!hasButton) {
-      caseRecord.notes.push('未在采购订单详情页找到关注按钮，可能为权限或详情页结构差异。')
-      await saveScreenshot(page, outputDir, 'wbf007-favorite-button-missing', record)
-      return { token, api }
+      const favoritePageResponse = page.waitForResponse(
+        response =>
+          response.url().includes('/system/user-favorite/page') &&
+          response.request().method() === 'GET' &&
+          response.ok(),
+        { timeout: 60000 }
+      )
+      await openRoute(page, WORKBENCH_PATH)
+      const favorites = assertBusinessSuccess(
+        await readBrowserResponsePayload(await favoritePageResponse), '工作台关注分页'
+      ).data
+      const sourceMatches = favorites?.list?.filter((row) =>
+        row.bizType === bizType && String(row.bizId) === bizId)
+      if (sourceMatches?.length !== 1) throw new Error('工作台关注分页未返回本轮唯一业务来源')
+      const panel = page.locator('.focus-panel').first()
+      await panel.waitFor({ state: 'visible' })
+      const favoriteTab = panel.getByRole('button', { name: /我的关注/ }).first()
+      if (await favoriteTab.isVisible()) await favoriteTab.click()
+      const expectedTitle = `采购订单 ${order.billNo || order.no || ''}`.trim()
+      const favoriteRow = panel
+        .locator('.focus-body .focus-row')
+        .filter({ hasText: expectedTitle })
+        .first()
+      const collected = await favoriteRow
+        .waitFor({ state: 'visible', timeout: 60000 })
+        .then(() => 1)
+        .catch(() => 0)
+      caseRecord.checks.push({
+        name: '关注单据自动归集到工作台我的关注（PB-355）',
+        passed: collected > 0,
+        details: `bizId=${bizId}; 匹配“${expectedTitle}”的条目数=${collected}`
+      })
+      await saveScreenshot(page, outputDir, 'wbf007-detail-favorite-to-workbench', record)
+      caseRecord.evidence.push('WBF-007 校验详情页关注采购订单后在工作台我的关注中自动归集')
+      return finishPageCase()
+    } finally {
+      assertBusinessSuccess(await api.delete(favoriteRoute), '清理本轮新增关注')
+      const restored = assertBusinessSuccess(await api.get(
+        `/system/user-favorite/check?bizType=${bizType}&bizId=${bizId}`
+      ), '关注清理回读').data
+      caseRecord.checks.push({
+        name: '仅清理本轮新增关注且原有关注不变', passed: restored === false,
+        details: `bizType=${bizType}; bizId=${bizId}; favorite=${restored}`
+      })
     }
-    await favoriteButton.click()
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
-    const check = await api.get(
-      `/system/user-favorite/check?bizType=${bizType}&bizId=${bizId}`
-    )
-    caseRecord.checks.push({
-      name: '点击关注后关注关系落库（PB-354）',
-      passed: check?.data === true,
-      details: `关注校验接口返回=${JSON.stringify(check?.data)}`
-    })
-
-    // The workbench renders an empty state before the async favorite page finishes.
-    // Register the response listener before navigation so the assertion follows the
-    // actual data request instead of racing the initial Vue render.
-    const favoritePageResponse = page.waitForResponse(
-      response =>
-        response.url().includes('/system/user-favorite/page') &&
-        response.request().method() === 'GET' &&
-        response.ok(),
-      { timeout: 60000 }
-    )
-    await openRoute(page, WORKBENCH_PATH)
-    await favoritePageResponse
-    const panel = page.locator('.focus-panel').first()
-    await panel.waitFor({ state: 'visible' })
-    const favoriteTab = panel.getByRole('button', { name: /我的关注/ }).first()
-    if (await favoriteTab.isVisible()) await favoriteTab.click()
-    const expectedTitle = `采购订单 ${order.billNo || order.no || ''}`.trim()
-    const favoriteRow = panel
-      .locator('.focus-body .focus-row')
-      .filter({ hasText: expectedTitle })
-      .first()
-    const collected = await favoriteRow
-      .waitFor({ state: 'visible', timeout: 60000 })
-      .then(() => 1)
-      .catch(() => 0)
-    caseRecord.checks.push({
-      name: '关注单据自动归集到工作台我的关注（PB-355）',
-      passed: collected > 0,
-      details: `匹配“${expectedTitle}”的条目数=${collected}`
-    })
-    await saveScreenshot(page, outputDir, 'wbf007-detail-favorite-to-workbench', record)
-    caseRecord.evidence.push('WBF-007 校验详情页关注采购订单后在工作台我的关注中自动归集')
-    // 清理本用例产生的关注关系，避免污染后续用例
-    await api.delete(favoriteRoute)
-    return { token, api }
   }
 
   if (caseId === 'WBF-008') {
@@ -742,7 +856,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   if (caseId === 'WBF-010') {
     // OA 统一资源预约中心（会议室）与工作台我的日程只读聚合（PB-371）
-    const suffix = String(Date.now()).slice(-6)
+    const suffix = String(Date.now())
     const roomName = `自动化会议室-${suffix}`
     const subject = `自动化会议-${suffix}`
     const conflictSubject = `${subject}-冲突`
@@ -762,9 +876,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
     try {
       await openRoute(page, '/settings/hrm/meeting-room')
-      await page.getByRole('button', { name: '新增会议室' }).first().click()
-      const roomDialog = page.getByRole('dialog').last()
-      await roomDialog.waitFor({ state: 'visible' })
+      const addRoomButton = page.getByRole('button', { name: '新增会议室', exact: true }).first()
+      await addRoomButton.waitFor({ state: 'visible' })
+      await addRoomButton.click()
+      const roomDialog = page.locator('.el-dialog:visible').filter({ hasText: '新增会议室' }).last()
+      await roomDialog.waitFor({ state: 'visible', timeout: 15000 })
       const roomFormItem = (label) =>
         roomDialog.locator('.el-form-item').filter({ hasText: label }).first()
       await roomFormItem('会议室名称').locator('input').first().fill(roomName)
@@ -816,6 +932,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         passed: Boolean(bookingId),
         details: `预约编号=${bookingId || '未落库'}；时间=${startTime} ~ ${endTime}`
       })
+      if (!/^[1-9]\d*$/.test(String(bookingId))) {
+        throw new Error('会议预约未返回正式安全ID，不能验证日程事实源')
+      }
+      const scheduleCopiesBefore = await runReadOnlySql(
+        `SELECT COUNT(*) FROM oa_schedule WHERE tenant_id=1 AND title='${subject}'`
+      )
 
       const conflict = await api.post('/oa/meeting-booking/create', {
         roomId,
@@ -831,15 +953,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         details: `冲突返回 code=${conflict?.code}，msg=${conflict?.msg || ''}`
       })
 
-      const meetingResponse = page.waitForResponse(
-        response =>
-          response.url().includes('/oa/meeting-booking/my-range') &&
-          response.request().method() === 'GET' &&
-          response.ok(),
-        { timeout: 60000 }
-      )
+      const meetings = assertBusinessSuccess(
+        await api.get(`/oa/meeting-booking/my-range?rangeStart=${encodeURIComponent(startTime)}` +
+          `&rangeEnd=${encodeURIComponent(endTime)}`),
+        '工作台OA预约来源'
+      ).data
       await openRoute(page, WORKBENCH_PATH)
-      await meetingResponse
       const schedulePanel = page.locator('.schedule-panel').first()
       await schedulePanel.waitFor({ state: 'visible' })
       await schedulePanel
@@ -872,26 +991,63 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           ? `日程区出现会议主题=${subject}`
           : `日程区未出现会议主题=${subject}`
       })
+      const scheduleCopiesAfter = await runReadOnlySql(
+        `SELECT COUNT(*) FROM oa_schedule WHERE tenant_id=1 AND title='${subject}'`
+      )
+      const originalBooking = Array.isArray(meetings) && meetings.filter((row) =>
+        String(row.id) === String(bookingId) && String(row.roomId) === String(roomId) &&
+        row.subject === subject)
+      caseRecord.checks.push({
+        name: '工作台日程保留OA预约原ID且不复制日程事实',
+        passed: meetingText.includes(subject) && originalBooking?.length === 1 &&
+          scheduleCopiesBefore.available && scheduleCopiesAfter.available &&
+          scheduleCopiesBefore.rows[0]?.[0] === '0' && scheduleCopiesAfter.rows[0]?.[0] === '0',
+        details: JSON.stringify({ bookingId, roomId, originalBooking,
+          before: scheduleCopiesBefore.rows, after: scheduleCopiesAfter.rows })
+      })
       await saveScreenshot(page, outputDir, 'wbf010-meeting-reservation-workbench', record)
       caseRecord.evidence.push('WBF-010 校验会议室台账、时段冲突与工作台 OA 会议只读聚合')
-      return { token, api }
+      return finishPageCase()
     } finally {
-      if (bookingId) {
-        await api
-          .put(`/oa/meeting-booking/cancel?id=${bookingId}`)
-          .catch(() => undefined)
-      } else {
-        const bookingPage = await api
-          .get(`/oa/meeting-booking/page?pageNo=1&pageSize=10&subject=${encodeURIComponent(subject)}`)
-          .catch(() => undefined)
-        const cleanupId = bookingPage?.data?.list?.[0]?.id
-        if (cleanupId) {
-          await api.put(`/oa/meeting-booking/cancel?id=${cleanupId}`).catch(() => undefined)
+      const cleanupErrors = []
+      try {
+        if (!bookingId && roomId) {
+          const bookingPage = assertBusinessSuccess(await api.get(
+            `/oa/meeting-booking/page?pageNo=1&pageSize=100&subject=${encodeURIComponent(subject)}`
+          ), '专属预约清理定位').data
+          bookingId = bookingPage.list.find((row) =>
+            row.subject === subject && String(row.roomId) === String(roomId))?.id
         }
+        if (bookingId) {
+          assertBusinessSuccess(await api.put(`/oa/meeting-booking/cancel?id=${bookingId}`), '取消本轮预约')
+          const cancelled = assertBusinessSuccess(
+            await api.get(`/oa/meeting-booking/get?id=${bookingId}`), '取消预约正式回读'
+          ).data
+          if (cancelled?.status !== 30 || cancelled.subject !== subject ||
+            String(cancelled.roomId) !== String(roomId)) throw new Error('专属预约未正式取消')
+          caseRecord.fixtureResiduals = [...(caseRecord.fixtureResiduals || []), {
+            type: 'oa-meeting-booking', id: String(bookingId), roomId: String(roomId),
+            status: 'CANCELLED', reason: '正式取消预约，保留历史审计'
+          }]
+        }
+      } catch (error) {
+        cleanupErrors.push(error.message)
       }
       if (roomId) {
-        await api.delete(`/oa/meeting-room/delete?id=${roomId}`).catch(() => undefined)
+        try {
+          assertBusinessSuccess(await api.delete(`/oa/meeting-room/delete?id=${roomId}`), '删除本轮会议室')
+          const removed = assertBusinessSuccess(
+            await api.get(`/oa/meeting-room/get?id=${roomId}`), '会议室删除回读'
+          ).data
+          if (removed != null) throw new Error('本轮会议室删除后仍存在')
+        } catch (error) {
+          cleanupErrors.push(error.message)
+        }
       }
+      caseRecord.checks.push({
+        name: '本轮会议室正式删除且预约取消保留审计', passed: cleanupErrors.length === 0,
+        details: JSON.stringify({ roomId, bookingId, cleanupErrors })
+      })
     }
   }
 
@@ -956,8 +1112,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     await submitDialog.getByRole('button', { name: '提交' }).click()
     await submitDialog.waitFor({ state: 'hidden' })
 
-    const pendingAfterSubmit = await api.get('/hrm/survey/my-pending')
-    const stillPending = (pendingAfterSubmit?.data || []).some((item) => item.surveyId === surveyId)
+    const pendingAfterSubmit = assertBusinessSuccess(
+      await api.get('/hrm/survey/my-pending'), '问卷提交后的正式待填写回读'
+    ).data
+    if (!Array.isArray(pendingAfterSubmit)) throw new Error('问卷待填写响应不是正式数组')
+    const stillPending = pendingAfterSubmit.some((item) => String(item.surveyId) === String(surveyId))
     caseRecord.checks.push({
       name: '提交后问卷从待填写清单回收（PB-358）',
       passed: !stillPending,
@@ -979,7 +1138,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     await saveScreenshot(page, outputDir, 'wbf011-survey-collected', record)
     caseRecord.evidence.push('WBF-011 校验发送调查、工作台待填写展示与提交回收链路')
     caseRecord.notes.push('HRM 问卷当前无删除接口，用例保留一条已提交问卷记录，待补作废/删除能力后再实现硬清理。')
-    return { token, api }
+    return finishPageCase()
   }
 
   if (caseId === 'WBF-012') {

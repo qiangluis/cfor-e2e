@@ -8,6 +8,7 @@ import {
 } from '../lib/api.mjs'
 import { assertBusinessSuccess, isBusinessSuccess } from '../lib/assertions.mjs'
 import { createProcurementPermissionReader } from './procurement-permission-reader.mjs'
+import { runIotTenantIsolation } from './iot-tenant-isolation.mjs'
 
 export const IOT_E2E_PREFIX = 'E2E-IOT'
 
@@ -57,8 +58,7 @@ export const IOT_CONTRACT_GAPS = Object.freeze({
     'IOT-002 与 IOT-009 共用正式属性消息链，但告警闭环由 IOT-010 单独验证。'
   ]),
   'IOT-010': Object.freeze([
-    '告警确认与转工单接口没有持久化处置说明，转工单也未校验真实工单归属；本轮不使用虚构工单 ID。',
-    '当前服务允许 ACTIVE/ACKNOWLEDGED 直接解除或关闭，不能把非严格线性状态机登记为完整通过。'
+    '告警生命周期必须按 ACTIVE->ACKNOWLEDGED->WORK_ORDER->RESOLVED->CLOSED 单向推进。'
   ]),
   'IOT-011': Object.freeze([
     '管理员正式发送接口要求真实设备，无法从该入口构造 UNKNOWN_DEVICE；本轮只验证真实 HTTP 目的投递失败。',
@@ -483,7 +483,7 @@ export const verifyIotPermissionRejections = async ({
   caseRecord.evidence.push(
     `IOT-002 专属权限账号拒绝探针：${results.length} 条精确权限 403；设备前后不变=${unchanged}；账号停用=${accountDeactivated}；租户头拒绝=${tenantHeaderRejected}；第二租户数据隔离仍为 GAP。`
   )
-  return { results, unchanged, accountDeactivated, tenantHeaderRejected, gap }
+  return { results, unchanged, accountDeactivated, tenantHeaderRejected, gap, checkNames }
 }
 
 export const expectBusinessRejection = (response, message) => {
@@ -617,7 +617,7 @@ export const createIotNotifyTemplateFixture = async (api, fixtures, options = {}
       code,
       type: 1,
       nickname: marker,
-      content: `${marker} {{configName}} {{deviceName}}`,
+      content: `${marker} {configName} {deviceName}`,
       status: 0,
       remark: `${IOT_E2E_PREFIX} isolated notify template`
     }),
@@ -1114,6 +1114,20 @@ const alertRows = async (api, deviceId, configId) =>
     `&configId=${encodeURIComponent(configId)}`
   )).list
 
+export const hasIotAlertTransferHandlingEvidence = (alert, remark) =>
+  alert?.workOrderId != null &&
+  alert?.transferUserId != null &&
+  Boolean(alert?.transferTime) &&
+  alert?.transferRemark === remark
+
+export const hasIotDeadLetterDedupEvidence = (rows, expected) =>
+  Array.isArray(rows) && rows.length === 1 &&
+  expected?.id != null && String(rows[0]?.id) === String(expected.id) &&
+  rows[0]?.idempotentKey === expected?.idempotentKey &&
+  Boolean(rows[0]?.sourceTime) && rows[0].sourceTime === expected.sourceTime &&
+  Boolean(rows[0]?.sourceVersion) && rows[0].sourceVersion === expected.sourceVersion &&
+  Boolean(rows[0]?.lastError)
+
 export const runIotAlertLifecycleClosure = async ({
   api,
   fixtures,
@@ -1241,6 +1255,58 @@ export const runIotAlertLifecycleClosure = async ({
     details: `alertId=${active.id}, rows=${activeAfterRepeat.length}`
   })
 
+  const expectedTransitionRejection = {
+    code: 1050014001,
+    message: 'IoT 告警记录状态不允许该操作'
+  }
+  const activeResolve = await api.request('PUT', '/iot/alert-record/resolve', {
+    id: active.id,
+    remark: `${IOT_E2E_PREFIX} active illegal resolve`
+  }, { expectedBusinessRejection: expectedTransitionRejection })
+  const activeClose = await api.request('PUT', '/iot/alert-record/close', {
+    id: active.id,
+    remark: `${IOT_E2E_PREFIX} active illegal close`
+  }, { expectedBusinessRejection: expectedTransitionRejection })
+  const activeTransitionsRejected =
+    matchesExpectedBusinessRejection(activeResolve, expectedTransitionRejection) &&
+    matchesExpectedBusinessRejection(activeClose, expectedTransitionRejection)
+
+  const repairOrder = dataOf(await api.postBusiness('/mes/system/order/add', {
+    orderNo: iotE2eMarker('010-REPAIR'),
+    orderContent: `${IOT_E2E_PREFIX} 告警维修工单`,
+    projectName: `${IOT_E2E_PREFIX} 设备项目`,
+    deviceId: device.id,
+    deviceIds: [String(device.id)],
+    priority: '中',
+    faultLevel: '一般',
+    faultCauseCategory: 'iot-alert'
+  }))
+  const repairOrderId = fixtures.track(
+    { code: 0, data: repairOrder?.id },
+    'IoT 告警维修工单',
+    async (id) => {
+      const detail = dataOf(await api.getBusiness(`/mes/system/order/${encodeURIComponent(id)}`))
+      if (!detail) return
+      if (detail.orderStatus !== 'REPORTED') {
+        return {
+          retained: true,
+          reason: `工单已进入 ${detail.orderStatus || '非待派工'}，保留审计`
+        }
+      }
+      assertBusinessSuccess(
+        await api.deleteBusiness(`/mes/system/order/${encodeURIComponent(id)}`),
+        `IoT 告警维修工单清理 id=${id}`
+      )
+    }
+  )
+  caseRecord.checks.push({
+    name: '告警转工单使用当前设备的正式维修工单',
+    passed: String(repairOrder?.id) === String(repairOrderId) &&
+      repairOrder?.orderStatus === 'REPORTED' &&
+      String(repairOrder?.deviceId) === String(device.id),
+    details: `alertId=${active.id}, workOrderId=${repairOrderId}, status=${repairOrder?.orderStatus}`
+  })
+
   assertBusinessSuccess(
     await api.putBusiness('/iot/alert-record/acknowledge', {
       id: active.id,
@@ -1248,6 +1314,57 @@ export const runIotAlertLifecycleClosure = async ({
     }),
     '告警确认'
   )
+  const acknowledgedResolve = await api.request('PUT', '/iot/alert-record/resolve', {
+    id: active.id,
+    remark: `${IOT_E2E_PREFIX} acknowledged illegal resolve`
+  }, { expectedBusinessRejection: expectedTransitionRejection })
+  const acknowledgedClose = await api.request('PUT', '/iot/alert-record/close', {
+    id: active.id,
+    remark: `${IOT_E2E_PREFIX} acknowledged illegal close`
+  }, { expectedBusinessRejection: expectedTransitionRejection })
+  const acknowledgedTransitionsRejected =
+    matchesExpectedBusinessRejection(acknowledgedResolve, expectedTransitionRejection) &&
+    matchesExpectedBusinessRejection(acknowledgedClose, expectedTransitionRejection)
+  assertBusinessSuccess(
+    await api.putBusiness('/iot/alert-record/transfer-work-order', {
+      id: active.id,
+      workOrderId: repairOrderId,
+      remark: `${IOT_E2E_PREFIX} 已转工单`
+    }),
+    '告警转正式维修工单'
+  )
+  const workOrderAlert = dataOf(await api.getBusiness(
+    `/iot/alert-record/get?id=${encodeURIComponent(active.id)}`
+  ))
+  caseRecord.checks.push({
+    name: '告警确认与转工单回读确认说明、责任人和工单关联',
+    passed:
+      workOrderAlert.alertStatus === 'WORK_ORDER' &&
+      String(workOrderAlert.workOrderId) === String(repairOrderId) &&
+      workOrderAlert.acknowledgeRemark === `${IOT_E2E_PREFIX} 已确认` &&
+      workOrderAlert.acknowledgeUserId != null &&
+      Boolean(workOrderAlert.acknowledgeTime),
+    details: `status=${workOrderAlert.alertStatus}, workOrderId=${workOrderAlert.workOrderId}, acknowledgeRemark=${workOrderAlert.acknowledgeRemark}`
+  })
+  const transferRemark = `${IOT_E2E_PREFIX} 已转工单`
+  caseRecord.checks.push({
+    name: '告警转工单持久化责任人、时间与处置说明',
+    passed: hasIotAlertTransferHandlingEvidence(workOrderAlert, transferRemark),
+    details: `workOrderId=${workOrderAlert.workOrderId}; transferUserId=${workOrderAlert.transferUserId ?? 'missing'}; transferTime=${workOrderAlert.transferTime ?? 'missing'}; transferRemark=${workOrderAlert.transferRemark ?? 'missing'}`
+  })
+  const workOrderClose = await api.request('PUT', '/iot/alert-record/close', {
+    id: active.id,
+    remark: `${IOT_E2E_PREFIX} work order illegal close`
+  }, { expectedBusinessRejection: expectedTransitionRejection })
+  const workOrderCloseRejected =
+    matchesExpectedBusinessRejection(workOrderClose, expectedTransitionRejection)
+  caseRecord.checks.push({
+    name: '告警越级解除/关闭按线性状态机拒绝',
+    passed: activeTransitionsRejected && acknowledgedTransitionsRejected && workOrderCloseRejected,
+    details:
+      `ACTIVE=${activeTransitionsRejected}; ACKNOWLEDGED=${acknowledgedTransitionsRejected}; ` +
+      `WORK_ORDER.close=${workOrderCloseRejected}`
+  })
   assertBusinessSuccess(
     await api.putBusiness('/iot/alert-record/resolve', {
       id: active.id,
@@ -1269,21 +1386,18 @@ export const runIotAlertLifecycleClosure = async ({
     id: active.id,
     remark: `${IOT_E2E_PREFIX} illegal`
   }, {
-    expectedBusinessRejection: {
-      code: 1050014001,
-      message: 'IoT 告警记录状态不允许该操作'
-    }
+    expectedBusinessRejection: expectedTransitionRejection
   })
-  const illegalTransitionRejected = matchesExpectedBusinessRejection(illegalTransition, {
-    code: 1050014001,
-    message: 'IoT 告警记录状态不允许该操作'
-  })
+  const illegalTransitionRejected =
+    matchesExpectedBusinessRejection(illegalTransition, expectedTransitionRejection)
   caseRecord.checks.push({
     name: '告警确认/解除/关闭记录责任人、时间和正式处置说明',
     passed:
       closed.alertStatus === 'CLOSED' &&
       closed.acknowledgeUserId != null &&
       Boolean(closed.acknowledgeTime) &&
+      closed.acknowledgeRemark === `${IOT_E2E_PREFIX} 已确认` &&
+      String(closed.workOrderId) === String(repairOrderId) &&
       closed.resolveUserId != null &&
       Boolean(closed.resolveTime) &&
       closed.resolveRemark === `${IOT_E2E_PREFIX} 已解除` &&
@@ -1311,18 +1425,74 @@ export const runIotAlertLifecycleClosure = async ({
   )
   const nextActive = nextCycle.find((row) =>
     String(row.id) !== String(active.id) && row.alertStatus === 'ACTIVE')
+  const activityKeyReleased = Boolean(nextActive?.id)
+  caseRecord.checks.push({
+    name: '解除关闭后活动键释放',
+    passed: activityKeyReleased,
+    details: `closedAlert=${active.id}, nextActive=${nextActive?.id || 'none'}, rows=${nextCycle.length}`
+  })
   if (nextActive?.id) {
+    const secondRepairOrder = dataOf(await api.postBusiness('/mes/system/order/add', {
+      orderNo: iotE2eMarker('010-REPAIR-SECOND'),
+      orderContent: `${IOT_E2E_PREFIX} 第二告警周期维修工单`,
+      projectName: `${IOT_E2E_PREFIX} 设备项目`,
+      deviceId: device.id,
+      deviceIds: [String(device.id)],
+      priority: '中',
+      faultLevel: '一般',
+      faultCauseCategory: 'iot-alert'
+    }))
+    const secondRepairOrderId = fixtures.track(
+      { code: 0, data: secondRepairOrder?.id },
+      'IoT 第二告警周期维修工单',
+      async (id) => {
+        const detail = dataOf(await api.getBusiness(`/mes/system/order/${encodeURIComponent(id)}`))
+        if (!detail) return
+        if (detail.orderStatus !== 'REPORTED') {
+          return {
+            retained: true,
+            reason: `工单已进入 ${detail.orderStatus || '非待派工'}，保留审计`
+          }
+        }
+        assertBusinessSuccess(
+          await api.deleteBusiness(`/mes/system/order/${encodeURIComponent(id)}`),
+          `IoT 第二告警周期维修工单清理 id=${id}`
+        )
+      }
+    )
+    assertBusinessSuccess(
+      await api.putBusiness('/iot/alert-record/acknowledge', {
+        id: nextActive.id,
+        remark: `${IOT_E2E_PREFIX} 第二周期已确认`
+      }),
+      `确认第二告警周期 id=${nextActive.id}`
+    )
+    assertBusinessSuccess(
+      await api.putBusiness('/iot/alert-record/transfer-work-order', {
+        id: nextActive.id,
+        workOrderId: secondRepairOrderId,
+        remark: `${IOT_E2E_PREFIX} 第二周期已转工单`
+      }),
+      `转工单第二告警周期 id=${nextActive.id}`
+    )
+    assertBusinessSuccess(
+      await api.putBusiness('/iot/alert-record/resolve', {
+        id: nextActive.id,
+        remark: `${IOT_E2E_PREFIX} 第二周期已解除`
+      }),
+      `解除第二告警周期 id=${nextActive.id}`
+    )
     assertBusinessSuccess(
       await api.putBusiness('/iot/alert-record/close', {
         id: nextActive.id,
-        remark: `${IOT_E2E_PREFIX} second cycle closed`
+        remark: `${IOT_E2E_PREFIX} 第二周期已关闭`
       }),
       `关闭第二告警周期 id=${nextActive.id}`
     )
   }
   caseRecord.notes.push(
     '告警记录没有删除接口；E2E 将专属告警关闭作为审计保留事实，finally 清理模板、场景规则、告警配置、设备、物模型和产品。' +
-      '本轮不调用转工单接口，因为正式工单 ID 未由本 IoT 夹具创建。'
+      '告警转工单使用本轮专属维修工单，工单保持待派工或按审计规则保留。'
   )
   markIotAssertion(caseRecord, 0, [
     '告警配置正式回读持续/组合/抑制/升级字段'
@@ -1332,11 +1502,15 @@ export const runIotAlertLifecycleClosure = async ({
     '解除关闭后活动键释放'
   ])
   markIotAssertion(caseRecord, 2, [
-    '告警确认/解除/关闭记录责任人、时间和正式处置说明'
-  ], '未创建正式维护工单，无法证明 WORK_ORDER 阶段；服务端允许活动状态直接解除/关闭，完整线性状态机保留 GAP。')
+    '告警确认与转工单回读确认说明、责任人和工单关联',
+    '告警确认/解除/关闭记录责任人、时间和正式处置说明',
+    '告警越级解除/关闭按线性状态机拒绝'
+  ])
   markIotAssertion(caseRecord, 3, [
+    '告警确认与转工单回读确认说明、责任人和工单关联',
+    '告警转工单持久化责任人、时间与处置说明',
     '告警确认/解除/关闭记录责任人、时间和正式处置说明'
-  ], '确认与转工单接口没有持久化处置说明，且转工单未验证真实工单归属；本轮不以请求参数作为持久化事实。')
+  ])
   return { product, device, identifier, configId, sceneRuleId, template, alert: closed }
 }
 
@@ -1636,7 +1810,7 @@ export const runIotDeadLetterClosure = async ({
         method: 'thing.property.post',
         productId: product.id,
         deviceId: device.id,
-        // PROPERTY_POST identifier is not populated by the current message utility.
+        // Keep the source broad; the runtime message still preserves the concrete property identifier.
         identifier: null
       }],
       sinkIds: [sinkId]
@@ -1652,9 +1826,10 @@ export const runIotDeadLetterClosure = async ({
       )
     }
   )
+  const sourceReportTime = new Date().toISOString().slice(0, 19)
   await sendProperty(api, device, identifier, {
     value: 88,
-    reportTime: new Date().toISOString().slice(0, 19),
+    reportTime: sourceReportTime,
     sequenceNo: 11001
   })
   const deadLetters = await waitForCondition(
@@ -1671,12 +1846,46 @@ export const runIotDeadLetterClosure = async ({
       deadLetter.bizType === 'DATA_SINK' &&
       String(deadLetter.refId) === String(sinkId) &&
       String(deadLetter.deviceId) === String(device.id) &&
-      deadLetter.identifier == null &&
+      deadLetter.identifier === identifier &&
       deadLetter.idempotentKey.includes(`${device.id}:`) &&
       deadLetter.idempotentKey.includes(`sink:${sinkId}`) &&
       Boolean(deadLetter.lastError) &&
-      Boolean(deadLetter.sourceTime),
+      Boolean(deadLetter.sourceTime) &&
+      Boolean(deadLetter.sourceVersion),
     details: `deadLetter=${deadLetter.id}, sink=${sinkId}, device=${device.id}`
+  })
+  await sendProperty(api, device, identifier, {
+    value: 88,
+    reportTime: sourceReportTime,
+    sequenceNo: 11001
+  })
+  // Observe the second delivery before accepting unchanged dead-letter evidence.
+  const duplicateRows = await waitForCondition(
+    () => anomalyRows(api, device.id, 'DUPLICATE'),
+    (rows) => Boolean(findAnomaly(rows, 11001)),
+    { label: '死信重投的重复消息已消费' }
+  )
+  const duplicate = requireIotAnomalyEvidence(findAnomaly(duplicateRows, 11001), {
+    type: 'DUPLICATE', deviceId: device.id, identifier,
+    sequenceNo: 11001, qualityCode: 0, value: 88
+  }, '死信重投 DUPLICATE 异常')
+  caseRecord.checks.push({
+    name: '死信重投已消费且关联本轮设备和来源序列号',
+    passed: duplicateRows.filter((row) => String(row.sequenceNo) === '11001').length === 1 &&
+      duplicate.messageId !== deadLetter.messageId,
+    details: `device=${device.id}; sequence=11001; duplicate=${duplicate.id}`
+  })
+  const deduplicatedDeadLetters = await waitForCondition(
+    async () => pageOf(await api.getBusiness(
+      `/iot/write-back-dead-letter/page?pageNo=1&pageSize=100&deviceId=${encodeURIComponent(device.id)}`
+    )).list,
+    (rows) => rows.length === 1 && rows[0].idempotentKey === deadLetter.idempotentKey,
+    { label: '重复回写失败按幂等键去重' }
+  )
+  caseRecord.checks.push({
+    name: '死信按幂等键去重且保留来源时间、版本和最近失败原因',
+    passed: hasIotDeadLetterDedupEvidence(deduplicatedDeadLetters, deadLetter),
+    details: `rows=${deduplicatedDeadLetters.length}; idempotentKey=${deduplicatedDeadLetters[0]?.idempotentKey}; sourceVersion=${deduplicatedDeadLetters[0]?.sourceVersion}`
   })
   assertBusinessSuccess(
     await api.putBusiness('/iot/write-back-dead-letter/handle', {
@@ -1717,8 +1926,9 @@ export const runIotDeadLetterClosure = async ({
     'HTTP 数据目的真实失败后登记唯一 E2E 死信'
   ], '本轮证明 DATA_SINK 投递失败登记；UNKNOWN_DEVICE 需要网关/MQ 入口，管理员发送接口会先拒绝不存在设备。')
   markIotAssertion(caseRecord, 1, [
-    'HTTP 数据目的真实失败后登记唯一 E2E 死信'
-  ], '正式管理员发送每次生成新 messageId，未找到同一死信幂等键重投入口；只记录来源版本与失败原因。')
+    '死信重投已消费且关联本轮设备和来源序列号',
+    '死信按幂等键去重且保留来源时间、版本和最近失败原因'
+  ])
   markIotAssertion(caseRecord, 2, [
     '死信人工接管记录接管人、时间与说明'
   ], '未发现正式 retry executor/job 的可观察状态流转，RETRYING/DEAD_LETTER 状态保留 GAP。')
@@ -1750,7 +1960,17 @@ export const runIotSecurityE2e = async ({
       record,
       runtime: dependencies.runtime || config
     }, dependencies)
-    return { ...result, permissionEvidence }
+    let tenantIsolation
+    if (page || dependencies.runIotTenantIsolation) {
+      tenantIsolation = await (dependencies.runIotTenantIsolation || runIotTenantIsolation)({
+        context, api, caseRecord
+      }, dependencies)
+      markIotAssertion(caseRecord, 3, [
+        ...(permissionEvidence.checkNames || []),
+        ...(tenantIsolation.isolationCheckNames || []),
+      ])
+    }
+    return { ...result, permissionEvidence, tenantIsolation }
   }
   if (caseId === 'IOT-009') return runIotAnomalyClosure(context)
   if (caseId === 'IOT-010') return runIotAlertLifecycleClosure(context)

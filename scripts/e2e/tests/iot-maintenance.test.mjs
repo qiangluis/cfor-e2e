@@ -21,7 +21,7 @@ test('MAINT-011 unwraps CommonResult data before reading business payloads', () 
 })
 
 test('MAINT-011 uses the menu-derived device status route', () => {
-  assert.equal(MAINT_011_DEVICE_STATUS_ROUTE, '/settings/iot/device-status')
+  assert.equal(MAINT_011_DEVICE_STATUS_ROUTE, '/iot/maintenance/device-status')
 })
 
 test('MAINT-011 does not treat empty status and repair facts as complete evidence', () => {

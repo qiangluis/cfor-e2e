@@ -41,7 +41,8 @@ const menuChain = (menu, byId) => {
   while (current) {
     const id = String(current.id ?? '')
     if (!/^[1-9]\d*$/.test(id)) return { chain, reason: '菜单编号非法' }
-    if (!seen.add(id)) return { chain, reason: `菜单父链存在循环：${id}` }
+    if (seen.has(id)) return { chain, reason: `菜单父链存在循环：${id}` }
+    seen.add(id)
     chain.push(current)
     if (String(current.parentId ?? '0') === '0') return { chain }
     current = byId.get(String(current.parentId))
@@ -53,7 +54,8 @@ const menuChain = (menu, byId) => {
 const isDescendantOf = (menu, ancestorIds, byId) => {
   const seen = new Set()
   let parentId = menu?.parentId
-  while (parentId != null && String(parentId) !== '0' && seen.add(String(parentId))) {
+  while (parentId != null && String(parentId) !== '0' && !seen.has(String(parentId))) {
+    seen.add(String(parentId))
     if (ancestorIds.has(String(parentId))) return true
     parentId = byId.get(String(parentId))?.parentId
   }
@@ -62,7 +64,8 @@ const isDescendantOf = (menu, ancestorIds, byId) => {
 
 /**
  * 从标准套餐 111 派生一个仅包含已启用完整父链的专属套餐菜单集。
- * 强制租户管理员基础菜单不能越过 111 的既有授权边界。
+ * Backend bootstrap adds enabled base-management menus independently of the package.
+ * Business permissions remain bounded by package 111; this fixture never expands it.
  */
 export const buildPmsIsolationPackage = ({ standardPackage, menus, assignableMenus = menus }) => {
   const sourceMenuIds = new Set((standardPackage?.menuIds || []).map(String))
@@ -71,7 +74,11 @@ export const buildPmsIsolationPackage = ({ standardPackage, menus, assignableMen
   const flatMenus = flattenMenus(menus)
   const byId = new Map(flatMenus.map((menu) => [String(menu.id), menu]))
   const assignableIds = new Set(flattenMenus(assignableMenus).map((menu) => String(menu.id)))
-  const baseMenus = flatMenus.filter((menu) => BASE_COMPONENTS.includes(menu.component))
+  const enabledMenus = flatMenus.filter((menu) => {
+    const { chain, reason } = menuChain(menu, byId)
+    return !reason && chain.every(menuState)
+  })
+  const baseMenus = enabledMenus.filter((menu) => BASE_COMPONENTS.includes(menu.component))
   const missingComponents = BASE_COMPONENTS.filter((component) =>
     !baseMenus.some((menu) => menu.component === component))
   if (missingComponents.length) {
@@ -79,16 +86,16 @@ export const buildPmsIsolationPackage = ({ standardPackage, menus, assignableMen
   }
 
   const baseIds = new Set(baseMenus.map((menu) => String(menu.id)))
-  const forcedMenus = flatMenus.filter((menu) =>
+  const forcedMenus = enabledMenus.filter((menu) =>
     baseIds.has(String(menu.id)) || isDescendantOf(menu, baseIds, byId))
   const forcedIssues = []
   for (const menu of forcedMenus) {
     const { chain, reason } = menuChain(menu, byId)
     for (const node of chain) {
-      if (!sourceMenuIds.has(String(node.id))) {
-        forcedIssues.push(`强制菜单越过111授权：${node.id}`)
-      }
-      if (!menuState(node) || !assignableIds.has(String(node.id))) {
+      // The simple-menu endpoint is package-scoped, unlike cross-tenant bootstrap.
+      // The backend still authorizes the platform administrator for every grant.
+      if (!menuState(node) || (sourceMenuIds.has(String(node.id)) &&
+          !assignableIds.has(String(node.id)))) {
         forcedIssues.push(`强制菜单或父链已停用：${node.id}`)
       }
     }

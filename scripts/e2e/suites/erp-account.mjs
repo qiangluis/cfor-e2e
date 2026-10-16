@@ -1,9 +1,46 @@
-import { createApiClient } from '../lib/api.mjs'
+import path from 'node:path'
+import { createApiClient, isBusinessRejection } from '../lib/api.mjs'
 import { config } from '../config/index.mjs'
 import { assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
-import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { login, openRoute, saveScreenshot, waitForPageReady } from '../lib/browser.mjs'
+import { decryptResponse, ENCRYPT_HEADER } from '../lib/crypto.mjs'
 
 export const cases = ['ERP-ACCOUNT-001']
+
+export const ACCOUNT_CATALOG_ASSERTIONS = Object.freeze([
+  '账户编码、账户类型和有效期字段可见',
+  '真实账号列表默认仅保留后四位'
+])
+// The formal list renders both dates in one column, not two date headers.
+export const ACCOUNT_SETTING_HEADERS = Object.freeze([
+  '账户编码', '账户类型', '真实账号', '有效期'
+])
+const acceptanceCheckNames = Object.freeze([
+  [
+    '账户分页按唯一编码回读自建账户并保持脱敏',
+    '企业资金账户设置页真实列头包含账户编码、账户类型和有效期',
+    '设置页按专属编码显示账户类型与有效期'
+  ],
+  [
+    '正式 API 回读账户主档字段、启用状态和默认脱敏',
+    '敏感详情权限接口仅在显式敏感权限下回读完整账号',
+    '账户分页按唯一编码回读自建账户并保持脱敏',
+    '设置页自建账户真实账号默认脱敏且完整号不出现'
+  ]
+])
+export const ACCOUNT_REQUIRED_CHECKS = Object.freeze([
+  '写侧环境锁定为本地 9151/48083 与租户 1',
+  '真实 Chrome 登录上下文确认租户 1',
+  '写侧所需账户查询、创建、敏感查询和删除权限齐备',
+  '显式 opt-in 后创建唯一 E2E 企业资金账户',
+  ...new Set(acceptanceCheckNames.flat()),
+  '设置页按专属编码请求正式分页且业务成功',
+  '启用状态账户进入精简列表且未改变默认账户设置',
+  '重复账户编码被正式 API 拒绝',
+  '生效日期晚于失效日期被正式 API 拒绝',
+  '删除后账户详情接口返回成功且不再有数据',
+  '仅清理本轮自建且未引用的账户夹具'
+])
 
 export const WRITE_FIXTURE_ENV = 'CFOR_E2E_WRITE_FIXTURES'
 export const ACCOUNT_REFERENCE_COLUMNS = Object.freeze([
@@ -52,10 +89,151 @@ export const maskAccountNo = (value) => {
 }
 
 export const isExpectedAccountRejection = (response, expectedMessage) =>
-  response?.code !== undefined &&
-  response.code !== 0 &&
-  response.code !== 500 &&
+  isBusinessRejection(response) &&
   String(response?.msg || response?.message || '').includes(expectedMessage)
+
+// Do not rely on the shared redactor for accountNo, including error payloads.
+export const createAccountApiClient = ({ token, record } = {}) => {
+  let lastEntry
+  const client = createApiClient({
+    token,
+    record: {
+      api: {
+        push (entry) {
+          lastEntry = entry
+          record?.api?.push({ ...entry, bodySummary: '[ACCOUNT RESPONSE OMITTED]' })
+        }
+      }
+    }
+  })
+  return Object.fromEntries(Object.entries(client).map(([name, method]) => [
+    name,
+    async (...args) => {
+      lastEntry = undefined
+      try {
+        return await method.apply(client, args)
+      } catch {
+        throw new Error(
+          `ERP account ${name} failure: HTTP=${lastEntry?.status ?? 'transport'}, ` +
+          `code=${lastEntry?.code ?? 'n/a'}`
+        )
+      }
+    }
+  ]))
+}
+
+const normalizedText = (value) => String(value ?? '').replace(/\s+/g, ' ').trim()
+const hasAccountSample = (fixture) =>
+  isStableAccountId(fixture?.id) &&
+  typeof fixture?.no === 'string' && fixture.no.length > 0 &&
+  typeof fixture?.accountNo === 'string' && /^\d{5,}$/.test(fixture.accountNo) &&
+  /^\d{4}-\d{2}-\d{2}$/.test(fixture?.effectiveFrom || '') &&
+  /^\d{4}-\d{2}-\d{2}$/.test(fixture?.effectiveTo || '')
+
+export const accountRowEvidence = (row, fixture) => ({
+  sampleMatched: hasAccountSample(fixture) && String(row?.id) === String(fixture.id),
+  codeMatched: row?.no === fixture?.no,
+  typeMatched: row?.accountType === fixture?.accountType,
+  validityMatched: row?.effectiveFrom === fixture?.effectiveFrom &&
+    row?.effectiveTo === fixture?.effectiveTo,
+  enabled: row?.status === 0,
+  notDefault: row?.defaultStatus !== true,
+  masked: hasAccountSample(fixture) && row?.accountNo === maskAccountNo(fixture.accountNo) &&
+    row.accountNo !== fixture.accountNo,
+  fullAccountAbsent: hasAccountSample(fixture) &&
+    !JSON.stringify(row ?? null).includes(fixture.accountNo)
+})
+
+export const accountPageEvidence = (response, fixture) => {
+  const data = dataOf(response)
+  const rows = Array.isArray(data?.list) ? data.list : []
+  return {
+    businessSuccess: response?.code === 0 && response.success !== false,
+    pageValid: Array.isArray(data?.list) && Number.isSafeInteger(data.total) && data.total >= 0,
+    sampleCount: rows.length,
+    uniqueSample: data?.total === 1 && rows.length === 1,
+    ...accountRowEvidence(rows[0], fixture),
+    fullAccountAbsent: hasAccountSample(fixture) &&
+      !JSON.stringify(data ?? null).includes(fixture.accountNo)
+  }
+}
+
+export const accountSettingEvidence = ({ url, headers = [], rows = [], bodyText = '' }, fixture) => {
+  const column = (label) => headers.indexOf(label)
+  const matchingRows = rows.filter((cells) => cells[column('账户编码')] === fixture?.no)
+  const cells = matchingRows[0] || []
+  const accountType = normalizedText(cells[column('账户类型')])
+  return {
+    routeMatched: new URL(url).pathname === '/systemModel/base/account',
+    headersMatched: ACCOUNT_SETTING_HEADERS.every((label) =>
+      headers.filter((header) => header === label).length === 1),
+    sampleCount: matchingRows.length,
+    uniqueSample: hasAccountSample(fixture) && rows.length === 1 && matchingRows.length === 1,
+    codeMatched: hasAccountSample(fixture) && cells[column('账户编码')] === fixture.no,
+    typeVisible: Boolean(accountType) && !['-', 'undefined', 'null'].includes(accountType),
+    validityMatched: hasAccountSample(fixture) &&
+      normalizedText(cells[column('有效期')]) === `${fixture.effectiveFrom} ~ ${fixture.effectiveTo}`,
+    masked: hasAccountSample(fixture) &&
+      normalizedText(cells[column('真实账号')]) === maskAccountNo(fixture.accountNo),
+    fullAccountAbsent: hasAccountSample(fixture) &&
+      !bodyText.includes(fixture.accountNo) &&
+      !JSON.stringify(rows).includes(fixture.accountNo)
+  }
+}
+
+const evidenceKeys = {
+  '正式 API 回读账户主档字段、启用状态和默认脱敏': [
+    'sampleMatched', 'codeMatched', 'typeMatched', 'validityMatched', 'enabled',
+    'notDefault', 'masked', 'fullAccountAbsent', 'currencyMatched'
+  ],
+  '敏感详情权限接口仅在显式敏感权限下回读完整账号': ['sampleMatched', 'fullAccountMatched'],
+  '账户分页按唯一编码回读自建账户并保持脱敏': [
+    'businessSuccess', 'pageValid', 'uniqueSample', 'sampleMatched', 'codeMatched',
+    'typeMatched', 'validityMatched', 'enabled', 'notDefault', 'masked', 'fullAccountAbsent'
+  ],
+  '企业资金账户设置页真实列头包含账户编码、账户类型和有效期': [
+    'routeMatched', 'headersMatched'
+  ],
+  '设置页按专属编码显示账户类型与有效期': [
+    'uniqueSample', 'codeMatched', 'typeVisible', 'validityMatched'
+  ],
+  '设置页自建账户真实账号默认脱敏且完整号不出现': [
+    'uniqueSample', 'masked', 'fullAccountAbsent'
+  ]
+}
+const evidencePassed = (name, evidence) =>
+  evidenceKeys[name].every((key) => evidence?.[key] === true)
+
+export const accountCatalogEvidence = (caseRecord, { writeEnabled = false, sampleObserved = false } = {}) => {
+  const checks = Array.isArray(caseRecord.checks) ? caseRecord.checks : []
+  const matches = (name) => checks.filter((check) => check.name === name)
+  const missing = ACCOUNT_REQUIRED_CHECKS.filter((name) =>
+    matches(name).length !== 1 || matches(name)[0].passed !== true)
+  const uniqueChecks = new Set(checks.map((check) => check.name)).size === checks.length
+  const closure = writeEnabled === true && sampleObserved === true && uniqueChecks &&
+    missing.length === 0 && checks.every((check) => check.passed === true)
+  caseRecord.catalogAssertions = ACCOUNT_CATALOG_ASSERTIONS.map((assertion, index) => {
+    const names = acceptanceCheckNames[index]
+    const verified = closure && names.every((name) =>
+      evidencePassed(name, matches(name)[0]?.evidence))
+    return {
+      index,
+      assertion,
+      status: verified ? 'VERIFIED' : 'GAP',
+      evidenceChecks: [...names],
+      details: verified ? '本轮专属账户 API、真实表格与安全清理证据齐备'
+        : `本轮证据未闭合：writeEnabled=${writeEnabled === true}, ` +
+          `sampleObserved=${sampleObserved === true}, uniqueChecks=${uniqueChecks}, ` +
+          `missingOrFailed=${missing.length}`
+    }
+  })
+  caseRecord.remainingAssertions = caseRecord.catalogAssertions
+    .filter((item) => item.status === 'GAP').map((item) => item.assertion)
+  caseRecord.acceptanceComplete = closure && caseRecord.remainingAssertions.length === 0
+  caseRecord.passCandidate = caseRecord.acceptanceComplete
+  caseRecord.partial = !caseRecord.acceptanceComplete
+  return caseRecord
+}
 
 export const assertLocalAccountWriteTarget = ({
   target,
@@ -106,6 +284,8 @@ const accountFixtureBody = () => {
     accountType: 'BANK',
     accountNo,
     currency: 'CNY',
+    effectiveFrom: '2026-01-01',
+    effectiveTo: '2099-12-31',
     status: 0,
     sort: 999,
     openingBank: 'E2E 测试银行',
@@ -126,12 +306,102 @@ const addCheck = (caseRecord, name, passed, details = '') => {
   caseRecord.checks.push({ name, passed: Boolean(passed), details })
 }
 
-const cleanupAccountFixture = async ({ api, fixture, caseRecord }) => {
+const addEvidenceCheck = (caseRecord, name, evidence) => {
+  caseRecord.checks.push({
+    name,
+    passed: evidencePassed(name, evidence),
+    evidence,
+    details: JSON.stringify(evidence)
+  })
+}
+
+export const withAccountPagePrivacy = async (page, action, { tracePath } = {}) => {
+  const tracing = page.context().tracing
+  if (!tracing?.stop || !tracing?.start) {
+    throw new Error('BLOCKED: 账户页面检查必须能暂停敏感数据 trace')
+  }
+  if (tracePath) await tracing.stop({ path: tracePath })
+  else await tracing.stop()
+  try {
+    return await action()
+  } finally {
+    // No screenshot or DOM snapshot may retain an unexpected unmasked response.
+    await page.goto('about:blank', { waitUntil: 'domcontentloaded' })
+    await tracing.start({ screenshots: true, snapshots: true, sources: false })
+  }
+}
+
+export const readAccountPageResponse = async (response) => {
+  try {
+    const text = await response.text()
+    return response.headers()[ENCRYPT_HEADER.toLowerCase()] === 'true'
+      ? decryptResponse(text) : JSON.parse(text)
+  } catch {
+    throw new Error(`账户设置页分页响应不可解析：HTTP=${response.status()}`)
+  }
+}
+
+const inspectAccountSetting = async ({ page, fixture, caseRecord, outputDir, record }) =>
+  withAccountPagePrivacy(page, async () => {
+    await openRoute(page, '/systemModel/base/account', { readyText: '账户编码' })
+    if (fixture?.id) {
+      await page.getByPlaceholder('请输入账户编码', { exact: true }).fill(fixture.no)
+      const [response] = await Promise.all([
+        page.waitForResponse((response) => {
+          const url = new URL(response.url())
+          return url.pathname === '/admin-api/erp/account/page' &&
+            url.searchParams.get('no') === fixture.no &&
+            response.request().method() === 'GET'
+        }),
+        page.getByRole('button', { name: '搜索', exact: true }).click()
+      ])
+      const payload = await readAccountPageResponse(response)
+      const evidence = accountPageEvidence(payload, fixture)
+      addCheck(caseRecord, '设置页按专属编码请求正式分页且业务成功',
+        response.ok() && evidence.businessSuccess && evidence.uniqueSample,
+        `HTTP=${response.status()}, code=${payload?.code ?? 'n/a'}, rows=${evidence.sampleCount}`)
+      if (!response.ok() || !evidence.businessSuccess) {
+        throw new Error(`账户设置页分页失败：HTTP=${response.status()}, code=${payload?.code ?? 'n/a'}`)
+      }
+      await waitForPageReady(page)
+    }
+    const table = page.locator('.el-table').first()
+    const headers = await table.locator('.el-table__header-wrapper th').allTextContents()
+    const rows = await table.locator('.el-table__body-wrapper tr.el-table__row').evaluateAll((rows) =>
+      rows.map((row) => [...row.querySelectorAll('td')].map((cell) =>
+        String(cell.textContent || '').replace(/\s+/g, ' ').trim()
+      ))
+    )
+    const evidence = accountSettingEvidence({
+      url: page.url(),
+      headers: headers.map(normalizedText),
+      rows,
+      bodyText: await page.locator('body').innerText()
+    }, fixture)
+    addEvidenceCheck(caseRecord,
+      '企业资金账户设置页真实列头包含账户编码、账户类型和有效期', evidence)
+    if (fixture?.id) {
+      addEvidenceCheck(caseRecord, '设置页按专属编码显示账户类型与有效期', evidence)
+      addEvidenceCheck(caseRecord, '设置页自建账户真实账号默认脱敏且完整号不出现', evidence)
+      if (evidence.uniqueSample && evidence.masked && evidence.fullAccountAbsent) {
+        await saveScreenshot(page, outputDir, 'erp-account', record)
+      } else {
+        caseRecord.notes.push('GAP: 页面样本或默认脱敏未通过，未保存可能含完整账号的截图。')
+      }
+    } else {
+      caseRecord.notes.push('GAP: 无本轮专属账户，未以既有行或空表替代页面脱敏证据，未保存账户截图。')
+    }
+  }, { tracePath: path.resolve(outputDir, '..', 'trace', 'erp-account-before-private-page.zip') })
+
+export const cleanupAccountFixture = async ({
+  api, fixture, caseRecord, readReferences = runReadOnlySql
+}) => {
   if (!fixture?.id) return
 
   const detailResponse = await api.get(`/erp/account/get?id=${encodeURIComponent(fixture.id)}`)
   const detail = dataOf(detailResponse)
   const owned =
+    detailResponse?.code === 0 &&
     String(detail?.id) === String(fixture.id) &&
     detail?.no === fixture.no &&
     detail?.remark === fixture.remark
@@ -142,7 +412,7 @@ const cleanupAccountFixture = async ({ api, fixture, caseRecord }) => {
     return
   }
 
-  const referenceResult = await runReadOnlySql(buildAccountReferenceSql(fixture.id))
+  const referenceResult = await readReferences(buildAccountReferenceSql(fixture.id))
   if (!referenceResult.available) {
     const message = `未取得账户引用只读证据：${referenceResult.reason}`
     caseRecord.notes.push(`未清理夹具 id=${fixture.id}：${message}`)
@@ -155,6 +425,16 @@ const cleanupAccountFixture = async ({ api, fixture, caseRecord }) => {
     accountId: fixture.id,
     references
   }]
+  const completeReferences = references.length === ACCOUNT_REFERENCE_COLUMNS.length &&
+    ACCOUNT_REFERENCE_COLUMNS.every(([table, column]) =>
+      references.filter((item) => item.reference === `${table}.${column}`).length === 1) &&
+    references.every((item) => Number.isSafeInteger(item.count) && item.count >= 0)
+  if (!completeReferences) {
+    const message = '引用证据缺失、重复或计数无效，禁止删除'
+    caseRecord.notes.push(`未清理夹具 id=${fixture.id}：${message}`)
+    addCheck(caseRecord, '仅清理本轮自建且未引用的账户夹具', false, message)
+    return
+  }
   const used = references.filter((item) => item.count > 0)
   if (used.length) {
     const message = `账户已存在业务引用，禁止删除：${used.map((item) => `${item.reference}=${item.count}`).join(', ')}`
@@ -181,9 +461,10 @@ const cleanupAccountFixture = async ({ api, fixture, caseRecord }) => {
   const pageAfterDelete = await api.get(
     `/erp/account/page?pageNo=1&pageSize=100&no=${encodeURIComponent(fixture.no)}`
   )
-  const pageRows = Array.isArray(pageAfterDelete?.data?.list) ? pageAfterDelete.data.list : []
   const pageAbsent = pageAfterDelete?.code === 0 &&
-    !pageRows.some((row) => String(row?.id) === String(fixture.id))
+    Array.isArray(pageAfterDelete?.data?.list) &&
+    pageAfterDelete.data.list.length === 0 &&
+    pageAfterDelete.data.total === 0
   const passed = deleteValue === true && pageAbsent
   addCheck(
     caseRecord,
@@ -194,7 +475,7 @@ const cleanupAccountFixture = async ({ api, fixture, caseRecord }) => {
   if (!passed) caseRecord.notes.push(`未清理夹具 id=${fixture.id}：删除响应或分页消失校验失败`)
 }
 
-const checkExpectedRejection = async (caseRecord, apiCall, label, message) => {
+export const checkExpectedAccountRejection = async (caseRecord, apiCall, label, message) => {
   let response
   try {
     response = await apiCall()
@@ -207,12 +488,13 @@ const checkExpectedRejection = async (caseRecord, apiCall, label, message) => {
     caseRecord,
     label,
     passed,
-    `code=${response?.code ?? 'n/a'}, msg=${String(response?.msg || response?.message || '').slice(0, 160)}`
+    `code=${response?.code ?? 'n/a'}, expectedDomainMessageMatched=${passed}`
   )
   return passed
 }
 
 export const runCase = async ({ page, record, caseRecord, outputDir }) => {
+  accountCatalogEvidence(caseRecord)
   assertLocalAccountWriteTarget({
     target: config.target,
     webBase: config.webBase,
@@ -224,9 +506,10 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
   const loginContext = await login(page, { returnContext: true })
   const token = loginContext.token
-  const api = createApiClient({ token, record })
+  const api = createAccountApiClient({ token, record })
   const writeEnabled = isWriteFixturesEnabled()
   let fixture
+  let sampleObserved = false
 
   const permission = await api.getPermissionInfo()
   const permissions = permission?.data?.permissions || []
@@ -259,31 +542,12 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
   }
 
   try {
-    const result = await api.get('/erp/account/page?pageNo=1&pageSize=100')
-    const rows = Array.isArray(result?.data?.list) ? result.data.list : []
-    const shapeValid = Array.isArray(result?.data?.list)
-    const maskedRowsValid = rows.every(
-      (row) =>
-        row?.no &&
-        row?.accountType !== undefined &&
-        (!row?.accountNo || /^\*{4}\d{0,4}$/.test(row.accountNo))
-    )
-    addCheck(
-      caseRecord,
-      '企业资金账户分页返回主档字段且真实账号默认脱敏',
-      shapeValid && (rows.length === 0 || maskedRowsValid),
-      `rows=${rows.length}`
-    )
-    if (!rows.length) {
-      caseRecord.notes.push('只读分页当前为空，未取得既有账户的字段/脱敏样本；不以空集判完整通过。')
-    }
-
     if (writeEnabled) {
       fixture = accountFixtureBody()
       const created = await api.postBusiness('/erp/account/create', fixture)
       fixture.id = dataOf(created)
       if (!isStableAccountId(fixture.id)) {
-        throw new Error(`创建接口返回无效账户 ID：${JSON.stringify(fixture.id)}`)
+        throw new Error('创建接口未返回可安全清理的账户 ID')
       }
       caseRecord.fixtures = [{
         kind: 'erp-account',
@@ -298,47 +562,29 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
       const maskedDetail = dataOf(await api.getBusiness(
         `/erp/account/get?id=${encodeURIComponent(fixture.id)}`
       ))
-      const sensitiveApi = createApiClient({ token })
-      const sensitiveDetail = dataOf(await sensitiveApi.getBusiness(
+      const sensitiveDetail = dataOf(await api.getBusiness(
         `/erp/account/get-sensitive?id=${encodeURIComponent(fixture.id)}`
       ))
-      addCheck(
+      addEvidenceCheck(
         caseRecord,
         '正式 API 回读账户主档字段、启用状态和默认脱敏',
-        maskedDetail?.id &&
-          String(maskedDetail.id) === String(fixture.id) &&
-          maskedDetail.no === fixture.no &&
-          maskedDetail.accountType === 'BANK' &&
-          maskedDetail.currency === 'CNY' &&
-          maskedDetail.status === 0 &&
-          maskedDetail.defaultStatus !== true &&
-          maskedDetail.accountNo === maskAccountNo(fixture.accountNo) &&
-          maskedDetail.accountNo !== fixture.accountNo,
-        `id=${maskedDetail?.id}, status=${maskedDetail?.status}, accountNo=${maskedDetail?.accountNo || 'empty'}`
+        { ...accountRowEvidence(maskedDetail, fixture), currencyMatched: maskedDetail?.currency === 'CNY' }
       )
-      addCheck(
+      addEvidenceCheck(
         caseRecord,
         '敏感详情权限接口仅在显式敏感权限下回读完整账号',
-        sensitiveDetail?.id &&
-          String(sensitiveDetail.id) === String(fixture.id) &&
-          sensitiveDetail.accountNo === fixture.accountNo,
-        `id=${sensitiveDetail?.id}, fullAccountMatched=${sensitiveDetail?.accountNo === fixture.accountNo}`
+        {
+          sampleMatched: String(sensitiveDetail?.id) === String(fixture.id),
+          fullAccountMatched: sensitiveDetail?.accountNo === fixture.accountNo
+        }
       )
 
-      const targetedPage = dataOf(await api.getBusiness(
+      const targetedPage = await api.getBusiness(
         `/erp/account/page?pageNo=1&pageSize=100&no=${encodeURIComponent(fixture.no)}`
-      ))
-      const targetedRows = targetedPage?.list || []
-      const targetedRow = targetedRows.find((row) => String(row?.id) === String(fixture.id))
-      addCheck(
-        caseRecord,
-        '账户分页按唯一编码回读自建账户并保持脱敏',
-        Boolean(targetedRow) &&
-          targetedRow.no === fixture.no &&
-          targetedRow.accountNo === maskAccountNo(fixture.accountNo) &&
-          targetedRow.status === 0,
-        `hits=${targetedRows.length}, accountNo=${targetedRow?.accountNo || 'missing'}`
       )
+      const pageEvidence = accountPageEvidence(targetedPage, fixture)
+      sampleObserved = pageEvidence.uniqueSample && pageEvidence.sampleMatched && pageEvidence.codeMatched
+      addEvidenceCheck(caseRecord, '账户分页按唯一编码回读自建账户并保持脱敏', pageEvidence)
 
       const simpleList = dataOf(await api.getBusiness('/erp/account/simple-list'))
       addCheck(
@@ -350,17 +596,20 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
         `simpleListRows=${Array.isArray(simpleList) ? simpleList.length : 'invalid'}`
       )
 
-      await checkExpectedRejection(
+      await checkExpectedAccountRejection(
         caseRecord,
         () => api.post('/erp/account/create', {
           ...fixture,
           name: `${fixture.name} duplicate`,
           id: undefined
-        }),
+        }, { expectedBusinessRejection: {
+          code: 1030600002,
+          message: `已存在编码为【${fixture.no}】的结算账户`
+        } }),
         '重复账户编码被正式 API 拒绝',
         '已存在编码'
       )
-      await checkExpectedRejection(
+      await checkExpectedAccountRejection(
         caseRecord,
         () => api.post('/erp/account/create', {
           ...fixture,
@@ -368,28 +617,30 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
           no: `${fixture.no}-INVALID-RANGE`,
           effectiveFrom: '2026-10-10',
           effectiveTo: '2026-10-01'
-        }),
+        }, { expectedBusinessRejection: {
+          code: 1030600003,
+          message: '结算账户生效日期不能晚于失效日期'
+        } }),
         '生效日期晚于失效日期被正式 API 拒绝',
         '生效日期不能晚于失效日期'
       )
+    } else {
+      const result = await api.getBusiness('/erp/account/page?pageNo=1&pageSize=100')
+      const rows = result?.data?.list
+      const shapeValid = Array.isArray(rows)
+      if (shapeValid && rows.length > 0) {
+        addCheck(caseRecord, '只读账户分页非空样本默认脱敏',
+          rows.every((row) => !row?.accountNo || /^\*{4}\d{0,4}$/.test(row.accountNo)),
+          `rows=${rows.length}`)
+      }
+      caseRecord.notes.push('GAP: 未开启写旗；既有账户、空列表和 HTTP 成功不作为本轮专属证据。')
     }
 
-    await openRoute(page, '/systemModel/base/account', { readyText: '账户编码' })
-    const bodyText = await page.locator('body').innerText()
-    addCheck(
-      caseRecord,
-      '企业资金账户设置页真实渲染',
-      page.url().includes('/systemModel/base/account') &&
-        bodyText.includes('账户编码') &&
-        bodyText.includes('账户类型') &&
-        bodyText.includes('真实账号'),
-      page.url()
-    )
-    await saveScreenshot(page, outputDir, 'erp-account', record)
+    await inspectAccountSetting({ page, fixture, caseRecord, outputDir, record })
     caseRecord.evidence.push(
       writeEnabled
         ? '真实 Chrome 登录、唯一 E2E 账户创建、正式 API 回读、反例和引用保护清理'
-        : '真实 Chrome 登录、账户分页脱敏契约和企业资金账户设置页截图'
+        : '真实 Chrome 登录和设置页列头检查；无本轮专属样本，保留 GAP'
     )
   } finally {
     if (writeEnabled && fixture?.id) {
@@ -404,17 +655,16 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
         addCheck(caseRecord, '仅清理本轮自建且未引用的账户夹具', false, error.message)
       }
     }
+    accountCatalogEvidence(caseRecord, { writeEnabled, sampleObserved })
   }
 
-  // Catalog acceptance for this case is limited to field visibility and default
-  // account masking. When the write fixture ran and every check passed, the case
-  // is fully closed; the broader ERP/FMS accounting scope is recorded as evidence,
-  // not as a blocking gap. Without opt-in it stays an honest read-only PARTIAL.
-  const writeClosureComplete = writeEnabled &&
-    caseRecord.checks.length > 0 &&
-    caseRecord.checks.every((check) => check.passed === true)
-  const note = writeEnabled
-    ? 'ERP-ACCOUNT-001 写侧夹具闭环已执行（创建/回读/默认脱敏/唯一与日期反例/删除清理）；更大范围 ERP/FMS 会计业务不在本案例 catalog 断言内。'
-    : '未开启 CFOR_E2E_WRITE_FIXTURES=true，仅执行原只读路径；空集或 HTTP 成功不代表完整业务通过。'
-  return { token, api, ...(writeClosureComplete ? { note } : { partial: true, note }) }
+  const note = caseRecord.acceptanceComplete
+    ? 'ERP-ACCOUNT-001 两条原 catalog 断言取得本轮专属 API、页面、反例与清理证据。'
+    : writeEnabled
+      ? 'ERP-ACCOUNT-001 本轮证据未闭合，详见失败 checks 和 catalogAssertions GAP。'
+      : '未开启 CFOR_E2E_WRITE_FIXTURES=true，仅执行原只读路径；空集或 HTTP 成功不代表完整业务通过。'
+  return {
+    token, api, partial: !caseRecord.acceptanceComplete,
+    acceptanceComplete: caseRecord.acceptanceComplete, note
+  }
 }

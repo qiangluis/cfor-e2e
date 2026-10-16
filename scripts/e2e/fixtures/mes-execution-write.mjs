@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto'
 import { config } from '../config/index.mjs'
 import { asList, assertBusinessSuccess } from '../lib/assertions.mjs'
 import { assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
+import { createPlan, createPublishedItem } from './mes-quality-write.mjs'
 
 const unwrap = (response, label = 'MES execution fixture') => {
   assertBusinessSuccess(response, label)
@@ -25,6 +26,8 @@ const cleanupDefinitions = {
   work: { table: 'mes_prod_work', endpoint: '/mes/prodWork/delete' },
   order: { table: 'mes_prod_order', endpoint: '/mes/prodOrder/delete' },
   opening: { table: 'mes_stk_io', endpoint: '/mes/stkIo/void' },
+  pickBill: { table: 'mes_stk_io', endpoint: '/mes/stkIo/void' },
+  output: { table: 'mes_stk_io', endpoint: '/mes/stkIo/void' },
   inventory: { table: 'mes_stk_inventory', endpoint: '/mes/stkInventory/delete' },
   route: { table: 'mes_wms_tech_route', endpoint: '/mes/wmsTechRoute/delete' },
   procedure: { table: 'mes_wms_procedure', endpoint: '/mes/wmsProcedure/delete' },
@@ -33,7 +36,17 @@ const cleanupDefinitions = {
   location: { table: 'mes_wms_house_location', endpoint: '/mes/wms-house-location/delete' },
   area: { table: 'mes_wms_house_area', endpoint: '/mes/wmsHouseArea/delete' },
   warehouse: { table: 'mes_wms_ware_house', endpoint: '/mes/wmsWareHouse/delete' },
-  team: { table: 'mes_team_manage', endpoint: '/mes/teamManage/delete' }
+  team: { table: 'mes_team_manage', endpoint: '/mes/teamManage/delete' },
+  qualityItem: { table: 'mes_quality_item', endpoint: '/mes/quality/item/delete' },
+  qualityPlan: { table: 'mes_quality_plan', endpoint: '/mes/quality/qualityPlan/delete' },
+  qualityBinding: {
+    table: 'mes_procedure_quality_item',
+    endpoint: '/mes/procedure-quality-item/delete'
+  },
+  qualityInspection: {
+    table: 'mes_quality_inspection',
+    endpoint: '/mes/quality/qualityInspection/delete'
+  }
 }
 
 const productionTime = (time = new Date()) => {
@@ -88,7 +101,12 @@ export class ExecutionWorkflowFixture {
     overdue = false,
     schedule = true,
     withTeam = true,
-    withOpeningInventory = true
+    withOpeningInventory = true,
+    separateOpeningLocation = false,
+    normalizeWmsOutputCleanup = false,
+    reuseEnabledBom = false,
+    withFeed = false,
+    withQuality = false
   } = {}) {
     this.api = api
     this.record = record
@@ -103,19 +121,35 @@ export class ExecutionWorkflowFixture {
     this.shouldSchedule = schedule
     this.withTeam = withTeam
     this.withOpeningInventory = withOpeningInventory
+    this.separateOpeningLocation = separateOpeningLocation
+    this.normalizeWmsOutputCleanupEnabled = normalizeWmsOutputCleanup
+    this.reuseEnabledBom = reuseEnabledBom
+    this.withFeed = withFeed
+    this.withQuality = withQuality
     this.owned = []
     this.works = []
     this.tasks = []
     this.reportIds = []
-    this.record.executionFixture = {
+    this.outputIds = []
+    this.feedRecordIds = []
+    this.qualityInspectionIds = []
+    this.scheduleBlocked = false
+    this.fixtureRecord = {
       caseId,
       marker: this.marker,
       overdue,
       schedule,
       withTeam,
       withOpeningInventory,
+      separateOpeningLocation,
+        normalizeWmsOutputCleanup,
+      reuseEnabledBom,
+      withFeed,
+      withQuality,
       resources: this.owned
     }
+    this.record.executionFixture = this.fixtureRecord
+    this.record.executionFixtures = [...(this.record.executionFixtures || []), this.fixtureRecord]
   }
 
   remember (kind, id, identity = '') {
@@ -147,6 +181,7 @@ export class ExecutionWorkflowFixture {
   }
 
   async setup (caseRecord) {
+    caseRecord.executionFixtures = [...(caseRecord.executionFixtures || []), this.fixtureRecord]
     assert.equal(config.target, 'local')
     assert.equal(String(config.tenantId), '1')
     assert.equal(config.db.name, 'cfor_admin_standard')
@@ -171,32 +206,92 @@ export class ExecutionWorkflowFixture {
     this.warehouse = await this.createWarehouse()
     this.area = await this.createArea()
     this.location = await this.createLocation()
-    this.material = await this.createMaterial('FG', false)
-    this.component = await this.createMaterial('RM', true)
-    this.bom = await this.createBom()
+    this.openingLocation = this.separateOpeningLocation && this.withOpeningInventory
+      ? await this.createLocation('OP')
+      : null
+    if (this.reuseEnabledBom) {
+      await this.selectEnabledBom()
+    } else {
+      this.material = await this.createMaterial('FG', false)
+      this.component = await this.createMaterial('RM', true)
+      this.bom = await this.createBom()
+    }
     // Production execution cases do not need stock facts; WMS suites own the
     // opening-inventory lifecycle and its audit-retained rows.
     this.opening = this.withOpeningInventory
       ? await this.createOpeningInventory()
       : null
     this.procedure = await this.createProcedure()
+    if (this.withQuality) {
+      await this.createQualityConfiguration(caseRecord)
+    }
     this.route = await this.createRoute()
     this.order = await this.createOrder()
     await this.approveAndSplit()
     if (this.shouldSchedule) {
       await this.scheduleTask()
     }
+    const chainReady = this.owned.length >= 8 && this.works.length === 1 &&
+      (this.withTeam
+        ? (!this.shouldSchedule || this.tasks.length === 1)
+        : (this.shouldSchedule && this.tasks.length === 0 && this.scheduleBlocked))
     addCheck(caseRecord, '专属 AUTOTEST 生产链路已正式创建并回读',
-      this.owned.length >= 8 && this.works.length === 1 &&
-        (!this.shouldSchedule || this.tasks.length === 1),
+      chainReady,
       JSON.stringify({
         marker: this.marker,
         orderId: this.order.id,
         workId: this.works[0]?.id,
         taskId: this.tasks[0]?.id,
-        scheduled: this.shouldSchedule
+        scheduled: this.shouldSchedule,
+        scheduleBlocked: this.scheduleBlocked
       }))
     return this
+  }
+
+  async selectEnabledBom () {
+    const rows = await runReadOnlySql(
+      `SELECT bom.id, bom.code, bom.stock_id, parent.unit_id, parent.code,
+              sub.stock_id, child.unit_id, child.code
+       FROM mes_wms_assemble bom
+       JOIN mes_bas_material parent ON parent.id=bom.stock_id
+       JOIN mes_wms_assemble_sub sub ON sub.parent_id=bom.id
+       JOIN mes_bas_material child ON child.id=sub.stock_id
+       WHERE bom.tenant_id=1 AND bom.deleted=0 AND bom.dev_status=2
+         AND bom.bom_usage='PRODUCTION'
+         AND parent.tenant_id=1 AND parent.deleted=0 AND parent.is_enabled=1
+         AND parent.inventory_nature='STOCK'
+         AND child.tenant_id=1 AND child.deleted=0 AND child.is_enabled=1
+         AND child.inventory_nature='STOCK'
+       ORDER BY bom.update_time DESC, bom.id DESC LIMIT 1`
+    )
+    if (!rows.available) throw new Error(`BLOCKED: ${rows.reason}`)
+    if (!Array.isArray(rows.rows) || rows.rows.length !== 1) {
+      throw new Error('BLOCKED: 缺少可复用的已启用生产 BOM 及实物母子件')
+    }
+    const [bomId, bomCode, materialId, materialUnitId, materialCode,
+      componentId, componentUnitId, componentCode] = rows.rows[0]
+    for (const [label, value] of [
+      ['BOM', bomId], ['母件', materialId], ['母件单位', materialUnitId],
+      ['子件', componentId], ['子件单位', componentUnitId]
+    ]) {
+      if (!stableId(value)) throw new Error(`BLOCKED: 已启用生产 BOM ${label}主键无效`)
+    }
+    this.material = {
+      id: String(materialId), unitId: String(materialUnitId), identity: String(materialCode),
+      shared: true
+    }
+    this.component = {
+      id: String(componentId), unitId: String(componentUnitId), identity: String(componentCode),
+      shared: true
+    }
+    this.bom = { id: String(bomId), identity: String(bomCode), shared: true, devStatus: 2 }
+    this.fixtureRecord.enabledBom = {
+      bomId: this.bom.id,
+      bomCode: this.bom.identity,
+      materialId: this.material.id,
+      componentId: this.component.id,
+      devStatus: 2
+    }
   }
 
   async createWarehouse () {
@@ -236,10 +331,10 @@ export class ExecutionWorkflowFixture {
     return this.remember('area', id, code)
   }
 
-  async createLocation () {
-    const code = `${this.shortCode}-LC`
+  async createLocation (suffix = '') {
+    const code = `${this.shortCode}-${suffix || 'LC'}`
     await this.api.postBusiness('/mes/wms-house-location/create', {
-      locationName: `${this.marker}-库位`,
+      locationName: `${this.marker}-${suffix ? '期初库位' : '库位'}`,
       locationCode: code,
       houseId: this.warehouse.id,
       areaId: this.area.id,
@@ -269,8 +364,8 @@ export class ExecutionWorkflowFixture {
       defaultWare: this.warehouse.id,
       defaultWareArea: this.area.id,
       defaultWareLocation: this.location.id,
-      source: 'mixed',
-      produced: 'Y',
+      source: component ? 'purchase' : 'mixed',
+      produced: component ? 'N' : 'Y',
       purchased: 'Y',
       saled: 'Y',
       parented: component ? 'N' : 'Y',
@@ -305,7 +400,7 @@ export class ExecutionWorkflowFixture {
       stockCount: 1,
       version: '1',
       versionDesc: this.marker,
-      defaultRecord: 'N',
+      defaultRecord: 'Y',
       bomUsage: 'PRODUCTION',
       unitId: String(this.unit.id),
       mark: this.marker,
@@ -322,6 +417,15 @@ export class ExecutionWorkflowFixture {
        WHERE tenant_id=1 AND deleted=0 AND code='${sqlText(code)}' AND mark='${sqlText(this.marker)}'`,
       '专属 BOM'
     )
+    await unwrap(
+      await this.api.postBusiness(`/mes/wmsAssemble/publish?id=${encodeURIComponent(id)}`),
+      '发布专属 BOM'
+    )
+    const published = unwrap(
+      await this.api.getBusiness(`/mes/wmsAssemble/queryById?id=${encodeURIComponent(id)}`),
+      '回读已发布专属 BOM'
+    )
+    assert.equal(Number(published?.devStatus), 2, '专属 BOM 发布后研发状态必须为已启用')
     return this.remember('bom', id, code)
   }
 
@@ -341,7 +445,7 @@ export class ExecutionWorkflowFixture {
         cost: 1,
         warehouseId: this.warehouse.id,
         wareAreaId: this.area.id,
-        wareLocationId: this.location.id,
+        wareLocationId: (this.openingLocation || this.location).id,
         batchNo: `${this.shortCode}-OPEN`,
         entryNo: 1,
         stockIoType: '106',
@@ -377,7 +481,7 @@ export class ExecutionWorkflowFixture {
          AND warehouse_id='${sqlText(this.warehouse.id)}'
          AND material_id='${sqlText(this.component.id)}'
          AND ware_area_id='${sqlText(this.area.id)}'
-         AND ware_location_id='${sqlText(this.location.id)}'
+         AND ware_location_id='${sqlText((this.openingLocation || this.location).id)}'
          AND batch_no='${sqlText(`${this.shortCode}-OPEN`)}'`,
       '专属期初库存事实'
     )
@@ -432,6 +536,59 @@ export class ExecutionWorkflowFixture {
     return this.remember('procedure', id, code)
   }
 
+  async createQualityConfiguration (caseRecord) {
+    const item = await createPublishedItem(this.api, caseRecord, {
+      kind: 'MES-PROD',
+      itemType: '生产过程检验项目',
+      unitId: this.unit.id,
+      inspectionResultType: 'select',
+      inspectionResult: '1',
+      judgmentMode: 'ENUM',
+      standardBaseValue: 1
+    })
+    const plan = await createPlan(this.api, caseRecord, {
+      kind: 'MES-PROD',
+      type: 300,
+      itemId: item.itemId,
+      itemSnapshot: item.row,
+      planName: `${this.marker}-QC-PLAN`,
+      publish: true
+    })
+    this.qualityItem = this.remember('qualityItem', item.itemId, item.itemCode)
+    this.qualityPlan = this.remember('qualityPlan', plan.planId, plan.planCode)
+    this.qualityConfig = { item, plan }
+
+    unwrap(await this.api.postBusiness('/mes/wmsTechRoute/batchCreateProcedureQuality', [{
+      procedureId: this.procedure.id,
+      qualityPlanId: plan.planId,
+      qualityItemId: item.itemId,
+      isRequired: 'Y',
+      frequency: '每批',
+      target: '100%',
+      sortOrder: 1,
+      status: '1',
+      remark: this.marker
+    }]), '绑定专属工序过程检项目')
+    const bindings = rowsOf(await this.api.getBusiness(
+      `/mes/procedure-quality-item/page?pageNo=1&pageSize=100&procedureId=${encodeURIComponent(this.procedure.id)}`
+    ), '工序过程检绑定回读')
+    const binding = bindings.find((row) =>
+      String(row?.procedureId) === this.procedure.id &&
+      String(row?.qualityPlanId) === String(plan.planId) &&
+      String(row?.qualityItemId) === String(item.itemId) &&
+      row?.isRequired === 'Y'
+    )
+    assert(binding?.id, '专属工序过程检绑定未回读')
+    this.qualityBinding = this.remember('qualityBinding', binding.id, this.procedure.id)
+    this.fixtureRecord.quality = {
+      itemId: String(item.itemId),
+      planId: String(plan.planId),
+      bindingId: String(binding.id),
+      type: 300,
+      required: true
+    }
+  }
+
   /**
    * 创建一条带真实成员的专属班组，供排产/预排产班组门禁使用。
    * 成员复用系统内置管理员，避免污染其它业务数据。
@@ -484,8 +641,8 @@ export class ExecutionWorkflowFixture {
         procedureId: this.procedure.id,
         procedureName: this.procedure.identity,
         sortOrder: 1,
-        isFeed: 0,
-        isQuality: 0,
+        isFeed: this.withFeed ? 1 : 0,
+        isQuality: this.withQuality ? 1 : 0,
         isFinished: 1,
         isVirtual: 0,
         mark: this.marker
@@ -569,6 +726,25 @@ export class ExecutionWorkflowFixture {
   async scheduleTask () {
     const work = this.assertOwnedWork(this.works[0])
     assert.ok(this.route.id, '专属工艺路线未创建')
+    if (!this.withTeam) {
+      const missingRoute = { code: 500, message: /未找到工艺路线/, allowServiceCode: true }
+      const rejected = await this.api.request('POST', '/mes/prodWork/scheduleProduct', {
+        id: work.id,
+        prodWorkOrderId: work.id,
+        qty: 2,
+        startDate: productionTime(Date.now() + 3600000),
+        endDate: productionTime(Date.now() + 5 * 3600000),
+        remark: this.marker
+      }, { expectedBusinessRejection: missingRoute })
+      assert.equal(rejected?.code, missingRoute.code, '未配工艺排产必须被正式拒绝')
+      assert.match(String(rejected?.msg || rejected?.message || ''), missingRoute.message)
+      const tasks = rowsOf(await this.api.getBusiness(
+        `/mes/prodWorkTask/list?pageNo=1&pageSize=100&workTicketId=${encodeURIComponent(work.id)}`
+      ), '未配工艺排产拒绝后任务回读')
+      assert.equal(tasks.length, 0, '未配工艺排产失败后不能留下孤立任务')
+      this.fixtureRecord.missingRoute = { workId: work.id, response: rejected, taskCount: tasks.length }
+      this.missingRouteBlocked = true
+    }
     unwrap(await this.api.putBusiness('/mes/prodWork/edit', {
       id: work.id,
       processId: this.route.id
@@ -577,10 +753,14 @@ export class ExecutionWorkflowFixture {
       // 工序未配置班组时必须被预排产门禁明确阻断。
       const preSchedule = await this.api.request(
         'GET',
-        `/mes/prodWork/preScheduleProduct?processId=${encodeURIComponent(this.route.id)}&workId=${encodeURIComponent(work.id)}`
+        `/mes/prodWork/preScheduleProduct?processId=${encodeURIComponent(this.route.id)}&workId=${encodeURIComponent(work.id)}`,
+        undefined,
+        { expectedBusinessRejection: { code: 500, message: /班组信息有误/, allowServiceCode: true } }
       )
       assert.equal(preSchedule?.code, 500, '未配置班组时预排产必须返回业务错误')
       assert.match(String(preSchedule?.msg || preSchedule?.message || ''), /班组/)
+      this.scheduleBlocked = true
+      this.fixtureRecord.missingTeam = { workId: work.id, response: preSchedule }
       return
     }
 
@@ -622,6 +802,303 @@ export class ExecutionWorkflowFixture {
       `/mes/prodWorkTask/queryById?id=${encodeURIComponent(task.id)}`
     ), '工单任务审核后回读'), task.id)
     assert.equal(effectiveTask.isEffective, 'Y', '正式排产任务审核后必须生效')
+    if (this.withFeed) {
+      assert.equal(Number(effectiveTask.isFeed), 1, '投料工序任务必须标记为投料工序')
+    }
+    if (this.withQuality) {
+      assert.equal(Number(effectiveTask.isQuality), 1, '过程检工序任务必须标记为质量工序')
+    }
+  }
+
+  async prepareFeed (caseRecord) {
+    const task = this.assertOwnedTask(this.tasks[0])
+    const preview = unwrap(await this.api.getBusiness(
+      `/mes/prodWorkTask/feed-pick-preview?taskId=${encodeURIComponent(task.id)}`
+    ), '任务投料领料预览')
+    const material = asList(preview?.materialList).find((row) =>
+      String(row?.materialId) === this.component.id)
+    assert(material?.srcEntryId, '投料预览缺少 BOM 来源明细')
+    assert(Number(material.requiredQty) > 0, '投料预览应领数量必须大于0')
+    this.feedPreview = preview
+    this.feedMaterialPreview = material
+    addCheck(caseRecord, '投料预览返回真实 BOM 物料、来源明细和数量',
+      String(preview.taskId) === task.id &&
+        String(material.materialId) === this.component.id &&
+        Number(material.requiredQty) > 0 &&
+        Number(material.remainingPickQty) === Number(material.requiredQty),
+      JSON.stringify({
+        taskId: preview.taskId,
+        materialId: material.materialId,
+        srcEntryId: material.srcEntryId,
+        requiredQty: material.requiredQty,
+        stockQty: material.stockQty
+      }))
+
+    const before = unwrap(await this.api.getBusiness(
+      `/mes/prodWorkTask/feed-status?taskId=${encodeURIComponent(task.id)}`
+    ), '投料前置状态')
+    addCheck(caseRecord, '未领料投料前置状态明确阻断报工',
+      before.allowReport === false &&
+        before.pickSatisfied === false &&
+        typeof before.blockReason === 'string' &&
+        before.blockReason.trim().length > 0,
+      JSON.stringify({
+        allowReport: before.allowReport,
+        pickSatisfied: before.pickSatisfied,
+        blockReason: before.blockReason
+      }))
+
+    const generated = unwrap(await this.api.postBusiness('/mes/prodWorkTask/generate-pick-bill', {
+      taskId: task.id
+    }), '生成生产领料单')
+    const billId = String(generated?.billId || '')
+    assert(stableId(billId), '生产领料单返回主键无效')
+    assert(String(generated?.billNo || '').trim().length > 0, '生产领料单返回单号为空')
+    this.pickBill = this.remember('pickBill', billId, String(generated.billNo))
+    const draft = unwrap(await this.api.getBusiness(
+      `/mes/stkIo/queryById?id=${encodeURIComponent(billId)}`
+    ), '生产领料单草稿回读')
+    const draftEntries = rowsOf(await this.api.getBusiness(
+      `/mes/stkIo/queryEntryByMainId?id=${encodeURIComponent(billId)}`
+    ), '生产领料单草稿明细回读')
+    const draftEntry = draftEntries.find((row) =>
+      String(row?.materialId) === this.component.id)
+    assert(draftEntry?.id, '生产领料单缺少专属组件明细')
+    assert.equal(String(draft?.stockIoType), '203', '生产领料单类型必须为203')
+    assert.equal(String(draft?.srcBillType), 'ProdWork', '生产领料单来源类型必须为ProdWork')
+    assert.equal(String(draft?.srcBillId), this.works[0].id, '生产领料单来源工单不匹配')
+
+    await this.submitAndApprovePick(draft, draftEntries)
+    const effective = unwrap(await this.api.getBusiness(
+      `/mes/stkIo/queryById?id=${encodeURIComponent(billId)}`
+    ), '生效生产领料单回读')
+    const effectiveEntries = rowsOf(await this.api.getBusiness(
+      `/mes/stkIo/queryEntryByMainId?id=${encodeURIComponent(billId)}`
+    ), '生效生产领料单明细回读')
+    const entry = effectiveEntries.find((row) =>
+      String(row?.id) === String(draftEntry.id))
+    assert(entry?.id, '生效生产领料单明细回读缺少原分录')
+    this.pickEntry = entry
+    addCheck(caseRecord, '生产领料单经 WMS 正式审核并保留来源与明细',
+      Number(effective?.isEffective) === 1 &&
+        String(effective?.stockIoType) === '203' &&
+        String(effective?.srcBillType) === 'ProdWork' &&
+        String(effective?.srcBillId) === this.works[0].id &&
+        String(entry.materialId) === this.component.id &&
+        Number(entry.qty) >= Number(material.requiredQty),
+      JSON.stringify({
+        billId,
+        billNo: effective?.billNo,
+        isEffective: effective?.isEffective,
+        entryId: entry.id,
+        materialId: entry.materialId,
+        qty: entry.qty
+      }))
+
+    const feedQty = Number(material.requiredQty)
+    const feedId = String(unwrap(await this.api.postBusiness('/mes/prodWorkTask/feed-record', {
+      taskId: task.id,
+      pickEntryId: String(entry.id),
+      materialId: this.component.id,
+      batchNo: entry.batchNo,
+      feedQty,
+      remark: this.marker
+    }), '保存正式投料记录'))
+    assert(stableId(feedId), '投料记录返回主键无效')
+    this.feedRecordIds.push(feedId)
+    const records = rowsOf(await this.api.getBusiness(
+      `/mes/prodWorkTask/feed-record/list?taskId=${encodeURIComponent(task.id)}`
+    ), '投料记录回读')
+    const record = records.find((row) => String(row?.id) === feedId)
+    addCheck(caseRecord, '正式投料记录按任务、领料分录、批次和数量回读',
+      record != null &&
+        String(record.taskId) === task.id &&
+        String(record.pickEntryId) === String(entry.id) &&
+        String(record.materialId) === this.component.id &&
+        Number(record.feedQty) === feedQty &&
+        record.remark === this.marker,
+      JSON.stringify({
+        feedId,
+        taskId: record?.taskId,
+        pickEntryId: record?.pickEntryId,
+        feedQty: record?.feedQty,
+        remark: record?.remark
+      }))
+
+    const after = unwrap(await this.api.getBusiness(
+      `/mes/prodWorkTask/feed-status?taskId=${encodeURIComponent(task.id)}`
+    ), '投料后置状态')
+    addCheck(caseRecord, '投料完成后状态允许报工且已投数量闭合',
+      after.pickSatisfied === true &&
+        after.feedSatisfied === true &&
+        after.allowReport === true &&
+        Number(after.remainingFeedQty) === 0 &&
+        Number(after.fedQty) >= feedQty,
+      JSON.stringify({
+        pickSatisfied: after.pickSatisfied,
+        feedSatisfied: after.feedSatisfied,
+        allowReport: after.allowReport,
+        fedQty: after.fedQty,
+        remainingFeedQty: after.remainingFeedQty
+      }))
+
+    const beforeDuplicate = await this.captureFeedWriteFacts(caseRecord, 'before-duplicate-pick')
+    const duplicatePick = await this.api.request(
+      'POST',
+      '/mes/prodWorkTask/generate-pick-bill',
+      { taskId: task.id },
+      { expectedBusinessRejection: { code: 400, message: /已满足|无需重复|没有可分配库存/ } }
+    )
+    const afterDuplicatePick = await this.captureFeedWriteFacts(caseRecord, 'after-duplicate-pick')
+    addCheck(caseRecord, '重复生成生产领料单被正式拒绝且不新增单据',
+      duplicatePick?.code === 400 &&
+        /已满足|无需重复|没有可分配库存/.test(String(duplicatePick?.msg || duplicatePick?.message || '')) &&
+        JSON.stringify(afterDuplicatePick) === JSON.stringify(beforeDuplicate),
+      JSON.stringify({
+        code: duplicatePick?.code, msg: duplicatePick?.msg,
+        before: beforeDuplicate, after: afterDuplicatePick
+      }))
+
+    const duplicateFeed = await this.api.request(
+      'POST',
+      '/mes/prodWorkTask/feed-record',
+      {
+        taskId: task.id,
+        pickEntryId: String(entry.id),
+        materialId: this.component.id,
+        batchNo: entry.batchNo,
+        feedQty: 1,
+        remark: `${this.marker} duplicate`
+      },
+      { expectedBusinessRejection: { code: 400, message: /已领未投余额|超过|累计投料/ } }
+    )
+    const afterDuplicateFeed = await this.captureFeedWriteFacts(caseRecord, 'after-duplicate-feed')
+    addCheck(caseRecord, '重复投料超过已领未投余额被正式拒绝',
+      duplicateFeed?.code === 400 &&
+        /已领未投余额|超过|累计投料/.test(String(duplicateFeed?.msg || duplicateFeed?.message || '')) &&
+        JSON.stringify(afterDuplicateFeed) === JSON.stringify(afterDuplicatePick),
+      JSON.stringify({
+        code: duplicateFeed?.code, msg: duplicateFeed?.msg,
+        before: afterDuplicatePick, after: afterDuplicateFeed
+      }))
+    this.fixtureRecord.feed = {
+      pickBillId: billId,
+      pickEntryId: String(entry.id),
+      feedRecordId: feedId,
+      requiredQty: feedQty
+    }
+  }
+
+  async captureFeedWriteFacts (caseRecord, stage) {
+    const task = this.assertOwnedTask(this.tasks[0])
+    const pick = await runReadOnlySql(
+      `SELECT io.id, io.bill_no, io.bill_stage, io.is_effective+0, io.is_voided+0,
+              entry.id, entry.material_id, entry.qty
+       FROM mes_stk_io io JOIN mes_stk_io_entry entry ON entry.mid=io.id
+       WHERE io.tenant_id=1 AND io.deleted=0 AND entry.tenant_id=1 AND entry.deleted=0
+         AND io.src_bill_type='ProdWork' AND io.src_bill_id='${sqlText(this.works[0].id)}'
+         AND io.stock_io_type='203' AND entry.material_id='${sqlText(this.component.id)}'
+       ORDER BY io.id, entry.id`
+    )
+    const feed = await runReadOnlySql(
+      `SELECT id, task_id, pick_bill_id, pick_entry_id, material_id, batch_no, feed_qty
+       FROM mes_prod_task_feed_record WHERE tenant_id=1 AND deleted=0
+         AND task_id='${sqlText(task.id)}'
+       ORDER BY id`
+    )
+    caseRecord.database = [...(caseRecord.database || []),
+      { stage, kind: 'production-pick-facts', ...pick },
+      { stage, kind: 'production-feed-facts', ...feed }]
+    assert(pick.available && feed.available &&
+      Array.isArray(pick.rows) && Array.isArray(feed.rows),
+    '领料投料幂等必须具备独立数据库事实证据')
+    assert(pick.rows.length > 0 && feed.rows.length > 0 &&
+      pick.rows.every((row) => row.length === 8 && stableId(row[0]) && stableId(row[5])) &&
+      feed.rows.every((row) => row.length === 7 && stableId(row[0])),
+    '领料投料幂等不能使用空集或无效事实')
+    assert(pick.rows.some((row) => String(row[0]) === this.pickBill.id &&
+      String(row[5]) === String(this.pickEntry.id) &&
+      String(row[6]) === this.component.id && Number(row[7]) > 0),
+    '领料幂等回读缺少本轮生效分录')
+    assert(feed.rows.some((row) => this.feedRecordIds.includes(String(row[0])) &&
+      String(row[1]) === task.id && String(row[2]) === this.pickBill.id &&
+      String(row[3]) === String(this.pickEntry.id) &&
+      String(row[4]) === this.component.id && Number(row[6]) > 0),
+    '投料幂等回读缺少本轮投料事实')
+    return { pickRows: pick.rows, feedRows: feed.rows }
+  }
+
+  async submitAndApprovePick (draft, entries) {
+    assert(this.pickBill && String(draft?.id) === this.pickBill.id, '提交领料单主键不属于本轮')
+    assert.equal(String(draft?.stockIoType), '203', '只能提交专属生产领料单')
+    assert.equal(String(draft?.srcBillType), 'ProdWork', '专属领料单来源类型不匹配')
+    assert.equal(String(draft?.srcBillId), this.works[0].id, '专属领料单来源工单不匹配')
+    assert(entries.length > 0 && entries.every((entry) =>
+      String(entry.materialId) === this.component.id &&
+      String(entry.warehouseId) === this.warehouse.id &&
+      String(entry.wareAreaId) === this.area.id &&
+      String(entry.wareLocationId) === this.location.id &&
+      Number(entry.qty) > 0), '领料分录必须属于本轮隔离物料和仓库')
+    let detail = draft
+    if (String(detail.billStage) === '12' && Number(detail.isEffective) === 0) {
+      const pick = (row, fields) => Object.fromEntries(fields
+        .filter((field) => Object.prototype.hasOwnProperty.call(row, field))
+        .map((field) => [field, row[field]]))
+      unwrap(await this.api.putBusiness('/mes/stkIo/edit/submit', {
+        ...pick(detail, [
+          'id', 'billNo', 'billDate', 'subject', 'remark', 'stockIoType',
+          'srcBillType', 'srcBillId', 'srcNo', 'isAuto', 'isQc', 'version',
+          'billStage', 'isEffective', 'isVoided', 'isClosed'
+        ]),
+        stkIoEntryList: entries.map((entry) => pick(entry, [
+          'id', 'entryNo', 'materialId', 'unitId', 'qty', 'cost', 'price', 'settleQty',
+          'settleAmt', 'warehouseId', 'wareAreaId', 'wareLocationId', 'batchNo',
+          'srcBillType', 'srcBillId', 'srcEntryId', 'srcNo', 'stockIoType',
+          'stockIoDirection', 'isQc', 'brand', 'colorId', 'remark'
+        ])),
+        stkIoDistributionList: [],
+        stkIoBomList: []
+      }), '正式提交生产领料草稿')
+      detail = unwrap(await this.api.getBusiness(
+        `/mes/stkIo/queryById?id=${encodeURIComponent(this.pickBill.id)}`
+      ), '生产领料提交后回读')
+    }
+    if (Number(detail?.isEffective) !== 1) {
+      unwrap(await this.api.putBusiness('/mes/stkIo/check', {
+        id: this.pickBill.id,
+        approvalResultType: '1',
+        approvalRemark: `${this.marker} pick`
+      }), '审核生产领料单')
+    }
+    return detail
+  }
+
+  async voidOpeningInventoryForShortage (caseRecord) {
+    assert(this.opening && this.inventory, '缺料场景必须先通过正式期初库存完成生产下达')
+    assert.equal(await this.cleanupResource(this.opening, caseRecord), true,
+      '缺料场景作废专属期初库存失败')
+    const task = this.assertOwnedTask(this.tasks[0])
+    const preview = unwrap(await this.api.getBusiness(
+      `/mes/prodWorkTask/feed-pick-preview?taskId=${encodeURIComponent(task.id)}`
+    ), '作废专属期初后缺料预览')
+    const material = asList(preview?.materialList).find((row) =>
+      String(row?.materialId) === this.component.id)
+    assert(material, '缺料预览必须返回本轮 BOM 物料，不能用空集证明缺料')
+    assert(Number(material.requiredQty) > 0 && Number(material.stockQty) === 0,
+      '作废期初后仍有库存，不能宣称缺料')
+    this.fixtureRecord.shortage = { taskId: task.id, openingId: this.opening.id, material }
+    return material
+  }
+
+  registerQualityInspection (inspectionId, identity = '') {
+    const id = String(inspectionId)
+    assert(stableId(id), '过程检单主键无效')
+    if (!this.qualityInspectionIds.includes(id)) {
+      this.qualityInspectionIds.push(id)
+      this.qualityInspections = this.qualityInspections || []
+      this.qualityInspections.push(this.remember('qualityInspection', id, identity || id))
+    }
+    return id
   }
 
   async startWork () {
@@ -637,6 +1114,146 @@ export class ExecutionWorkflowFixture {
     ), '生产工单开工回读')
     this.assertOwnedWork(detail, work.id)
     assert.equal(Number(detail.status), 2, '生产工单开工后状态应为进行中')
+    return detail
+  }
+
+  async reportTask ({
+    qty = 2,
+    qualifiedQty = 1,
+    defectQty = 1,
+    disqualificationReason = `${this.marker} defect`,
+    remark = this.marker,
+    startTime = `${productionTime().slice(0, 10)} 16:00:00`,
+    endTime = `${productionTime().slice(0, 10)} 16:30:00`
+  } = {}) {
+    const task = this.assertOwnedTask(this.tasks[0])
+    assert.equal(Number(qty), Number(qualifiedQty) + Number(defectQty),
+      '专属报工的合格数与不合格数必须等于报工数')
+    const reportCode = `${this.shortCode}-RP`
+    const reportId = String(unwrap(
+      await this.api.postBusiness('/mes/prodWorkReport/addByTaskId', {
+        taskId: task.id,
+        qty,
+        qualifiedQty,
+        defectQty,
+        disqualificationReason,
+        reportCode,
+        remark,
+        startTime,
+        endTime
+      }),
+      '专属生产报工'
+    ))
+    assert(stableId(reportId), '专属生产报工返回主键无效')
+    this.reportIds.push(reportId)
+    this.remember('report', reportId, reportCode)
+    const detail = unwrap(await this.api.getBusiness(
+      `/mes/prodWorkReport/queryById?id=${encodeURIComponent(reportId)}`
+    ), '专属生产报工回读')
+    assert.equal(String(detail?.id), reportId, '专属报工主键回读不匹配')
+    assert.equal(String(detail?.workTaskId), task.id, '专属报工任务关联不匹配')
+    assert.equal(String(detail?.workTicketId), this.works[0].id, '专属报工工单关联不匹配')
+    assert.equal(String(detail?.reportCode), reportCode, '专属报工编码回读不匹配')
+    // Adopt any real output even when a quality gate was expected, so a backend
+    // premature release cannot leave untracked stock facts during cleanup.
+    await this.captureProductionOutput(reportId)
+    return detail
+  }
+
+  async captureProductionOutput (reportId, { requireInventory = false } = {}) {
+    const snapshot = await runReadOnlySql(
+      `SELECT io.id, io.bill_no, io.is_effective+0, io.is_voided+0, io.bill_stage,
+              entry.material_id, entry.warehouse_id, entry.ware_area_id,
+              entry.ware_location_id, entry.batch_no
+       FROM mes_stk_io io
+       JOIN mes_stk_io_entry entry ON entry.mid=io.id
+       WHERE io.tenant_id=1 AND io.deleted=0
+         AND io.src_bill_type='ProdWork'
+         AND io.src_bill_id='${sqlText(this.works[0].id)}'
+         AND io.stock_io_type='104'
+         AND entry.src_entry_id='${sqlText(reportId)}'`
+    )
+    if (!snapshot.available) throw new Error(`BLOCKED: ${snapshot.reason}`)
+    assert(snapshot.rows.length <= 1, '专属报工成品入库来源必须至多唯一一张')
+    if (snapshot.rows.length === 0) {
+      if (requireInventory) {
+        throw new Error('正式报工放行后未找到唯一104成品入库')
+      }
+      return null
+    }
+
+    const [id, billNo, isEffective, isVoided, billStage, materialId,
+      warehouseId, wareAreaId, wareLocationId, batchNo] = snapshot.rows[0]
+    assert(stableId(id), '专属报工自动成品入库主键无效')
+    assert.equal(String(materialId), this.material.id, '自动成品入库物料归属不匹配')
+    assert.equal(String(warehouseId), this.warehouse.id, '自动成品入库仓库归属不匹配')
+    assert.equal(String(wareAreaId), this.area.id, '自动成品入库库区归属不匹配')
+    assert.equal(String(wareLocationId), this.location.id, '自动成品入库库位归属不匹配')
+    const existing = this.owned.find((resource) => resource.kind === 'output' && resource.id === String(id))
+    const output = existing || this.remember('output', id, billNo)
+    output.sourceReportId = String(reportId)
+    output.sourceWorkId = this.works[0].id
+    output.stockIoType = '104'
+    output.billStage = String(billStage)
+    output.isEffective = Number(isEffective)
+    output.isVoided = Number(isVoided)
+    output.dimensions = {
+      warehouseId: String(warehouseId),
+      materialId: String(materialId),
+      wareAreaId: String(wareAreaId),
+      wareLocationId: String(wareLocationId),
+      batchNo: String(batchNo)
+    }
+    if (!this.outputIds.includes(output.id)) this.outputIds.push(output.id)
+    this.fixtureRecord.productionOutputs = this.owned.filter((resource) => resource.kind === 'output')
+
+    const inventory = await runReadOnlySql(
+      `SELECT id, warehouse_id, material_id, ware_area_id, ware_location_id, batch_no,
+              qty, available_qty, lock_qty, hold_qty, frozen_qty, pending_putaway_qty,
+              deleted+0, is_closed
+       FROM mes_stk_inventory
+       WHERE tenant_id=1 AND deleted=0 AND is_closed=0
+         AND warehouse_id='${sqlText(warehouseId)}'
+         AND material_id='${sqlText(materialId)}'
+         AND ware_area_id='${sqlText(wareAreaId)}'
+         AND ware_location_id='${sqlText(wareLocationId)}'
+         AND batch_no='${sqlText(batchNo)}'`
+    )
+    if (!inventory.available) throw new Error(`BLOCKED: ${inventory.reason}`)
+    assert(inventory.rows.length <= 1, '专属自动成品入库库存事实必须至多唯一一条')
+    if (inventory.rows.length === 1) {
+      const [inventoryId, actualWarehouseId, actualMaterialId, actualWareAreaId,
+        actualWareLocationId, actualBatchNo] = inventory.rows[0]
+      assert.equal(String(actualWarehouseId), String(warehouseId), '自动成品库存仓库归属不匹配')
+      assert.equal(String(actualMaterialId), String(materialId), '自动成品库存物料归属不匹配')
+      const resource = this.owned.find((item) => item.kind === 'inventory' && item.id === String(inventoryId)) ||
+        this.remember('inventory', inventoryId, actualBatchNo)
+      resource.sourceOutputId = output.id
+      resource.dimensions = {
+        warehouseId: String(actualWarehouseId),
+        materialId: String(actualMaterialId),
+        wareAreaId: String(actualWareAreaId),
+        wareLocationId: String(actualWareLocationId),
+        batchNo: String(actualBatchNo)
+      }
+    }
+    if (requireInventory && !this.owned.some((resource) =>
+      resource.kind === 'inventory' && resource.sourceOutputId === output.id)) {
+      throw new Error('正式104成品入库后未找到对应 WMS 库存事实')
+    }
+    return output
+  }
+
+  async finishWork () {
+    const work = this.assertOwnedWork(this.works[0])
+    unwrap(await this.api.postBusiness('/mes/prodWork/finish', {
+      id: work.id
+    }), '生产工单完工')
+    const detail = unwrap(await this.api.getBusiness(
+      `/mes/prodWork/queryById?id=${encodeURIComponent(work.id)}`
+    ), '生产工单完工回读')
+    this.assertOwnedWork(detail, work.id)
+    assert.equal(Number(detail.status), 6, '生产工单完工后状态应为已完成')
     return detail
   }
 
@@ -675,6 +1292,22 @@ export class ExecutionWorkflowFixture {
     const deletedColumn = definition.deletedColumn || 'deleted'
     const value = (text) => `'${sqlText(text)}'`
     let ownership
+    if (resource.kind === 'output') {
+      const output = await runReadOnlySql(
+        `SELECT io.id
+         FROM mes_stk_io io
+         JOIN mes_stk_io_entry entry ON entry.mid=io.id
+         WHERE io.tenant_id=1 AND io.deleted=0 AND io.id='${sqlText(resource.id)}'
+           AND io.src_bill_type='ProdWork'
+           AND io.src_bill_id='${sqlText(resource.sourceWorkId)}'
+           AND io.stock_io_type='104'
+           AND entry.src_entry_id='${sqlText(resource.sourceReportId)}'`
+      )
+      if (!output.available) throw new Error(`BLOCKED: ${output.reason}`)
+      assert.equal(output.rows.length, 1, '自动成品入库所有权回读必须唯一')
+      assert.equal(String(output.rows[0][0]), resource.id, '自动成品入库所有权主键不匹配')
+      return
+    }
     if (resource.kind === 'work') {
       ownership = `prod_order_id=${value(this.order.id)} AND remark=${value(this.marker)}`
     } else if (resource.kind === 'task' || resource.kind === 'report') {
@@ -767,9 +1400,164 @@ export class ExecutionWorkflowFixture {
     return true
   }
 
+  async cleanupSpecialResource (resource, caseRecord) {
+    const label = `${resource.kind}=${resource.id}`
+    if (resource.kind === 'pickBill') {
+      const detail = unwrap(await this.api.getBusiness(
+        `/mes/stkIo/queryById?id=${encodeURIComponent(resource.id)}`
+      ), '清理前生产领料单回读')
+      assert.equal(String(detail?.id), resource.id, '生产领料单主键不匹配')
+      assert.equal(String(detail?.stockIoType), '203', '生产领料单类型不匹配')
+      assert.equal(String(detail?.srcBillId), this.works[0].id, '生产领料单来源工单不匹配')
+      unwrap(await this.api.putBusiness('/mes/stkIo/void', { id: resource.id }), '作废生产领料单')
+      const voided = unwrap(await this.api.getBusiness(
+        `/mes/stkIo/queryById?id=${encodeURIComponent(resource.id)}`
+      ), '作废后生产领料单回读')
+      assert.equal(Number(voided?.isVoided), 1, '生产领料单未确认作废')
+      resource.cleanup = 'VOIDED_RETAINED'
+      addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+      return true
+    }
+    if (resource.kind === 'qualityBinding') {
+      const rows = rowsOf(await this.api.getBusiness(
+        `/mes/procedure-quality-item/page?pageNo=1&pageSize=100&procedureId=${encodeURIComponent(this.procedure.id)}`
+      ), '清理前工序过程检绑定回读')
+      const row = rows.find((item) => String(item?.id) === resource.id)
+      assert(row, '工序过程检绑定所有权回读失败')
+      assert.equal(String(row.procedureId), this.procedure.id, '工序过程检绑定工序不匹配')
+      unwrap(await this.api.deleteBusiness(
+        `${cleanupDefinitions.qualityBinding.endpoint}?id=${encodeURIComponent(resource.id)}`
+      ), '删除工序过程检绑定')
+      const after = rowsOf(await this.api.getBusiness(
+        `/mes/procedure-quality-item/page?pageNo=1&pageSize=100&procedureId=${encodeURIComponent(this.procedure.id)}`
+      ), '删除后工序过程检绑定回读')
+      assert(!after.some((item) => String(item?.id) === resource.id), '工序过程检绑定仍然存在')
+      resource.cleanup = 'DELETED_VERIFIED'
+      addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+      return true
+    }
+    if (resource.kind === 'qualityInspection') {
+      const detail = unwrap(await this.api.getBusiness(
+        `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(resource.id)}`
+      ), '清理前过程检单回读')
+      assert.equal(String(detail?.id), resource.id, '过程检单主键不匹配')
+      assert.equal(String(detail?.type), '300', '过程检单类型不匹配')
+      assert(
+        this.reportIds.includes(String(detail?.srcBillId)) ||
+        this.reportIds.includes(String(detail?.customField8)),
+        '过程检单来源报工不属于本轮'
+      )
+      try {
+        unwrap(await this.api.request('PUT', '/mes/quality/qualityInspection/void', {
+          id: resource.id
+        }, {
+          expectedBusinessRejection: {
+            code: 500,
+            message: '该质检单存在对应的成品入库单，不能作废',
+            allowServiceCode: true
+          }
+        }), '作废过程检单')
+        unwrap(await this.api.deleteBusiness(
+          `/mes/quality/qualityInspection/delete?id=${encodeURIComponent(resource.id)}`
+        ), '删除过程检单')
+        resource.cleanup = 'DELETED_VERIFIED'
+        addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+        return true
+      } catch (error) {
+        if (!/该质检单存在对应的成品入库单/.test(error.message)) {
+          throw error
+        }
+
+        // A linked 104 output is an intentional audit-retention boundary:
+        // the product rejects voiding the inspection after stock write-back.
+        // Verify that the retained inspection and its output both belong to
+        // this fixture before treating the retention as successful cleanup.
+        const relatedReportIds = new Set(
+          [detail?.srcBillId, detail?.customField8]
+            .map((value) => String(value || ''))
+            .filter((value) => this.reportIds.includes(value))
+        )
+        if (relatedReportIds.size === 0) {
+          const entries = rowsOf(await this.api.getBusiness(
+            `/mes/quality/qualityInspection/queryMesQualityInspectionEntryByMainId/dictText?id=${encodeURIComponent(resource.id)}`
+          ), '保留过程检明细回读')
+          for (const entry of entries) {
+            for (const value of [entry?.srcBillId, entry?.srcEntryId]) {
+              const reportId = String(value || '')
+              if (this.reportIds.includes(reportId)) relatedReportIds.add(reportId)
+            }
+          }
+        }
+        const linkedOutputs = this.owned.filter((item) =>
+          item.kind === 'output' && relatedReportIds.has(String(item.sourceReportId))
+        )
+        assert(linkedOutputs.length > 0, '被保留质检单未找到本轮已生效104成品入库')
+        for (const output of linkedOutputs) {
+          await this.assertCleanupOwnership(output)
+        }
+        const retained = unwrap(await this.api.getBusiness(
+          `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(resource.id)}`
+        ), '保留过程检单回读')
+        assert.equal(Number(retained?.isVoided || 0), 0, '审计保留质检单不应被标记为作废')
+        resource.cleanup = 'RETAINED_AUDIT_LINKED_OUTPUT'
+        resource.retainedReason = 'QUALITY_INSPECTION_LINKED_TO_104_OUTPUT'
+        resource.linkedOutputIds = linkedOutputs.map((item) => item.id)
+        caseRecord.database = [...(caseRecord.database || []), {
+          stage: 'execution-cleanup-retained-linked-output',
+          inspectionId: resource.id,
+          reportIds: [...relatedReportIds],
+          outputIds: resource.linkedOutputIds,
+          reason: resource.retainedReason
+        }]
+        caseRecord.notes.push(
+          `质检单 ${resource.id} 已由正式规则保留：关联本轮104成品入库 ${resource.linkedOutputIds.join(',')}，不能作废，保留审计事实。`
+        )
+        addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+        return true
+      }
+    }
+    if (resource.kind === 'qualityPlan') {
+      const detail = unwrap(await this.api.getBusiness(
+        `/mes/quality/qualityPlan/queryById/dictText?id=${encodeURIComponent(resource.id)}`
+      ), '清理前过程检方案回读')
+      assert.equal(String(detail?.id), resource.id, '过程检方案主键不匹配')
+      assert.equal(detail?.planCode, resource.identity, '过程检方案编码不匹配')
+      await this.api.postBusiness(
+        `/mes/quality/qualityPlan/disable?id=${encodeURIComponent(resource.id)}`
+      )
+      unwrap(await this.api.deleteBusiness(
+        `${cleanupDefinitions.qualityPlan.endpoint}?id=${encodeURIComponent(resource.id)}`
+      ), '删除过程检方案')
+      resource.cleanup = 'DELETED_VERIFIED'
+      addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+      return true
+    }
+    if (resource.kind === 'qualityItem') {
+      const rows = rowsOf(await this.api.getBusiness(
+        `/mes/quality/item/list/dictText?pageNo=1&pageSize=100&itemCode=${encodeURIComponent(resource.identity)}`
+      ), '清理前过程检项目回读')
+      const detail = rows.find((item) => String(item?.id) === resource.id)
+      assert(detail, '过程检项目所有权回读失败')
+      await this.api.postBusiness(
+        `/mes/quality/item/disable?id=${encodeURIComponent(resource.id)}`
+      )
+      unwrap(await this.api.deleteBusiness(
+        `${cleanupDefinitions.qualityItem.endpoint}?id=${encodeURIComponent(resource.id)}`
+      ), '删除过程检项目')
+      resource.cleanup = 'DELETED_VERIFIED'
+      addCheck(caseRecord, `专属 ${label} 清理回读已确认`, true, resource.cleanup)
+      return true
+    }
+    return false
+  }
+
   async cleanupResource (resource, caseRecord) {
     const label = `${resource.kind}=${resource.id}`
     try {
+      if (['pickBill', 'qualityBinding', 'qualityInspection', 'qualityPlan', 'qualityItem']
+        .includes(resource.kind)) {
+        return await this.cleanupSpecialResource(resource, caseRecord)
+      }
       if (resource.kind === 'task') {
         // Parent work-order revocation formally removes its task. Avoid a
         // second void request after that state transition.
@@ -842,15 +1630,32 @@ export class ExecutionWorkflowFixture {
           ), '作废专属工单任务')
         }
       }
-      if (resource.kind === 'opening') {
-        unwrap(await this.api.putBusiness('/mes/stkIo/void', { id: resource.id }), '作废专属期初库存')
+      if (resource.kind === 'opening' || resource.kind === 'output') {
+        if (resource.kind === 'output' && this.normalizeWmsOutputCleanupEnabled) {
+          await this.normalizeWmsOutputCleanup(resource.id)
+        }
+        const before = unwrap(await this.api.getBusiness(
+          `/mes/stkIo/queryById?id=${encodeURIComponent(resource.id)}`
+        ), '作废前专属入库回读')
+        if (Number(before?.isVoided) !== 1 || Number(before?.isEffective) !== 0) {
+          unwrap(await this.api.putBusiness('/mes/stkIo/void', { id: resource.id }), '作废专属期初库存')
+        }
         const detail = unwrap(await this.api.getBusiness(
           `/mes/stkIo/queryById?id=${encodeURIComponent(resource.id)}`
         ), '作废后期初库存回读')
         assert.equal(String(detail?.id), resource.id, '专属期初库存所有权主键不匹配')
-        assert.equal(detail.remark, this.marker, '专属期初库存所有权标记不匹配')
+        if (resource.kind === 'opening') {
+          assert.equal(detail.remark, this.marker, '专属期初库存所有权标记不匹配')
+        } else {
+          assert.equal(String(detail?.srcBillType), 'ProdWork', '自动成品入库来源类型不匹配')
+          assert.equal(String(detail?.srcBillId), resource.sourceWorkId, '自动成品入库来源工单不匹配')
+          assert.equal(String(detail?.stockIoType), '104', '自动成品入库类型不匹配')
+        }
         assert.equal(Number(detail.isVoided), 1, '专属期初库存未确认作废')
-        resource.cleanup = 'VOIDED_RETAINED'
+        assert.equal(Number(detail.isEffective), 0, '专属作废入库仍处于生效状态')
+        resource.cleanup = resource.kind === 'output'
+          ? 'VOIDED_RETAINED_AUTO_OUTPUT'
+          : 'VOIDED_RETAINED'
       } else {
         try {
           const deleteOptions = resource.kind === 'warehouse'
@@ -885,6 +1690,26 @@ export class ExecutionWorkflowFixture {
     }
   }
 
+  async normalizeWmsOutputCleanup (outputId) {
+    const rows = asList(await this.api.getBusiness(
+      `/wms/operation/task/page?pageNo=1&pageSize=100&sourceBillType=MesStkIo&sourceBillId=${encodeURIComponent(outputId)}`
+    ))
+    for (const task of rows.filter((item) => item?.taskType === 'PUTAWAY')) {
+      if (task.status === 'PENDING') {
+        await this.api.postBusiness('/wms/operation/task/start', {
+          id: task.id, remark: `${this.marker} cleanup start`
+        })
+      }
+      if (task.status === 'PENDING' || task.status === 'IN_PROGRESS') {
+        await this.api.postBusiness('/wms/operation/task/complete', {
+          id: task.id,
+          actualQuantity: task.plannedQuantity,
+          remark: `${this.marker} cleanup complete`
+        })
+      }
+    }
+  }
+
   async cleanup (caseRecord) {
     const results = []
     const clean = async (kind, id) => {
@@ -895,6 +1720,13 @@ export class ExecutionWorkflowFixture {
         results.push(false)
         return
       }
+      results.push(await this.cleanupResource(resource, caseRecord))
+    }
+    for (const outputId of [...this.outputIds].reverse()) await clean('output', outputId)
+    for (const resource of this.owned.filter((item) => item.kind === 'pickBill').reverse()) {
+      results.push(await this.cleanupResource(resource, caseRecord))
+    }
+    for (const resource of this.owned.filter((item) => item.kind === 'qualityInspection').reverse()) {
       results.push(await this.cleanupResource(resource, caseRecord))
     }
     for (const reportId of [...this.reportIds].reverse()) await clean('report', reportId)
@@ -963,7 +1795,10 @@ export class ExecutionWorkflowFixture {
         results.push(false)
       }
     }
-    const cleanupOrder = ['opening', 'inventory', 'route', 'procedure', 'bom', 'material', 'location', 'area', 'warehouse']
+    const cleanupOrder = [
+      'opening', 'inventory', 'qualityBinding', 'route', 'procedure',
+      'qualityPlan', 'qualityItem', 'bom', 'material', 'location', 'area', 'warehouse'
+    ]
     for (const kind of cleanupOrder) {
       for (const resource of this.owned.filter((item) => item.kind === kind).reverse()) {
         results.push(await this.cleanupResource(resource, caseRecord))
@@ -973,7 +1808,7 @@ export class ExecutionWorkflowFixture {
       results.push(await this.cleanupResource(team, caseRecord))
     }
     const complete = results.every(Boolean)
-    this.record.executionFixture.cleanup = complete ? 'VERIFIED' : 'INCOMPLETE'
+    this.fixtureRecord.cleanup = complete ? 'VERIFIED' : 'INCOMPLETE'
     const retainedOpening = this.owned.some((resource) => resource.kind === 'opening')
     caseRecord.notes.push(complete
       ? `AUTOTEST 夹具 ${this.marker} 清理已回读确认${retainedOpening

@@ -383,12 +383,14 @@ const createDedicatedProductionPrerequisite = async (api, marker, { caseRecord }
   })
   const bomId = requiredId(payloadData(await api.postBusiness('/mes/wmsAssemble/add', bomBody)), '专属生产 BOM')
   registerResource(registry, { kind: 'bom', id: bomId, identity: bomBody.code })
+  await api.postBusiness(`/mes/wmsAssemble/publish?id=${encodeURIComponent(bomId)}`)
   const bom = payloadData(await api.getBusiness(`/mes/wmsAssemble/queryById?id=${bomId}`))
   const bomSubs = listData(await api.getBusiness(
     `/mes/wmsAssemble/queryWmsAssembleSubByMainId?id=${bomId}&pageNo=1&pageSize=100`
   ))
   if (String(bom?.id) !== bomId || String(bom?.stockId) !== product.id ||
-      bom?.bomUsage !== 'PRODUCTION' || String(bom?.prepayWareHouseId) !== storage.warehouse.id ||
+      bom?.bomUsage !== 'PRODUCTION' || Number(bom?.devStatus) !== 2 ||
+      String(bom?.prepayWareHouseId) !== storage.warehouse.id ||
       String(bom?.prepayWareAreaId) !== storage.area.id ||
       bomSubs.length !== 1 || String(bomSubs[0]?.stockId) !== component.id ||
       String(bomSubs[0]?.prepayWareHouseId) !== storage.warehouse.id ||
@@ -557,6 +559,88 @@ export async function ensureOutsourceApprovalOption (api) {
 }
 
 /**
+ * 增量补齐委外业务类型规则。
+ *
+ * 委外单保存时会按 OUTSOURCE_WORK 解析租户级生效规则；标准租户可能只有
+ * 审批策略而没有该业务类型映射，导致所有专属委外单在建单阶段被拒绝。
+ * 只复用或新增 OUTSOURCE_WORK，不覆盖已有企业规则。
+ */
+export async function ensureOutsourceBusinessTypeRule (api, caseRecord) {
+  const documentTypePage = await api.getBusiness(
+    '/system/document/type/page?pageNo=1&pageSize=100&code=OUTSOURCE_WORK'
+  )
+  let documentType = asList(payloadData(documentTypePage)).find((row) =>
+    String(row.code) === 'OUTSOURCE_WORK'
+  )
+  let documentTypeCreated = false
+  if (!documentType?.id) {
+    const documentTypeId = payloadData(await api.postBusiness('/system/document/type/create', {
+      code: 'OUTSOURCE_WORK',
+      name: '工单委外',
+      isOpen: true,
+      sort: 971
+    }))
+    documentType = payloadData(await api.getBusiness(
+      `/system/document/type/get?id=${encodeURIComponent(documentTypeId)}`
+    ))
+    documentTypeCreated = true
+  }
+  const documentTypeId = requiredId(documentType?.id, 'OUTSOURCE_WORK 单据类型')
+  const rulePage = await api.getBusiness(
+    `/mes/outsource-type-rule/page?pageNo=1&pageSize=100&documentTypeId=${encodeURIComponent(documentTypeId)}`
+  )
+  const rules = asList(payloadData(rulePage))
+  const today = new Date().toISOString().slice(0, 10)
+  const active = rules.find((row) =>
+    String(row.documentTypeId) === documentTypeId &&
+    String(row.documentTypeCode) === 'OUTSOURCE_WORK' &&
+    String(row.coreType) === 'WORK' &&
+    Number(row.status) === 1 &&
+    String(row.effectiveFrom || '0000-01-01') <= today &&
+    (!row.effectiveTo || String(row.effectiveTo) >= today)
+  )
+  if (active?.id) {
+    caseRecord?.evidence?.push(
+      `委外业务类型规则已存在并复用：OUTSOURCE_WORK -> WORK, ruleId=${active.id}, version=${active.version}`
+    )
+    return {
+      created: false,
+      documentTypeCreated,
+      documentTypeId,
+      ruleId: String(active.id),
+      documentTypeCode: 'OUTSOURCE_WORK',
+      rule: active
+    }
+  }
+  const created = payloadData(await api.postBusiness('/mes/outsource-type-rule/create', {
+    documentTypeId,
+    coreType: 'WORK',
+    effectiveFrom: '2026-01-01',
+    status: 1,
+    remark: `${OUTSOURCE_MARKER_PREFIX}-CONFIG OUTSOURCE_WORK -> WORK`
+  }))
+  const ruleId = requiredId(created, 'OUTSOURCE_WORK 委外规则')
+  const rule = payloadData(await api.getBusiness(
+    `/mes/outsource-type-rule/get?id=${encodeURIComponent(ruleId)}`
+  ))
+  if (String(rule?.documentTypeCode) !== 'OUTSOURCE_WORK' ||
+      String(rule?.coreType) !== 'WORK' || Number(rule?.status) !== 1) {
+    throw new Error(`OUTSOURCE_WORK 委外规则回读不一致：${JSON.stringify(rule)}`)
+  }
+  caseRecord?.evidence?.push(
+    `委外业务类型规则已增量创建：OUTSOURCE_WORK -> WORK, ruleId=${ruleId}, version=${rule.version}`
+  )
+  return {
+    created: true,
+    documentTypeCreated,
+    documentTypeId,
+    ruleId,
+    documentTypeCode: 'OUTSOURCE_WORK',
+    rule
+  }
+}
+
+/**
  * 委外 110 收货必须先生成 104 质检事实，再由质检结果驱动入库执行。
  * 仅在本地验收租户缺少该单据策略时增量补齐，不覆盖已有租户配置。
  */
@@ -601,6 +685,9 @@ export async function createOutsourceDraft (api, {
   currencyCode = 'CNY',
   taxRate = 13
 } = {}) {
+  if (caseRecord) {
+    await ensureOutsourceBusinessTypeRule(api, caseRecord)
+  }
   // Lightweight cases may intentionally use a caller-owned read-only work. Heavy
   // material-out cases must opt into the complete dedicated production chain.
   const prerequisite = dedicatedPrerequisite

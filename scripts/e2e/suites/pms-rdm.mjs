@@ -1,6 +1,9 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute } from '../lib/browser.mjs'
-import { RDM_CASES, runRdmWriteCase } from '../fixtures/rdm.mjs'
+import {
+  RDM_CASES, runRdmWriteCase, initializeRdmAssertions, finalizeRdmAssertions,
+  createRdmReportFixture, verifyRdmReportFixture, RDM_METRIC_FORMULAS, matchesRdmMetricTruth
+} from '../fixtures/rdm.mjs'
 
 export const cases = [
   'RDM-001',
@@ -107,6 +110,7 @@ const markPartial = (caseRecord, caseId) => {
 export const runRdmEvidenceContract = async ({ caseId, api, caseRecord }) => {
   if (!RDM_UNTESTED_STEPS[caseId]) return { partial: false }
 
+  initializeRdmAssertions(caseRecord, caseId)
   markPartial(caseRecord, caseId)
 
   if (caseId === 'RDM-001') {
@@ -307,10 +311,11 @@ export const runRdmEvidenceContract = async ({ caseId, api, caseRecord }) => {
     }
   }
 
-  return { partial: true, note: `未测步骤：${RDM_UNTESTED_STEPS[caseId]}` }
+  return { ...finalizeRdmAssertions(caseRecord, caseId, { readOnly: true }),
+    partial: true, note: `未测步骤：${RDM_UNTESTED_STEPS[caseId]}` }
 }
 
-export const runCase = async ({ caseId, page, record, caseRecord }) => {
+export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
 
@@ -331,6 +336,9 @@ export const runCase = async ({ caseId, page, record, caseRecord }) => {
   }
 
   if (caseId === 'RDM-007') {
+    initializeRdmAssertions(caseRecord, caseId)
+    const fixture = await createRdmReportFixture({ api, caseRecord })
+    await verifyRdmReportFixture({ api, caseRecord, fixture })
     await openRoute(page, '/reports/project/project-plan/progress-efficiency', { retries: 1 })
     const reportPage = page.locator('[data-testid="pm-report-progress-efficiency"]').first()
     await reportPage.waitFor({ state: 'visible' })
@@ -399,7 +407,66 @@ export const runCase = async ({ caseId, page, record, caseRecord }) => {
         metricCodes: Array.from(metricCodes)
       })
     })
+    addCheck(caseRecord, 'RDM007 五指标定义公式与正式口径一致',
+      definition?.metricVersion === fixture.metricVersion &&
+        Object.entries(RDM_METRIC_FORMULAS).every(([code, formula]) =>
+          definition?.metrics?.some((metric) => metric.code === code && metric.formula === formula)),
+      JSON.stringify({ metricVersion: definition?.metricVersion, metrics: definition?.metrics }))
+    const projectSelect = reportPage.locator('.el-form-item')
+      .filter({ has: page.locator('.el-form-item__label').filter({ hasText: /^项目$/ }) })
+      .locator('.el-select')
+    const selectProject = async (name) => {
+      await projectSelect.click()
+      const input = projectSelect.locator('input')
+      await input.fill(name)
+      const option = page.getByRole('option').filter({ hasText: name }).first()
+      await option.waitFor({ state: 'visible' })
+      await option.click()
+    }
+    const queryReport = async (projectId) => {
+      const responsePromise = page.waitForResponse((response) => {
+        const url = new URL(response.url())
+        return url.pathname.endsWith('/pm/report/progress-efficiency') &&
+          url.searchParams.get('projectId') === projectId && response.request().method() === 'GET'
+      })
+      await reportPage.getByRole('button', { name: '查询', exact: true }).click()
+      const response = await responsePromise
+      const payload = await response.json()
+      if (payload?.code !== 0) throw new Error('RDM007 浏览器筛选报表接口未成功')
+      await reportPage.locator('.el-loading-mask').waitFor({ state: 'hidden' })
+      return payload.data
+    }
+    await selectProject(fixture.projectName)
+    const browserReport = await queryReport(fixture.projectId)
+    const metricValues = await reportPage.locator('.report-metric__value').allTextContents()
+    const expectedMetricValues = metricKeys.map((key) =>
+      fixture.metricTruth[key] === null ? '-' : ['taskCompletionRate', 'versionOnTimeRate'].includes(key)
+        ? Number(fixture.metricTruth[key]).toFixed(2)
+        : Number(fixture.metricTruth[key]).toLocaleString('zh-CN'))
+    addCheck(caseRecord, 'RDM007 浏览器正式项目筛选与五指标真值一致',
+      String(browserReport?.appliedFilters?.projectId) === fixture.projectId &&
+        browserReport?.projectCount === 1 && matchesRdmMetricTruth(browserReport, fixture.metricTruth) &&
+        metricValues.length === 5 && metricValues.every((value, index) =>
+          value.trim() === expectedMetricValues[index]),
+      JSON.stringify({ filters: browserReport?.appliedFilters, metricValues, expectedMetricValues }))
+    if (outputDir) {
+      const screenshot = `${outputDir}/rdm-007-owned-project-filter.png`
+      await page.screenshot({ path: screenshot, fullPage: true })
+      caseRecord.evidence.push(screenshot)
+    }
+    await selectProject(fixture.controlProjectName)
+    const controlReport = await queryReport(fixture.controlProjectId)
+    addCheck(caseRecord, 'RDM007 切换对照项目不泄漏目标项目统计',
+      String(controlReport?.appliedFilters?.projectId) === fixture.controlProjectId &&
+        controlReport?.projectCount === 1 && matchesRdmMetricTruth(controlReport, fixture.controlTruth),
+      JSON.stringify({ controlReport, controlTruth: fixture.controlTruth }))
+    if (outputDir) {
+      const screenshot = `${outputDir}/rdm-007-progress-efficiency.png`
+      await page.screenshot({ path: screenshot, fullPage: true })
+      caseRecord.evidence.push(screenshot)
+    }
     caseRecord.evidence.push('真实登录、报表页面与研发进度效率指标契约校验（PB-338）')
+    return { token, api, ...finalizeRdmAssertions(caseRecord, caseId) }
   }
 
   return { token, api }

@@ -15,8 +15,19 @@ import {
   presetConfirmButtonSelector,
   presetConfirmButtonText,
   readinessClassification,
-  validateInitReadinessFacts
+  validateInitReadinessFacts,
+  validateWmsTopology
 } from '../fixtures/init-gaps.mjs'
+import {
+  localInitCases,
+  localInitEvidence,
+  runIsolatedLocalInitCase,
+  validateInitialEnterpriseShape,
+  buildInitialEnterpriseShapeSql,
+  buildConfigSnapshotSql,
+  buildDedicatedLogoPersistenceSql,
+  routeByComponent
+} from '../fixtures/init-local-closure.mjs'
 
 const local = {
   target: 'local',
@@ -28,11 +39,224 @@ const local = {
 }
 
 test('init gap fixture owns exactly the requested catalog cases', () => {
-  assert.deepEqual([...cases], ['INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-002'])
+  assert.deepEqual([...cases], [
+    'INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-001', 'PB001-002'
+  ])
   for (const caseId of cases) {
     const definition = catalogDefinition(caseId)
     assert.ok(definition.assertions.length > 0)
   }
+})
+
+test('every isolated local init case is connected to the gap suite dispatcher', () => {
+  assert.deepEqual([...localInitCases], ['INIT-002', 'INIT-003', 'INIT-004', 'PB001-001', 'PB001-002'])
+  for (const caseId of localInitCases) assert.ok(cases.includes(caseId), caseId)
+})
+
+test('enterprise page route follows the complete real permission-menu path', () => {
+  const menus = [{
+    path: 'systemModel',
+    children: [{
+      path: 'base',
+      children: [{
+        path: 'organization',
+        children: [{
+          path: 'enterprise-organization',
+          component: 'system/enterprise-organization/index'
+        }]
+      }]
+    }]
+  }]
+  assert.equal(
+    routeByComponent(menus, 'system/enterprise-organization/index'),
+    '/systemModel/base/organization/enterprise-organization'
+  )
+  assert.equal(routeByComponent(menus, 'missing/component'), null)
+})
+
+test('new tenant initial enterprise shape accepts owned template branding but requires empty profile data', () => {
+  const valid = validateInitialEnterpriseShape({
+    registrationName: 'E2E TENANT',
+    enterpriseFullName: null,
+    enterpriseLogoUrl: null,
+    brandMarkUrl: '/logo/cfor-logo-mark.png',
+    brandLogoUrl: '/logo/cfor-logo.png',
+    brandDarkLogoUrl: '/logo/cfor-logo.png'
+  }, [
+    ['organization', '0', '', '', '', '', '', ''],
+    ['tenant-brand', '1', '9007199254740999', '/logo/cfor-logo-mark.png',
+      '/logo/cfor-logo.png', '/logo/cfor-logo.png', '', ''],
+    ['template-brand', '1', '/logo/cfor-logo-mark.png', '/logo/cfor-logo.png',
+      '/logo/cfor-logo.png', '', '', '']
+  ], '9007199254740999')
+  assert.equal(valid.tenantBrandOwned, true)
+  assert.throws(() => validateInitialEnterpriseShape({
+    enterpriseFullName: 'foreign data', enterpriseLogoUrl: null,
+    brandMarkUrl: '/logo/cfor-logo-mark.png', brandLogoUrl: '/logo/cfor-logo.png',
+    brandDarkLogoUrl: '/logo/cfor-logo.png'
+  }, [
+    ['organization', '1', '', '', '', '', '', ''],
+    ['tenant-brand', '1', '9007199254740999', '/logo/cfor-logo-mark.png',
+      '/logo/cfor-logo.png', '/logo/cfor-logo.png', '', ''],
+    ['template-brand', '1', '/logo/cfor-logo-mark.png', '/logo/cfor-logo.png',
+      '/logo/cfor-logo.png', '', '', '']
+  ], '9007199254740999'), /新租户企业资料主表必须为空/)
+})
+
+test('new tenant initial enterprise shape rejects cross-tenant or non-template branding', () => {
+  const base = {
+    enterpriseFullName: null, enterpriseLogoUrl: null,
+    brandMarkUrl: '/logo/cfor-logo-mark.png', brandLogoUrl: '/logo/cfor-logo.png',
+    brandDarkLogoUrl: '/logo/cfor-logo.png'
+  }
+  const template = ['template-brand', '1', '/logo/cfor-logo-mark.png',
+    '/logo/cfor-logo.png', '/logo/cfor-logo.png', '', '', '']
+  assert.throws(() => validateInitialEnterpriseShape(base, [
+    ['organization', '0', '', '', '', '', '', ''],
+    ['tenant-brand', '1', '1', '/logo/cfor-logo-mark.png', '/logo/cfor-logo.png',
+      '/logo/cfor-logo.png', '', ''], template
+  ], '9007199254740999'), /不属于当前租户/)
+  assert.throws(() => validateInitialEnterpriseShape({ ...base, brandLogoUrl: '/logo/other.png' }, [
+    ['organization', '0', '', '', '', '', '', ''],
+    ['tenant-brand', '1', '9007199254740999', '/logo/cfor-logo-mark.png', '/logo/cfor-logo.png',
+      '/logo/cfor-logo.png', '', ''], template
+  ], '9007199254740999'), /接口品牌字段与当前租户配置不一致/)
+})
+
+test('initial enterprise snapshot SQL follows the actual table schemas', () => {
+  const sql = buildInitialEnterpriseShapeSql({
+    tenantId: '9007199254740999',
+    organizationColumns: [
+      'tenant_id', 'enterprise_full_name', 'enterprise_short_name', 'enterprise_type',
+      'unified_social_credit_code', 'industry_category', 'industry_sub_category',
+      'taxpayer_qualification', 'province_code', 'city_code', 'district_code',
+      'registered_address', 'enterprise_logo_url', 'deleted'
+    ],
+    configColumns: ['tenant_id', 'category', 'tag', 'config_data']
+  })
+  assert.match(sql, /system_enterprise_organization[\s\S]*deleted=0/)
+  assert.match(sql, /FROM system_config[\s\S]*tag='common'/)
+  assert.doesNotMatch(sql, /FROM system_config[\s\S]*deleted=0/)
+  assert.throws(() => buildInitialEnterpriseShapeSql({
+    tenantId: '1', organizationColumns: ['tenant_id'],
+    configColumns: ['tenant_id', 'category', 'tag', 'config_data']
+  }), /缺少初始形状所需正式字段/)
+})
+
+test('all system_config read-only snapshots omit deleted when the actual table omits it', () => {
+  const configColumns = ['id', 'tenant_id', 'category', 'tag', 'config_data']
+  const snapshot = buildConfigSnapshotSql({ tenantId: '9007199254740999', configColumns })
+  const logo = buildDedicatedLogoPersistenceSql({
+    tenantId: '9007199254740999',
+    organizationColumns: ['tenant_id', 'enterprise_logo_url', 'deleted'],
+    configColumns
+  })
+  assert.doesNotMatch(snapshot, /deleted=0/)
+  assert.doesNotMatch(logo, /system_config[\s\S]*deleted=0/)
+  assert.match(logo, /system_enterprise_organization[\s\S]*deleted=0/)
+  assert.throws(() => buildConfigSnapshotSql({ tenantId: '1', configColumns: ['tenant_id'] }),
+    /系统配置表缺少只读快照所需正式字段/)
+  assert.throws(() => buildDedicatedLogoPersistenceSql({
+    tenantId: '1', organizationColumns: ['tenant_id'], configColumns
+  }), /企业资料表缺少 Logo 只读快照所需正式字段/)
+})
+
+test('local init closure reuses the runner platform session instead of treating options as credentials', async () => {
+  const calls = []
+  const context = {
+    page: {},
+    record: { api: [] },
+    caseRecord: { checks: [], notes: [], database: [] }
+  }
+  const dependencies = {
+    config: local,
+    writeFixturesEnabled: true,
+    async assertLocalWriteSafety () {},
+    async login (page, options) {
+      calls.push({ page, options })
+      return { token: 'platform-token-12345678901234567890', tenantId: '1' }
+    },
+    createApiClient () {
+      return {
+        async getPermissionInfo () {
+          return { data: { roles: ['super_admin'] } }
+        },
+        async getBusiness () {
+          return { data: { id: '1', name: 'CFOR 标准平台' } }
+        }
+      }
+    },
+    async runEnterpriseIsolationEvidence () {
+      return { executed: true }
+    }
+  }
+  const result = await runIsolatedLocalInitCase(context, dependencies)
+  assert.deepEqual(result, { executed: true })
+  assert.deepEqual(calls, [{ page: context.page, options: { returnContext: true } }])
+})
+
+test('local init closure proves tenant1 from formal APIs when the cached login context has no tenant id', async () => {
+  const context = {
+    page: {},
+    record: { api: [] },
+    caseRecord: { checks: [], notes: [], database: [] }
+  }
+  const dependencies = {
+    config: local,
+    writeFixturesEnabled: true,
+    async assertLocalWriteSafety () {},
+    async login () {
+      return { token: 'platform-token-12345678901234567890', tenantId: '' }
+    },
+    createApiClient () {
+      return {
+        async getPermissionInfo () {
+          return { data: { roles: ['super_admin'] } }
+        },
+        async getBusiness (path) {
+          assert.equal(path, '/system/tenant/get?id=1')
+          return { data: { id: '1', name: 'CFOR 标准平台' } }
+        }
+      }
+    },
+    async runEnterpriseIsolationEvidence () {
+      return { executed: true }
+    }
+  }
+  assert.deepEqual(await runIsolatedLocalInitCase(context, dependencies), { executed: true })
+})
+
+test('local init closure rejects a token that is not formally a standard-platform super_admin session', async () => {
+  const context = {
+    page: {},
+    record: { api: [] },
+    caseRecord: { checks: [], notes: [], database: [] }
+  }
+  const dependencies = {
+    config: local,
+    writeFixturesEnabled: true,
+    async assertLocalWriteSafety () {},
+    async login () {
+      return { token: 'platform-token-12345678901234567890', tenantId: '' }
+    },
+    createApiClient () {
+      return {
+        async getPermissionInfo () {
+          return { data: { roles: ['tenant_admin'] } }
+        },
+        async getBusiness () {
+          return { data: { id: '1', name: 'CFOR 标准平台' } }
+        }
+      }
+    },
+    async runEnterpriseIsolationEvidence () {
+      throw new Error('must not create isolated resources')
+    }
+  }
+  await assert.rejects(
+    runIsolatedLocalInitCase(context, dependencies),
+    /正式 API 证明为标准租户 1 super_admin/
+  )
 })
 
 test('scope rejects non-local endpoints, wrong tenant, and credential-bearing URLs', () => {
@@ -71,8 +295,12 @@ test('allowlist permits only read and preview calls and rejects every write surf
 })
 
 test('catalog mapping preserves every assertion and keeps unproven work as GAP', () => {
-  const record = { checks: [] }
-  initializeCatalogAssertions(record, 'INIT-002', new Map([[0, { status: 'VERIFIED' }]]))
+  const record = {
+    checks: [{ name: 'preview evidence', passed: true }]
+  }
+  initializeCatalogAssertions(record, 'INIT-002', new Map([[
+    0, { status: 'VERIFIED', evidenceChecks: ['preview evidence'] }
+  ]]))
   const definition = catalogDefinition('INIT-002')
   assert.deepEqual(record.catalogAssertions.map((item) => item.assertion), definition.assertions)
   assert.equal(record.catalogAssertions[0].status, 'VERIFIED')
@@ -80,13 +308,58 @@ test('catalog mapping preserves every assertion and keeps unproven work as GAP',
   assert.equal(record.readyCandidate, false)
 })
 
+test('catalog mapping rejects bare, missing, duplicate, or failed named evidence', () => {
+  for (const record of [
+    { checks: [] },
+    { checks: [{ name: 'preview evidence', passed: false }] },
+    { checks: [
+      { name: 'preview evidence', passed: true },
+      { name: 'preview evidence', passed: true }
+    ] }
+  ]) {
+    initializeCatalogAssertions(record, 'INIT-002', new Map([[
+      0, { status: 'VERIFIED', evidenceChecks: ['preview evidence'] }
+    ]]))
+    assert.equal(record.catalogAssertions[0].status, 'GAP')
+    assert.match(record.catalogAssertions[0].reason, /具名检查/)
+  }
+
+  const bare = { checks: [{ name: 'preview evidence', passed: true }] }
+  initializeCatalogAssertions(bare, 'INIT-002', new Map([[0, { status: 'VERIFIED' }]]))
+  assert.equal(bare.catalogAssertions[0].status, 'GAP')
+  assert.deepEqual(bare.catalogAssertions[0].evidenceChecks, [])
+})
+
+test('isolated INIT-002/003/004 evidence maps remain fully named and verifiable', () => {
+  for (const caseId of ['INIT-002', 'INIT-003', 'INIT-004']) {
+    const record = {
+      checks: Object.values(localInitEvidence[caseId]).flatMap((entry) =>
+        entry.checks.map((name) => ({ name, passed: true })))
+    }
+    const mapping = new Map(Object.entries(localInitEvidence[caseId]).map(([index, entry]) => [
+      Number(index), { status: 'VERIFIED', evidenceChecks: entry.checks }
+    ]))
+    initializeCatalogAssertions(record, caseId, mapping)
+    assert.equal(record.catalogAssertions.every((item) => item.status === 'VERIFIED'), true, caseId)
+    assert.equal(record.catalogAssertions.every((item) =>
+      item.evidenceChecks.length > 0 && item.evidenceChecks.every((name) =>
+        record.checks.filter((check) => check.name === name).length === 1)), true, caseId)
+  }
+})
+
 test('INIT-005 catalog mapping preserves GAP reasons without upgrading assertions', () => {
-  const record = { checks: [] }
+  const record = {
+    checks: [{ name: 'job disabled evidence', passed: true }]
+  }
   initializeCatalogAssertions(record, 'INIT-005', new Map([
     [0, { status: 'GAP', reason: 'WMS topology not checked' }],
     [1, { status: 'GAP', reason: 'skip API round trip not executed' }],
     [2, { status: 'GAP', reason: 'facts-before/after not captured' }],
-    [3, { status: 'VERIFIED', evidence: 'default migration plus read-only snapshot' }]
+    [3, {
+      status: 'VERIFIED',
+      evidence: 'default migration plus read-only snapshot',
+      evidenceChecks: ['job disabled evidence']
+    }]
   ]))
   assert.equal(record.catalogAssertions.length, 4)
   assert.deepEqual(record.catalogAssertions.map((item) => item.status), [
@@ -187,12 +460,28 @@ test('INIT-005 permits empty facts only with a non-ready status', () => {
   assert.equal(validateInitReadinessFacts(rows, readinessItems(counts, { material: 'READY' })).valid, false)
 })
 
+test('INIT-005 compares ERP compatibility rows with all non-deleted warehouses, not only enabled warehouses', () => {
+  const topology = {
+    warehouse: 415,
+    'warehouse-total': 486,
+    area: 331,
+    location: 391,
+    'orphan-area': 0,
+    'orphan-location': 0,
+    'erp-view': 1,
+    'erp-rows': 486
+  }
+  assert.equal(validateWmsTopology(topology, 'READY').valid, true)
+  assert.match(validateWmsTopology({ ...topology, 'orphan-location': 25 }, 'READY').reason, /孤立库位/)
+  assert.match(validateWmsTopology({ ...topology, 'erp-rows': 415 }, 'READY').reason, /行数/)
+})
+
 test('logo inspection requires actual labeled fields and does not infer save behavior', () => {
   assert.deepEqual(inspectLogoFields([
     { label: '图形标识', required: false, hasRequiredMark: false },
     { label: '黑字完整 Logo', required: false, hasRequiredMark: false },
     { label: '白字完整 Logo', required: false, hasRequiredMark: false }
-  ]), { found: 2, optional: true })
+  ]), { found: 3, optional: true })
   assert.equal(inspectLogoFields([{ label: '黑字完整 Logo', required: true }]).optional, false)
   assert.equal(inspectLogoFields([{ label: '企业名称', required: false }]).optional, false)
 })

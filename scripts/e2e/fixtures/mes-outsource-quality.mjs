@@ -137,7 +137,11 @@ export async function createDedicatedOutsourceQuality (api, caseRecord, fixture)
   ensureRecord(caseRecord)
   const marker = fixtureMarker(fixture)
   const materialId = dedicatedProductId(fixture)
-  const effectiveFrom = businessDateAsiaShanghai()
+  // The local Java service may calculate billDate in UTC while the browser
+  // fixture runs in Asia/Shanghai. Start the owned rule a few days earlier so
+  // the rule matches both representations of the current business date.
+  const effectiveFrom = fixture.effectiveFrom ??
+    businessDateAsiaShanghai(Date.now() - 7 * 24 * 60 * 60 * 1000)
   const resources = []
 
   const item = await createPublishedItem(api, caseRecord, {

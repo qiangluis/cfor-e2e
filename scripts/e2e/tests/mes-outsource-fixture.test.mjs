@@ -32,6 +32,15 @@ const makeDedicatedApi = (marker, { failPath, inventoryQty = 4, inventoryAvailab
     async getBusiness(path) {
       calls.push({ method: 'GET', path })
       if (path === failPath) throw new Error(`simulated failure: ${path}`)
+      if (path === '/system/document/type/page?pageNo=1&pageSize=100&code=OUTSOURCE_WORK') {
+        return ok([{ id: '901', code: 'OUTSOURCE_WORK', name: '工单委外', isOpen: true }])
+      }
+      if (path === '/mes/outsource-type-rule/page?pageNo=1&pageSize=100&documentTypeId=901') {
+        return ok([{
+          id: '902', documentTypeId: '901', documentTypeCode: 'OUTSOURCE_WORK',
+          coreType: 'WORK', status: 1, effectiveFrom: '2026-01-01', version: 1
+        }])
+      }
       if (path === '/mes/basUnit/list/enabled') return ok([{ id: '11' }])
       if (path === '/mes/wmsWareHouse/allTree') {
         return ok([{ id: ids.warehouse, name: `${marker}-委外仓`, code: `${marker}-WH`, mark: marker, children: [] }])
@@ -54,6 +63,7 @@ const makeDedicatedApi = (marker, { failPath, inventoryQty = 4, inventoryAvailab
       }
       if (path.includes('/mes/wmsAssemble/queryById')) {
         return ok({ id: ids.bom, stockId: ids.product, bomUsage: 'PRODUCTION',
+          devStatus: 2,
           prepayWareHouseId: ids.warehouse, prepayWareAreaId: ids.area })
       }
       if (path.includes('/mes/wmsAssemble/queryWmsAssembleSubByMainId')) {
@@ -95,6 +105,7 @@ const makeDedicatedApi = (marker, { failPath, inventoryQty = 4, inventoryAvailab
         return ok(body.code.endsWith('-FG') ? ids.product : body.code.endsWith('-RM') ? ids.component : ids.outsource)
       }
       if (path === '/mes/wmsAssemble/add') return ok(ids.bom)
+      if (path === `/mes/wmsAssemble/publish?id=${ids.bom}`) return ok(true)
       if (path === '/mes/prodOrder/add') return ok(ids.order)
       if (path === '/mes/prodWork/transferWorkOrder') return ok(true)
       if (path === '/mes/prodOutsource/add') return ok(ids.outsource)

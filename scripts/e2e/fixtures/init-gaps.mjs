@@ -11,7 +11,9 @@ import { login, openRoute } from '../lib/browser.mjs'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const catalogPath = path.join(here, '..', 'cases', 'catalog.json')
 
-export const cases = Object.freeze(['INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-002'])
+export const cases = Object.freeze([
+  'INIT-002', 'INIT-003', 'INIT-004', 'INIT-005', 'PB001-001', 'PB001-002'
+])
 
 export const INIT_READINESS_FACT_KEYS = Object.freeze([
   'material', 'unit', 'supplier', 'customer', 'account', 'warehouse', 'accountSet'
@@ -127,13 +129,21 @@ export function initializeCatalogAssertions (caseRecord, caseId, verified = new 
     const value = statuses.get(index)
     return typeof value === 'string' ? { status: value } : (value || {})
   }
-  caseRecord.catalogAssertions = definition.assertions.map((assertion, index) => ({
-    index,
-    assertion,
-    status: statusFor(index).status === 'VERIFIED' ? 'VERIFIED' : 'GAP',
-    ...(statusFor(index).evidence ? { evidence: statusFor(index).evidence } : {}),
-    ...(statusFor(index).reason ? { reason: statusFor(index).reason } : {})
-  }))
+  caseRecord.catalogAssertions = definition.assertions.map((assertion, index) => {
+    const candidate = statusFor(index)
+    const names = Array.isArray(candidate.evidenceChecks) ? candidate.evidenceChecks : []
+    const supported = names.length > 0 && names.every((name) => {
+      const checks = (caseRecord.checks || []).filter((item) => item.name === name)
+      return checks.length === 1 && checks[0].passed === true
+    })
+    const verified = candidate.status === 'VERIFIED' && !candidate.reason && supported
+    return {
+      index, assertion, status: verified ? 'VERIFIED' : 'GAP', evidenceChecks: [...names],
+      ...(verified && candidate.evidence ? { evidence: candidate.evidence } : {}),
+      ...(!verified ? { reason: candidate.reason ||
+        '缺少本轮非空、唯一且全部通过的具名检查，不能仅以 VERIFIED 标记升级' } : {})
+    }
+  })
   caseRecord.remainingAssertions = caseRecord.catalogAssertions
     .filter((item) => item.status !== 'VERIFIED')
     .map((item) => ({
@@ -142,6 +152,8 @@ export function initializeCatalogAssertions (caseRecord, caseId, verified = new 
       ...(item.reason ? { reason: item.reason } : {})
     }))
   caseRecord.readyCandidate = false
+  caseRecord.passCandidate = false
+  caseRecord.acceptanceComplete = false
   return caseRecord.catalogAssertions
 }
 
@@ -173,7 +185,10 @@ export function isForbiddenRequest (method, pathname) {
 const dataOf = (payload) => (isBusinessSuccess(payload) ? payload.data : null)
 const nonNegative = (value) => Number.isInteger(value) && value >= 0
 const text = (value) => String(value ?? '')
-const normalize = (value) => JSON.stringify(value, Object.keys(value || {}).sort())
+const normalize = (value) => JSON.stringify(value, (_key, item) =>
+  item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]]))
+    : item)
 
 function stateSnapshot (value) {
   const state = dataOf(value) || {}
@@ -336,11 +351,43 @@ export function validateInitReadinessFacts (factRows, readinessItems) {
   return { valid: true, reason: '', factMap: rowMap }
 }
 
+export function validateWmsTopology (topologyInput, readinessStatus) {
+  const topology = topologyInput instanceof Map
+    ? topologyInput
+    : new Map(Object.entries(topologyInput || {}).map(([key, value]) => [key, Number(value)]))
+  const required = [
+    'warehouse', 'warehouse-total', 'area', 'location',
+    'orphan-area', 'orphan-location', 'erp-view', 'erp-rows'
+  ]
+  const missing = required.filter((key) => !Number.isInteger(topology.get(key)))
+  if (missing.length > 0) {
+    return { valid: false, reason: `WMS 拓扑计数缺失：${missing.join(',')}` }
+  }
+  const failures = []
+  if (topology.get('warehouse') <= 0) failures.push('没有启用仓库')
+  if (topology.get('warehouse-total') <= 0) failures.push('没有未删除仓库')
+  if (topology.get('warehouse') > topology.get('warehouse-total')) {
+    failures.push('启用仓库数大于未删除仓库总数')
+  }
+  if (topology.get('area') <= 0) failures.push('没有启用库区')
+  if (topology.get('location') <= 0) failures.push('没有启用库位')
+  if (topology.get('orphan-area') !== 0) failures.push('存在孤立库区')
+  if (topology.get('orphan-location') !== 0) failures.push('存在孤立库位')
+  if (topology.get('erp-view') !== 1) failures.push('erp_warehouse 不是唯一兼容视图')
+  // The compatibility view projects all non-deleted WMS warehouses, including disabled ones.
+  if (topology.get('erp-rows') !== topology.get('warehouse-total')) {
+    failures.push('ERP 兼容视图行数与未删除 WMS 仓库总数不一致')
+  }
+  if (readinessStatus !== 'READY') failures.push(`wms.base readiness=${readinessStatus || 'missing'}`)
+  return { valid: failures.length === 0, reason: failures.join('；') }
+}
+
 export function inspectLogoFields (fields = []) {
-  const labels = fields.filter((item) => /logo/i.test(text(item.label)))
+  const expected = ['图形标识', '黑字完整 Logo', '白字完整 Logo']
+  const labels = expected.map((label) => fields.find((item) => text(item.label).trim() === label))
   return {
-    found: labels.length,
-    optional: labels.length > 0 && labels.every((item) => item.required !== true && item.hasRequiredMark !== true)
+    found: labels.filter(Boolean).length,
+    optional: labels.every((item) => item && item.required !== true && item.hasRequiredMark !== true)
   }
 }
 
@@ -459,7 +506,11 @@ async function runInit002 ({ api, page, caseRecord, navigate }) {
   if (isBusinessSuccess(preview) && presetResultComplete(preview, false) && unchanged) {
     evidence(caseRecord, 'state/organization/permission API 前后快照一致；preview applied=false')
     caseRecord.catalogAssertions = initializeCatalogAssertions(caseRecord, 'INIT-002', new Map([
-      [0, { status: 'VERIFIED', evidence: '只读快照一致且 preview.applied=false' }]
+      [0, {
+        status: 'VERIFIED',
+        evidence: '只读快照一致且 preview.applied=false',
+        evidenceChecks: ['preview 返回 applied=false 且前后只读快照一致']
+      }]
     ]))
   }
   const sameAsBeforePreview = normalize(stateSnapshot(before.state)) === normalize(stateSnapshot(previewState))
@@ -544,9 +595,17 @@ async function runInit002 ({ api, page, caseRecord, navigate }) {
       addCheck(caseRecord, '预览按钮打开确认弹窗', visible, diagnostic)
       if (visible) {
         const current = caseRecord.catalogAssertions?.find((item) => item.index === 1)
-        if (current) current.status = 'VERIFIED'
+        if (current) {
+          current.status = 'VERIFIED'
+          current.evidenceChecks = ['预览按钮打开确认弹窗']
+          delete current.reason
+        }
         else initializeCatalogAssertions(caseRecord, 'INIT-002', new Map([
-          [0, { status: 'VERIFIED' }], [1, { status: 'VERIFIED' }]
+          [0, {
+            status: 'VERIFIED',
+            evidenceChecks: ['preview 返回 applied=false 且前后只读快照一致']
+          }],
+          [1, { status: 'VERIFIED', evidenceChecks: ['预览按钮打开确认弹窗'] }]
         ]))
         evidence(caseRecord, 'headed 页面确认弹窗可见，未点击确认')
       }
@@ -555,13 +614,23 @@ async function runInit002 ({ api, page, caseRecord, navigate }) {
   const verified = new Map((caseRecord.catalogAssertions || []).map((item) => [item.index, item]))
   if (isBusinessSuccess(preview) && presetResultComplete(preview, false) && unchanged &&
       sameAsBeforePreview && isBusinessSuccess(stateSave) && savedModulesMatch) {
-    verified.set(2, { status: 'VERIFIED' })
+    verified.set(2, {
+      status: 'VERIFIED',
+      evidenceChecks: [
+        '保存后 tenant_admin 菜单权限已同步且角色菜单可回读',
+        '权限同步落库 system_role_menu 并有可用授权记录'
+      ]
+    })
   }
   if (isBusinessSuccess(permissionsAfterSave) && stillHasMenus &&
       roleMenuCount != null && roleMenuCount > 0) {
-    verified.set(3, { status: 'VERIFIED' })
+    verified.set(3, {
+      status: 'VERIFIED',
+      evidenceChecks: ['顶部业务域在工作台即时可见']
+    })
   }
-  if (packageUnchanged) verified.set(4, { status: 'VERIFIED' })
+  // The shared package snapshot does not prove that every other role stayed
+  // unchanged. Keep assertion 4 as GAP in this legacy tenant-1 path.
   initializeCatalogAssertions(caseRecord, 'INIT-002', verified)
   evidence(caseRecord,
     '真实写侧：保存同一份行业/模块/步骤配置 -> 回读一致 -> 权限快照与 system_role_menu 落库 -> 顶部业务域可见 -> 标准套餐未变。')
@@ -639,10 +708,25 @@ async function runInit003 ({ api, page, caseRecord, navigate }) {
     if (displayed) evidence(caseRecord, 'headed 刷新页面显示首轮预置回执摘要')
   }
   const verified = new Map()
-  if (complete && page) verified.set(0, { status: 'VERIFIED' })
-  if (receiptPersisted) verified.set(1, { status: 'VERIFIED' })
-  if (secondIdempotent) verified.set(2, { status: 'VERIFIED' })
-  if (modifiedStable) verified.set(3, { status: 'VERIFIED' })
+  // The legacy page check does not verify all four rendered detail categories;
+  // the isolated local closure owns the complete INIT-003 assertion 0 proof.
+  if (receiptPersisted) {
+    verified.set(1, {
+      status: 'VERIFIED',
+      evidenceChecks: [
+        '重复预设保留首轮回执且 state 稳定不漂移',
+        '首轮回执持久化在 system_init_state 且可解析'
+      ]
+    })
+  }
+  if (secondIdempotent) {
+    verified.set(2, {
+      status: 'VERIFIED',
+      evidenceChecks: ['第二次 apply 零新增且冲突明细不再变化（幂等）']
+    })
+  }
+  // Equal modified counters do not prove a deliberately changed value was
+  // preserved. Keep assertion 3 as GAP outside the isolated local closure.
   initializeCatalogAssertions(caseRecord, 'INIT-003', verified)
   evidence(caseRecord,
     `真实写侧：apply(first) added=${result1?.added} -> apply(second) added=${result2?.added} ` +
@@ -729,7 +813,7 @@ async function runInit004 ({ api, page, caseRecord, navigate }) {
     const initOpened = await openReadOnlyRoute(page, initRoutes.overview, navigate, caseRecord)
     const initBody = initOpened ? await pageBodyText(page) : ''
     const tabsVisible = initBody.length > 0 && hasSelected
-    if (tabsVisible) verified.set(0, { status: 'VERIFIED' })
+    // Opening the page does not prove the visible tabs exactly equal selectedModules.
     const settingsOpened = await openReadOnlyRoute(
       page,
       initRoutes.enterpriseOrganization,
@@ -737,15 +821,25 @@ async function runInit004 ({ api, page, caseRecord, navigate }) {
       caseRecord
     )
     const settingsBody = settingsOpened ? await pageBodyText(page) : ''
-    if (settingsOpened && /企业|设置/.test(settingsBody)) verified.set(3, { status: 'VERIFIED' })
     if (settingsOpened && initBody && settingsBody) {
       evidence(caseRecord, '初始化与设置页面均只读打开；未执行跳过或保存')
     }
   }
-  if (skipApplied && restored && skipPersisted) verified.set(1, { status: 'VERIFIED' })
-  if (formalBlocked) verified.set(2, { status: 'VERIFIED' })
-  if (settingsSplit) verified.set(3, { status: 'VERIFIED' })
-  if (configConsistent) verified.set(4, { status: 'VERIFIED' })
+  // This path exercises one skippable item only; it cannot prove both WMS and
+  // FMS opening items. The isolated local closure supplies that exact evidence.
+  if (formalBlocked) {
+    verified.set(2, {
+      status: 'VERIFIED',
+      evidenceChecks: ['正式账套跳过被服务端拒绝且 state 不变']
+    })
+  }
+  // selectedModules membership alone does not prove the settings UI split.
+  if (configConsistent) {
+    verified.set(4, {
+      status: 'VERIFIED',
+      evidenceChecks: ['初始化与设置的企业/行业配置回读一致']
+    })
+  }
   initializeCatalogAssertions(caseRecord, 'INIT-004', verified)
   evidence(caseRecord,
     `真实写侧：skip(${skippableKey})=true -> state 含该键 -> skip=false 恢复原值 -> ` +
@@ -770,6 +864,99 @@ async function runInit005 ({ api, caseRecord }) {
   addCheck(caseRecord, '成本模型/集成仅按现状读取，不伪造外部连接', external.length > 0 &&
     external.every((item) => ['READY', 'INCOMPLETE', 'NOT_STARTED', 'SKIPPED', 'UNKNOWN'].includes(item.status)),
   `externalItems=${external.length}`)
+  const externalSnapshot = (items) => JSON.stringify((items || []).map((item) => ({
+    key: item.key,
+    status: item.status,
+    count: item.count,
+    skippable: item.skippable
+  })).sort((left, right) => String(left.key).localeCompare(String(right.key))))
+  const externalBefore = externalSnapshot(external)
+
+  // 真实写侧：只切换“库存期初”跳过状态并恢复，不触碰成本模型或集成连接。
+  const beforeState = dataOf(state)
+  const originalSkipped = Array.isArray(beforeState?.skippedItems)
+    ? [...beforeState.skippedItems]
+    : []
+  const openingKey = classified.opening.find((item) => item.skippable === true)?.key
+  let skipApplied = false
+  let skipRestored = false
+  if (openingKey) {
+    const skipWrite = await callWrite(api, 'POST',
+      `/system/system-init/skip?key=${encodeURIComponent(openingKey)}&skipped=true`,
+      undefined, caseRecord)
+    const afterSkip = dataOf(await callReadOnly(
+      api, 'GET', '/system/system-init/state', undefined, caseRecord))
+    skipApplied = isBusinessSuccess(skipWrite) &&
+      Array.isArray(afterSkip?.skippedItems) &&
+      afterSkip.skippedItems.includes(openingKey)
+    addCheck(caseRecord, '跳过期初项后 state.skippedItems 真实包含该键',
+      skipApplied, `key=${openingKey} skipped=${JSON.stringify(afterSkip?.skippedItems)}`)
+
+    const restoreWrite = await callWrite(api, 'POST',
+      `/system/system-init/skip?key=${encodeURIComponent(openingKey)}&skipped=false`,
+      undefined, caseRecord)
+    const restoredState = dataOf(await callReadOnly(
+      api, 'GET', '/system/system-init/state', undefined, caseRecord))
+    skipRestored = isBusinessSuccess(restoreWrite) &&
+      Array.isArray(restoredState?.skippedItems) &&
+      normalize([...(restoredState.skippedItems || [])].sort()) ===
+      normalize([...originalSkipped].sort())
+    addCheck(caseRecord, '取消跳过期初项后 state.skippedItems 恢复到原值（反向闭环）',
+      skipRestored,
+      `original=${JSON.stringify(originalSkipped)} restored=${JSON.stringify(restoredState?.skippedItems)}`)
+  } else {
+    addCheck(caseRecord, '存在可跳过的库存期初项',
+      false, `opening=${JSON.stringify(classified.opening)}`)
+  }
+
+  const readyAfterSkip = await callReadOnly(
+    api, 'GET', '/system/system-init/readiness', undefined, caseRecord)
+  const externalAfter = externalSnapshot(
+    readinessClassification(readyAfterSkip).items
+      ?.filter((item) => /cost|成本|integration|集成|connection|连接/.test(item.haystack)) || [])
+  addCheck(caseRecord, '成本模型/集成可选连接在期初跳过往返前后保持不变',
+    external.length > 0 && externalBefore === externalAfter,
+    `before=${externalBefore} after=${externalAfter}`)
+
+  const topologyRows = await readSql(caseRecord, 'wms-topology-and-erp-view', `
+    SELECT 'warehouse', COUNT(*) FROM mes_wms_ware_house
+    WHERE tenant_id = 1 AND deleted = 0 AND is_enabled = 1;
+    SELECT 'warehouse-total', COUNT(*) FROM mes_wms_ware_house
+    WHERE tenant_id = 1 AND deleted = 0;
+    SELECT 'area', COUNT(*) FROM mes_wms_house_area
+    WHERE tenant_id = 1 AND deleted = 0 AND is_enabled = 1;
+    SELECT 'location', COUNT(*) FROM mes_wms_house_location
+    WHERE tenant_id = 1 AND deleted = 0 AND is_enabled = 1;
+    SELECT 'orphan-area', COUNT(*)
+    FROM mes_wms_house_area a
+    LEFT JOIN mes_wms_ware_house w
+      ON w.tenant_id = a.tenant_id AND w.deleted = 0
+      AND CAST(w.id AS CHAR) = a.house_id
+    WHERE a.tenant_id = 1 AND a.deleted = 0 AND a.is_enabled = 1 AND w.id IS NULL;
+    SELECT 'orphan-location', COUNT(*)
+    FROM mes_wms_house_location l
+    LEFT JOIN mes_wms_house_area a
+      ON a.tenant_id = l.tenant_id AND a.deleted = 0
+      AND CAST(a.id AS CHAR) = l.area_id
+    LEFT JOIN mes_wms_ware_house w
+      ON w.tenant_id = l.tenant_id AND w.deleted = 0
+      AND CAST(w.id AS CHAR) = l.house_id
+    WHERE l.tenant_id = 1 AND l.deleted = 0 AND l.is_enabled = 1
+      AND (a.id IS NULL OR w.id IS NULL OR a.house_id <> l.house_id);
+    SELECT 'erp-view', COUNT(*)
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE() AND table_name = 'erp_warehouse' AND table_type = 'VIEW';
+    SELECT 'erp-rows', COUNT(*) FROM erp_warehouse
+    WHERE tenant_id = 1 AND deleted = 0;
+  `)
+  const topology = new Map((topologyRows || []).map((row) => [row[0], Number(row[1])]))
+  const wmsItem = (classified.items || []).find((item) => item.key === 'wms.base')
+  const topologyValidation = validateWmsTopology(topology, wmsItem?.status)
+  const topologyComplete = topologyValidation.valid
+  addCheck(caseRecord, 'WMS 仓库/库区/库位层级完整且 ERP 兼容视图按同租户同源回读',
+    topologyComplete,
+    `topology=${JSON.stringify(Object.fromEntries(topology))} readiness=${wmsItem?.status || 'missing'}` +
+      (topologyValidation.reason ? ` reason=${topologyValidation.reason}` : ''))
   // Official readiness facts are tenant-scoped and must never be fabricated.
   const factRows = await readSql(caseRecord, 'init-readiness-facts', initReadinessFactSql(1))
   const factValidation = validateInitReadinessFacts(factRows, classified.items || [])
@@ -796,23 +983,38 @@ async function runInit005 ({ api, caseRecord }) {
   addCheck(caseRecord, 'Job 默认关闭且 Quartz 无活动触发器', jobVerified, jobVerified ? 'read-only SQL' : '缺少可用只读数据库证据')
   const verified = new Map([
     [0, {
-      status: 'GAP',
-      reason: factValidation.valid
-        ? '七类计数已闭环，但未在本用例核验 wms.base 的库区、库位和 ERP 映射完整性'
-        : '七类真实事实计数未闭环，且 wms.base 三级仓储完整性未核验'
+      status: factValidation.valid && topologyComplete ? 'VERIFIED' : 'GAP',
+      ...(factValidation.valid && topologyComplete
+        ? { evidenceChecks: [
+            '必配事实按 readiness 分类完整返回',
+            'readiness 七类官方计数与当前租户事实一致',
+            'WMS 仓库/库区/库位层级完整且 ERP 兼容视图按同租户同源回读'
+          ] }
+        : { reason: '七类事实或 WMS/ERP 同源拓扑未全部闭环' })
     }],
     [1, {
-      status: 'GAP',
-      reason: '仅证明 readiness 返回 skippable=true；未调用正式 skip API，也未回读 state/readiness 验证跳过与恢复闭环'
+      status: skipApplied && skipRestored ? 'VERIFIED' : 'GAP',
+      ...(skipApplied && skipRestored
+        ? { evidenceChecks: [
+            '跳过期初项后 state.skippedItems 真实包含该键',
+            '取消跳过期初项后 state.skippedItems 恢复到原值（反向闭环）'
+          ] }
+        : { reason: '库存期初跳过或恢复写侧未闭环' })
     }],
     [2, {
-      status: 'GAP',
-      reason: '仅读取 status enum；未证明成本/集成原事实未变化，也未验证不存在伪造连接的服务端写侧闭环'
+      status: external.length > 0 && externalBefore === externalAfter ? 'VERIFIED' : 'GAP',
+      ...(external.length > 0 && externalBefore === externalAfter
+        ? { evidenceChecks: [
+            '成本模型/集成仅按现状读取，不伪造外部连接',
+            '成本模型/集成可选连接在期初跳过往返前后保持不变'
+          ] }
+        : { reason: '成本模型/集成连接前后快照不稳定或未见结构化项' })
     }]
   ])
   if (jobVerified) {
     verified.set(3, {
       status: 'VERIFIED',
+      evidenceChecks: ['Job 默认关闭且 Quartz 无活动触发器'],
       evidence: '只读快照 enabled-jobs=0、active-triggers=0；默认关闭策略由 V202609272500__disable_jobs_by_default.sql 明确设置 infra_job=2、Quartz=PAUSED'
     })
   } else {
@@ -951,6 +1153,16 @@ export async function runCase (context, dependencies = {}) {
   if (!cases.includes(caseId)) throw new Error(`Unsupported init gap case: ${caseId}`)
   assertSafeScope(dependencies.config || config)
   initializeCatalogAssertions(caseRecord, caseId)
+  if (caseId !== 'INIT-005') {
+    const { runIsolatedLocalInitCase, localInitEvidence } = await import('./init-local-closure.mjs')
+    await runIsolatedLocalInitCase(context, dependencies)
+    const mapping = localInitEvidence[caseId]
+    initializeCatalogAssertions(caseRecord, caseId, new Map(Object.entries(mapping)
+      .map(([index, entry]) => [Number(index), {
+        status: 'VERIFIED', evidenceChecks: entry.checks
+      }])))
+    return finalizeGapEvidence(caseRecord)
+  }
   const record = context.record || { api: [] }
   const page = context.page || dependencies.page
   let token = context.token || dependencies.token || ''
@@ -966,10 +1178,35 @@ export async function runCase (context, dependencies = {}) {
   if (caseId === 'INIT-003') await runInit003(runContext)
   if (caseId === 'INIT-004') await runInit004(runContext)
   if (caseId === 'INIT-005') await runInit005(runContext)
+  return finalizeGapEvidence(caseRecord)
+}
+
+export function finalizeGapEvidence (caseRecord) {
   caseRecord.remainingAssertions = caseRecord.catalogAssertions
     .filter((item) => item.status !== 'VERIFIED')
-    .map((item) => ({ index: item.index, assertion: item.assertion }))
-  caseRecord.readyCandidate = false
-  caseRecord.status = caseRecord.remainingAssertions.length ? 'PARTIAL' : 'PASS'
-  return caseRecord
+    .map((item) => ({
+      index: item.index,
+      assertion: item.assertion,
+      ...(item.reason ? { reason: item.reason } : {})
+    }))
+  caseRecord.catalogComplete = caseRecord.remainingAssertions.length === 0 &&
+    caseRecord.catalogAssertions.length > 0 &&
+    caseRecord.catalogAssertions.every((item) =>
+      item.status === 'VERIFIED' && Array.isArray(item.evidenceChecks) && item.evidenceChecks.length > 0 &&
+      item.evidenceChecks.every((name) => {
+        const checks = (caseRecord.checks || []).filter((check) => check.name === name)
+        return checks.length === 1 && checks[0].passed === true
+      }))
+  caseRecord.acceptanceComplete = caseRecord.catalogComplete &&
+    caseRecord.checks.length > 0 &&
+    caseRecord.checks.every((item) => item.passed === true)
+  caseRecord.readyCandidate = caseRecord.acceptanceComplete
+  caseRecord.passCandidate = caseRecord.acceptanceComplete
+  return {
+    partial: !caseRecord.acceptanceComplete,
+    acceptanceComplete: caseRecord.acceptanceComplete,
+    passCandidate: caseRecord.passCandidate,
+    note: caseRecord.acceptanceComplete ? '原 catalog 逐项检查完整，最终由 runner 验证运行时错误'
+      : caseRecord.remainingAssertions.map((item) => `${item.assertion}: ${item.reason || '缺证'}`).join('；')
+  }
 }

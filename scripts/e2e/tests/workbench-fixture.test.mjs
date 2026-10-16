@@ -95,6 +95,14 @@ test('case permissions match invoked read controllers and never bind report writ
     .some((permission) => /:(create|update|delete|submit|save)$/.test(permission)), false)
 })
 
+test('daily-report project-dependent enhancements stay blocked until membership and reporter ownership are proven', async () => {
+  const { WORKBENCH_FIXTURE_DEPENDENCIES } = await import('../workbenchhelper/contracts.mjs')
+  for (const caseId of ['WBF-004', 'WBF-008', 'WBF-012']) {
+    const blockers = WORKBENCH_FIXTURE_DEPENDENCIES[caseId].projectDependentEnhancements.join('；')
+    assert.match(blockers, /项目成员、填报人归属及数据权限校验/)
+  }
+})
+
 for (const caseId of ['WBF-005', 'WBF-009']) {
   test(`${caseId} is readable without any report or portal-management permission`, () => {
     const gate = resolveWorkbenchReadGate({

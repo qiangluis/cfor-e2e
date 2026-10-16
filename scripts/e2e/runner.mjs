@@ -6,6 +6,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { config } from './config/index.mjs'
 import { launchBrowser, saveScreenshot } from './lib/browser.mjs'
 import { serverApiFailures } from './lib/api.mjs'
+import {
+  DEFAULT_API_READY_TIMEOUT_MS,
+  DEFAULT_API_READY_INTERVAL_MS,
+  DEFAULT_API_READY_REQUEST_TIMEOUT_MS,
+  waitForApiReady
+} from './lib/api-readiness.mjs'
 import { checklist } from './lib/assert.mjs'
 import {
   checkpointScope,
@@ -19,6 +25,9 @@ import {
   caseOutcome,
   caseErrorStatus,
   finishCase,
+  atomicWriteFile,
+  reportSnapshot,
+  writeProgress,
   writeReport
 } from './lib/report.mjs'
 import {
@@ -67,7 +76,19 @@ const suiteFiles = {
   'base-partner': 'base-partner.mjs',
   'mes-prod-task-report': 'mes-prod-task-report.mjs',
   'mes-monitor': 'mes-monitor.mjs',
-  'bpm-business': 'bpm-business.mjs'
+  'bpm-business': 'bpm-business.mjs',
+  'customer-portal': 'customer-portal.mjs',
+  'erp-sale-order-lifecycle': 'erp-sale-order-lifecycle.mjs',
+  'erp-sale-invoice-reversal': 'erp-sale-invoice-reversal.mjs',
+  'erp-sale-return-receipt': 'erp-sale-return-receipt.mjs',
+  'erp-receivable-receipt-writeoff': 'erp-receivable-receipt-writeoff.mjs',
+  'erp-sale-reconciliation': 'erp-sale-reconciliation.mjs',
+  'crm-contract-change': 'crm-contract-change.mjs',
+  'crm-project-handover': 'crm-project-handover.mjs',
+  'crm-sales-task': 'crm-sales-task.mjs',
+  'crm-work-report': 'crm-work-report.mjs',
+  'crm-business-report': 'crm-business-report.mjs',
+  'crm-sales-plan': 'crm-sales-plan.mjs'
 }
 
 const definitions = new Map(
@@ -148,7 +169,7 @@ function saveCheckpoint (caseId) {
   fs.mkdirSync(path.dirname(checkpointPath()), { recursive: true })
   const completedCases = [...loadCheckpoint()]
   if (!completedCases.includes(caseId)) completedCases.push(caseId)
-  fs.writeFileSync(
+  atomicWriteFile(
     checkpointPath(),
     JSON.stringify({ updatedAt: new Date().toISOString(), completedCases }, null, 2)
   )
@@ -156,6 +177,24 @@ function saveCheckpoint (caseId) {
 
 function clearCheckpoint () {
   try { fs.unlinkSync(checkpointPath()) } catch {}
+}
+
+export function selectedResumeCases (completed, selectedCases) {
+  return new Set([...completed].filter((caseId) => selectedCases.has(caseId)))
+}
+
+function reconcileCheckpoint (record) {
+  const file = checkpointPath()
+  if (!fs.existsSync(file)) return
+  const checkpoint = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const revoked = new Set(record.cases.filter((item) =>
+    item.status !== 'PASS' &&
+    !(item.status === 'SKIPPED' && item.notes?.includes('断点续跑：此前已通过'))
+  ).map((item) => item.caseId || item.id))
+  const completedCases = (checkpoint.completedCases || []).filter((id) => !revoked.has(id))
+  atomicWriteFile(file, JSON.stringify({
+    ...checkpoint, updatedAt: new Date().toISOString(), completedCases
+  }, null, 2))
 }
 
 function filterAllowedRuntimeErrors (runtimeErrors, allowRuntimeErrors = {}) {
@@ -230,13 +269,20 @@ async function closeBrowserHandle (handle, tracePath, label = 'browser') {
 }
 
 export function finalizeCaseRecord (caseRecord) {
-  const snapshot = structuredClone(caseRecord)
+  const snapshot = reportSnapshot(caseRecord)
   const freeze = (value) => {
     if (!value || typeof value !== 'object') return value
     Object.values(value).forEach(freeze)
     return Object.freeze(value)
   }
   return freeze(snapshot)
+}
+
+export function persistFinalizedCase (record, index, caseRecord, options = {}) {
+  const snapshot = finalizeCaseRecord(caseRecord)
+  record.cases[index] = snapshot
+  writeProgress(record, { ...options, caseRecord: snapshot })
+  return snapshot
 }
 
 export async function runCaseWithTimeout (operation, timeoutMs, caseId, onTimeout) {
@@ -271,17 +317,45 @@ export async function runCaseWithTimeout (operation, timeoutMs, caseId, onTimeou
   }
 }
 
-async function main () {
-  const args = parseRunnerArgs(process.argv.slice(2), {
+export async function main (dependencies = {}) {
+  const settings = dependencies.config || config
+  const persistOptions = { outputRoot: settings.outputRoot, settings }
+  const launch = dependencies.launchBrowser || launchBrowser
+  const close = dependencies.closeBrowserHandle || closeBrowserHandle
+  const checkpoint = dependencies.saveCheckpoint || saveCheckpoint
+  const persist = dependencies.persistFinalizedCase || persistFinalizedCase
+  const progress = dependencies.writeProgress || writeProgress
+  const reportWriter = dependencies.writeReport || writeReport
+  const args = parseRunnerArgs(dependencies.argv || process.argv.slice(2), {
     reuseSession: config.reuseSession,
     caseTimeoutMs: Number(process.env.CFOR_E2E_CASE_TIMEOUT_MS || DEFAULT_CASE_TIMEOUT_MS)
   })
+  if (args.help) {
+    console.log([
+      'Usage: node scripts/e2e/runner.mjs [options]',
+      '  --list                     List cases without executing',
+      '  --suite ID                 Select one suite (all by default)',
+      '  --case ID                  Select cases (repeatable)',
+      '  --headed | --headless      Browser visibility',
+      '  --reuse-session            Reuse browser/login session',
+      '  --no-reuse-session         Use independent browser sessions',
+      '  --resume | --fresh         Use or ignore checkpoints',
+      '  --continue-on-failure      Continue isolated cases after failure',
+      '  --case-timeout-ms N        Per-case timeout (default 180000)',
+      '  --help, -h                 Show usage without executing',
+      '  CFOR_E2E_OUT               Evidence output directory',
+      '  CFOR_E2E_API_READY_TIMEOUT_MS  Batch health wait (default 900000)',
+      '  CFOR_E2E_API_READY_INTERVAL_MS Poll interval (default 2000)',
+      '  CFOR_E2E_API_READY_REQUEST_TIMEOUT_MS  Health request timeout (default 5000)'
+    ].join('\n'))
+    return
+  }
   if (args.list) return printList()
-  if (!config.password) throw new Error('缺少 CFOR_PASSWORD/CFOR_PASS，不能启动真实浏览器验收')
-  if (config.target === 'local') {
+  if (!settings.password) throw new Error('缺少 CFOR_PASSWORD/CFOR_PASS，不能启动真实浏览器验收')
+  if (settings.target === 'local') {
     for (const [label, base, port] of [
-      ['前端', config.webBase, '9151'],
-      ['后端', config.apiBase, '48083']
+      ['前端', settings.webBase, '9151'],
+      ['后端', settings.apiBase, '48083']
     ]) {
       const url = new URL(base)
       if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.port !== port) {
@@ -302,20 +376,43 @@ async function main () {
     selectedCases: [...selectedCases]
   })
   record.runId = runId
-  record.environment.webBase = config.webBase
-  record.environment.apiBase = config.apiUrl
+  record.environment.target = settings.target
+  record.environment.webBase = settings.webBase
+  record.environment.apiBase = settings.apiUrl
 
-  if (!args.resume) clearCheckpoint()
-  const completed = args.resume ? loadCheckpoint() : new Set()
+  if (!args.resume) (dependencies.clearCheckpoint || clearCheckpoint)()
+  const completed = selectedResumeCases(
+    args.resume ? (dependencies.loadCheckpoint || loadCheckpoint)() : new Set(),
+    selectedCases
+  )
   let browserHandle
+  let fatalError
+  const loadedModules = new Map()
 
-  console.log(`[e2e] target=${config.target} web=${config.webBase} api=${config.apiUrl}`)
+  progress(record, { ...persistOptions, phase: 'API_READINESS' })
+  console.log(`[e2e] target=${settings.target} web=${settings.webBase} api=${settings.apiUrl}`)
   console.log(`[e2e] suites=${selectedSuites.map((suite) => suite.id).join(', ')}`)
   if (completed.size) console.log(`[e2e] resume: skip ${completed.size} passed cases`)
 
   try {
+    let lastReadinessLogMs = -Infinity
+    record.apiReadiness = await (dependencies.waitForApiReady || waitForApiReady)({
+      settings,
+      timeoutMs: Number(process.env.CFOR_E2E_API_READY_TIMEOUT_MS || DEFAULT_API_READY_TIMEOUT_MS),
+      intervalMs: Number(process.env.CFOR_E2E_API_READY_INTERVAL_MS || DEFAULT_API_READY_INTERVAL_MS),
+      requestTimeoutMs: Number(process.env.CFOR_E2E_API_READY_REQUEST_TIMEOUT_MS || DEFAULT_API_READY_REQUEST_TIMEOUT_MS),
+      onAttempt: (attempt) => {
+        if (attempt.attempt === 1 || attempt.elapsedMs - lastReadinessLogMs >= 30000) {
+          lastReadinessLogMs = attempt.elapsedMs
+          console.log(`[e2e] API readiness: attempt=${attempt.attempt} elapsedMs=${Math.round(attempt.elapsedMs)} HTTP=${attempt.httpStatus ?? 'unavailable'} status=${attempt.healthStatus ?? 'unknown'}`)
+        }
+      }
+    })
+    console.log(`[e2e] API readiness: ${record.apiReadiness.status}`)
+    progress(record, persistOptions)
     suites: for (const suite of selectedSuites) {
-      const module = await loadSuite(suite.id)
+      const module = await (dependencies.loadSuite || loadSuite)(suite.id)
+      loadedModules.set(suite.id, module)
       const runnableCases = new Set(module.cases || suite.cases.map((item) => item.id))
       for (const definition of suite.cases) {
         if (!selectedCases.has(definition.id)) continue
@@ -324,17 +421,18 @@ async function main () {
         for (const gap of definition.acceptanceGaps || []) caseRecord.notes.push(`GAP: ${gap}`)
         const caseRecordIndex = record.cases.length
         record.cases.push(caseRecord)
+        progress(record, persistOptions)
         const declaredStatus = definition.status || 'READY'
 
         const pauseReason = pauseReasonFor(caseDefinition, pausedCatalog)
         if (pauseReason) {
           finishCase(caseRecord, 'SKIPPED', `已暂停自动化：${pauseReason}`)
-          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
+          persist(record, caseRecordIndex, caseRecord, persistOptions)
           continue
         }
         if (completed.has(definition.id)) {
           finishCase(caseRecord, 'SKIPPED', '断点续跑：此前已通过')
-          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
+          persist(record, caseRecordIndex, caseRecord, persistOptions)
           continue
         }
         if (declaredStatus === 'DESIGNED' || declaredStatus === 'BLOCKED') {
@@ -345,17 +443,17 @@ async function main () {
               ? `${declaredStatus}：${definition.registration}`
               : `${declaredStatus}：当前没有完整可执行步骤，未伪造通过`
           )
-          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
+          persist(record, caseRecordIndex, caseRecord, persistOptions)
           continue
         }
         if (!runnableCases.has(definition.id)) {
           finishCase(caseRecord, 'PARTIAL', '目录中有用例，但套件未实现对应步骤')
-          record.cases[caseRecordIndex] = finalizeCaseRecord(caseRecord)
+          persist(record, caseRecordIndex, caseRecord, persistOptions)
           continue
         }
 
         if (!browserHandle) {
-          browserHandle = await launchBrowser({
+          browserHandle = await launch({
             headed: args.headed,
             record
           })
@@ -366,7 +464,7 @@ async function main () {
           })
         }
 
-        const outputDir = path.join(config.outputRoot, record.runId, 'screenshots')
+        const outputDir = path.join(settings.outputRoot, record.runId, 'screenshots')
         const check = checklist()
         const startedAt = Date.now()
         const errorsBefore = {
@@ -403,9 +501,9 @@ async function main () {
                 handle.context.close().catch(() => {}),
                 `${definition.id} timeout context`
               )
-              await closeBrowserHandle(
+              await close(
                 handle,
-                path.join(config.outputRoot, record.runId, 'trace', `${definition.id}-FAIL.zip`),
+                path.join(settings.outputRoot, record.runId, 'trace', `${definition.id}-FAIL.zip`),
                 `${definition.id} timeout`
               )
             }
@@ -439,9 +537,15 @@ async function main () {
                 result?.status === 'PASS'
               )
             )
+          const explicitlyIncomplete = Boolean(
+            result?.partial || result?.notImplemented || result?.designed ||
+            result?.blocked || result?.skipped || result?.acceptanceComplete === false ||
+            caseRecord.acceptanceComplete === false || caseRecord.passCandidate === false
+          )
           const acceptanceComplete = acceptanceIsComplete({
             failedChecks,
             remainingAssertions: caseRecord.remainingAssertions,
+            incomplete: explicitlyIncomplete,
             candidates: [
               result?.acceptanceComplete,
               caseRecord.acceptanceComplete,
@@ -450,6 +554,7 @@ async function main () {
             ]
           })
           const partial = !acceptanceComplete && (
+            explicitlyIncomplete ||
             Boolean(caseRecord.remainingAssertions?.length) ||
             declaredStatus === 'PARTIAL' ||
             Boolean(definition.acceptanceGaps?.length) ||
@@ -467,7 +572,6 @@ async function main () {
             }
           })
           finishCase(caseRecord, outcome.status, outcome.note)
-          if (outcome.status === 'PASS') saveCheckpoint(definition.id)
           caseRecord.durationMs = Date.now() - startedAt
           console.log(`[${caseRecord.status}] ${definition.id}`)
         } catch (error) {
@@ -487,17 +591,19 @@ async function main () {
           caseRecord.checks.push(...check.steps.filter((step) => !caseRecord.checks.includes(step)))
           caseRecord.durationMs = Date.now() - startedAt
           if (browserHandle) {
-            await saveScreenshot(browserHandle.page, outputDir, `${definition.id}-FAIL`, record).catch(() => {})
+            await (dependencies.saveScreenshot || saveScreenshot)(
+              browserHandle.page, outputDir, `${definition.id}-FAIL`, record
+            ).catch(() => {})
           }
           finishCase(
             caseRecord,
             caseErrorStatus(error, caseRecord.checks),
             String(error.message || error).slice(0, 1000)
           )
-          console.log(`[${caseRecord.status}] ${definition.id} ${error.message || error}`)
+          console.log(`[${caseRecord.status}] ${definition.id} ${reportSnapshot(String(error.message || error), { settings })}`)
         }
-        caseRecord = finalizeCaseRecord(caseRecord)
-        record.cases[caseRecordIndex] = caseRecord
+        caseRecord = persist(record, caseRecordIndex, caseRecord, persistOptions)
+        if (caseRecord.status === 'PASS') checkpoint(definition.id)
         const failureAction = caseFailureAction(
           caseRecord.status,
           args.continueOnFailure
@@ -508,39 +614,83 @@ async function main () {
         }
         if (failureAction === 'continue-isolated' && browserHandle) {
           const tracePath = path.join(
-            config.outputRoot,
+            settings.outputRoot,
             record.runId,
             'trace',
             `${definition.id}-FAIL.zip`
           )
-          await closeBrowserHandle(browserHandle, tracePath, `${definition.id} failure`)
+          await close(browserHandle, tracePath, `${definition.id} failure`)
           browserHandle = undefined
           console.log('[e2e] continue-on-failure：已关闭失败用例浏览器，下一例使用隔离上下文')
         }
         if (!args.reuseSession && browserHandle) {
-          const tracePath = path.join(config.outputRoot, record.runId, 'trace', `${definition.id}.zip`)
+          const tracePath = path.join(settings.outputRoot, record.runId, 'trace', `${definition.id}.zip`)
           fs.mkdirSync(path.dirname(tracePath), { recursive: true })
-          await closeBrowserHandle(browserHandle, tracePath, definition.id)
+          await close(browserHandle, tracePath, definition.id)
           browserHandle = undefined
         }
       }
     }
+  } catch (error) {
+    fatalError = error
+    if (error.readiness) record.apiReadiness = error.readiness
+    record.runError = reportSnapshot(error, { settings })
   } finally {
-    if (browserHandle) {
-      const tracePath = path.join(config.outputRoot, record.runId, 'trace', 'browser.zip')
-      fs.mkdirSync(path.dirname(tracePath), { recursive: true })
-      await closeBrowserHandle(browserHandle, tracePath)
+    try {
+      await finalizeSuiteSessions(loadedModules, record, {
+        afterSuite: () => {
+          progress(record, { ...persistOptions, phase: 'TEARDOWN' })
+          ;(dependencies.reconcileCheckpoint || reconcileCheckpoint)(record)
+        }
+      })
+    } finally {
+      if (browserHandle) {
+        const tracePath = path.join(settings.outputRoot, record.runId, 'trace', 'browser.zip')
+        fs.mkdirSync(path.dirname(tracePath), { recursive: true })
+        await close(browserHandle, tracePath)
+      }
     }
   }
 
-  const report = await writeReport(record)
+  progress(record, { ...persistOptions, phase: 'TEARDOWN' })
+  ;(dependencies.reconcileCheckpoint || reconcileCheckpoint)(record)
+  if (fatalError?.code === 'E2E_REPORT_PERSISTENCE_FAILED') throw fatalError
+  const report = await reportWriter(record, persistOptions)
   console.log(`[e2e] report=${report.resultFile}`)
-  process.exit(record.passed ? 0 : 1)
+  if (fatalError) throw fatalError
+  return { record, report }
+}
+
+export async function finalizeSuiteSessions (modules, record, { afterSuite } = {}) {
+  for (const [suiteId, module] of modules) {
+    if (typeof module.teardownRun !== 'function') continue
+    // Teardown hooks may correct case evidence; the saved pre-teardown snapshots stay immutable.
+    record.cases = record.cases.map((entry) =>
+      entry.suite === suiteId ? structuredClone(entry) : entry)
+    try {
+      await module.teardownRun({ record })
+    } catch (error) {
+      const owner = record.cases.findLast((entry) => entry.suite === suiteId)
+      if (!owner) throw error
+      owner.checks.push({
+        name: `${suiteId} 整轮会话与专属账号清理`,
+        passed: false,
+        details: String(error.message || error).slice(0, 1000)
+      })
+      finishCase(owner, 'FAIL', `整轮清理失败：${error.message || error}`)
+    } finally {
+      record.cases = record.cases.map((entry) =>
+        entry.suite === suiteId ? finalizeCaseRecord(entry) : entry)
+      await afterSuite?.(suiteId)
+    }
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  main().catch((error) => {
-    console.error(`[e2e] fatal: ${error.stack || error.message || error}`)
-    process.exit(2)
+  main().then(({ record } = {}) => {
+    if (record) process.exitCode = record.passed ? 0 : 1
+  }).catch((error) => {
+    console.error(`[e2e] fatal: ${reportSnapshot(String(error.stack || error.message || error))}`)
+    process.exitCode = 2
   })
 }

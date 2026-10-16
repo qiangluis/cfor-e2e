@@ -1,5 +1,9 @@
 import { createApiClient, matchesExpectedBusinessRejection } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot, waitForPageReady } from '../lib/browser.mjs'
+import { config } from '../config/index.mjs'
+import { assertHrmOaLocalTarget } from '../fixtures/hrm-local-closure.mjs'
+import { runCase as runHrmLocalCase } from './hrm.mjs'
+import { runCase as runOaLocalCase } from './oa.mjs'
 import { verifyPmsMemberPermissions } from '../fixtures/pms-member-permissions.mjs'
 import {
   createPmsIsolationTenant,
@@ -513,6 +517,13 @@ const runCaseCore = async ({ caseId, page, record, caseRecord, outputDir, check 
 
 export const runCase = async (args) => {
   const { caseId, caseRecord } = args
+  // Keep the legacy read-only path unless this domain and fixture writes are both opted in.
+  if ((caseId === 'HRM-001' || caseId === 'OA-001') &&
+      process.env.CFOR_HRM_OA_LOCAL_CLOSURE === 'true' &&
+      process.env.CFOR_E2E_WRITE_FIXTURES === 'true') {
+    assertHrmOaLocalTarget(config, process.env)
+    return caseId === 'HRM-001' ? runHrmLocalCase(args) : runOaLocalCase(args)
+  }
   if (caseId === 'PMS-001') initializePmsCatalogAssertions(caseRecord)
   let result
   try {

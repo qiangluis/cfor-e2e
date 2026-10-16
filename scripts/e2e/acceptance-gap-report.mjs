@@ -130,6 +130,18 @@ function assertionResult (catalogAssertion, index, mappings) {
   }
 }
 
+function acceptanceGateResult (assertion, mappings) {
+  const matches = mappings.filter((item) => item.assertion === assertion)
+  return {
+    assertion,
+    status: matches.length === 1 && matches[0].status === VERIFIED_STATUS
+      ? 'RECORDED_VERIFIED' : 'GAP',
+    mappingIssue: matches.length === 0 ? 'NO_STRUCTURED_MAPPING'
+      : matches.length > 1 ? 'DUPLICATE_EXACT_MAPPING'
+        : matches[0].status === VERIFIED_STATUS ? null : 'MISSING_VERIFIED_STATUS'
+  }
+}
+
 function caseAcceptanceStatus (actualStatus, assertions, hasStructuredMapping) {
   if (assertions.length > 0 && assertions.every((item) => item.status === 'RECORDED_VERIFIED')) {
     return 'RECORDED_VERIFIED'
@@ -165,6 +177,22 @@ function loadSource (sourcePath, cache) {
   }
 }
 
+function checksSummary (caseRecord) {
+  const recorded = Array.isArray(caseRecord?.checks)
+  const checks = recorded ? caseRecord.checks : []
+  const passed = checks.filter((item) => item?.passed === true).length
+  const failed = checks.filter((item) => item?.passed === false).length
+  return { recorded, total: checks.length, passed, failed, unknown: checks.length - passed - failed }
+}
+
+function remainingAssertions (caseRecord) {
+  if (!Array.isArray(caseRecord?.remainingAssertions)) return null
+  return caseRecord.remainingAssertions.map((item) => {
+    const assertion = typeof item === 'string' ? item : item?.assertion
+    return typeof assertion === 'string' && assertion.trim() ? assertion : null
+  })
+}
+
 function buildCaseReport (definition, coverageCase, sourceCache, warnings) {
   const execution = coverageCase?.latestExecution || null
   const sourcePath = typeof execution?.sourcePath === 'string' ? path.resolve(execution.sourcePath) : null
@@ -178,6 +206,8 @@ function buildCaseReport (definition, coverageCase, sourceCache, warnings) {
   const mappings = assertionMappings(sourceRecord)
   const assertions = catalogAssertions.map((assertion, index) =>
     assertionResult(assertion, index, mappings))
+  const acceptanceGates = (definition.declared?.acceptanceGaps || []).map((assertion) =>
+    acceptanceGateResult(assertion, mappings))
   const hasStructuredMapping = mappings.length > 0
   const actualStatus = normalizeStatus(coverageCase?.actualStatus) || 'UNEXECUTED'
   if (!CASE_STATUSES.has(actualStatus)) warnings.push(`${definition.id} coverage status 未知：${actualStatus}`)
@@ -189,21 +219,45 @@ function buildCaseReport (definition, coverageCase, sourceCache, warnings) {
   if (!runId) warnings.push(`${definition.id} 缺少 runId`)
   warnings.push(...environmentWarnings(loaded.document?.environment, sourcePath || definition.id))
 
+  const completionBlockers = []
+  if (actualStatus !== 'PASS' || coverageCase?.executed !== true) completionBlockers.push('EXECUTION_NOT_PASS')
+  if (normalizeStatus(sourceRecord?.status) !== 'PASS') completionBlockers.push('SOURCE_NOT_PASS')
+  if (sourceRecord?.partial === true || sourceRecord?.passCandidate === false ||
+      sourceRecord?.acceptanceComplete === false) completionBlockers.push('EXPLICIT_INCOMPLETE')
+  if (!assertions.length || assertions.some((item) => item.status !== 'RECORDED_VERIFIED')) {
+    completionBlockers.push('ASSERTION_GAP')
+  }
+  if (acceptanceGates.some((item) => item.status !== 'RECORDED_VERIFIED') ||
+      sourceRecord?.remainingAssertions?.length) completionBlockers.push('ACCEPTANCE_GATE_GAP')
+  if (!Array.isArray(sourceRecord?.checks) || !sourceRecord.checks.length ||
+      sourceRecord.checks.some((item) => item.passed !== true)) completionBlockers.push('INCOMPLETE_CHECK')
+  if (['console', 'page', 'api', 'request', 'nodeApi'].some((key) =>
+    !Array.isArray(sourceRecord?.runtimeErrors?.[key]))) {
+    completionBlockers.push('INCOMPLETE_RUNTIME_EVIDENCE')
+  }
+  if (sourceRecord?.runtimeErrors && Object.values(sourceRecord.runtimeErrors).some((items) =>
+    !Array.isArray(items) || items.length > 0)) completionBlockers.push('RUNTIME_FAILURE')
+  const recordedStatus = caseAcceptanceStatus(actualStatus, assertions, hasStructuredMapping)
   return {
     id: definition.id,
     suite: definition.suite,
     title: definition.title,
     catalogStatus: definition.catalogStatus,
     actualStatus,
-    acceptanceStatus: caseAcceptanceStatus(actualStatus, assertions, hasStructuredMapping),
-    completeAcceptance: assertions.length > 0 && assertions.every((item) => item.status === 'RECORDED_VERIFIED'),
+    acceptanceStatus: recordedStatus === 'RECORDED_VERIFIED' && completionBlockers.length
+      ? 'GAP' : recordedStatus,
+    completeAcceptance: completionBlockers.length === 0,
+    completionBlockers,
     executed: Boolean(coverageCase?.executed),
     runId: runId || null,
     environment: safeEnvironment(loaded.document?.environment),
     sourcePath,
     evidencePaths: sourceEvidencePaths(coverageCase, sourcePath),
     skippedRecordCount: Number(coverageCase?.skippedRecordCount || 0),
-    assertions
+    checksSummary: checksSummary(sourceRecord),
+    remainingAssertions: remainingAssertions(sourceRecord),
+    assertions,
+    acceptanceGates
   }
 }
 
@@ -213,6 +267,12 @@ function countBy (items, key) {
     counts[value] = (counts[value] || 0) + 1
     return counts
   }, {})
+}
+
+function sumChecks (items) {
+  return Object.fromEntries(['total', 'passed', 'failed', 'unknown'].map((key) => [
+    key, items.reduce((total, item) => total + item.checksSummary[key], 0)
+  ]))
 }
 
 export function buildAcceptanceGapReport ({ coveragePath, catalogPath = defaultCatalogPath } = {}) {
@@ -235,6 +295,7 @@ export function buildAcceptanceGapReport ({ coveragePath, catalogPath = defaultC
       totalCases: items.length,
       completeCases: items.filter((item) => item.completeAcceptance).length,
       nonCompleteCases: items.filter((item) => !item.completeAcceptance).length,
+      checksSummary: sumChecks(items),
       actualStatusCounts: countBy(items, 'actualStatus'),
       acceptanceStatusCounts: countBy(items, 'acceptanceStatus'),
       assertionStatusCounts: countBy(items.flatMap((item) => item.assertions), 'status')
@@ -246,12 +307,14 @@ export function buildAcceptanceGapReport ({ coveragePath, catalogPath = defaultC
     generatedAt: new Date().toISOString(),
     coveragePath: resolvedCoveragePath,
     catalogPath: path.resolve(catalogPath),
-    sourcePolicy: '仅读取 coverage 最新 sourcePath；仅 exact index + assertion + status=VERIFIED 记 RECORDED_VERIFIED',
+    ...(coverage.environmentFilter ? { environmentFilter: coverage.environmentFilter } : {}),
+    sourcePolicy: '仅读取 coverage 最新 sourcePath；原断言须 exact index + assertion + VERIFIED；完整验收还须实际与原记录 PASS、附加门禁已验证且无未完成检查或运行异常',
     metadataWarnings: uniqueWarnings,
     summary: {
       totalCases: cases.length,
       completeCases: cases.filter((item) => item.completeAcceptance).length,
       nonCompleteCases: cases.filter((item) => !item.completeAcceptance).length,
+      checksSummary: sumChecks(cases),
       actualStatusCounts: countBy(cases, 'actualStatus'),
       acceptanceStatusCounts: countBy(cases, 'acceptanceStatus'),
       assertionStatusCounts: countBy(cases.flatMap((item) => item.assertions), 'status'),
@@ -270,21 +333,35 @@ function caseEvidence (item) {
   return item.evidencePaths.length ? item.evidencePaths.join('<br>') : '无'
 }
 
+function checksText (summary) {
+  if (summary.recorded === false) return '未记录'
+  return `通过 ${summary.passed} / 失败 ${summary.failed} / 未确认 ${summary.unknown}（共 ${summary.total}）`
+}
+
+function remainingAssertionsText (items) {
+  if (items === null) return '未记录'
+  return items.length ? items.map((item) => item ?? '未记录有效断言文本').join('<br>') : '无'
+}
+
 export function renderAcceptanceGapMarkdown (report) {
   const lines = [
     '# CFOR E2E 验收缺口报告',
     '',
+    '> 本报告汇总已存档执行证据，不代表当前服务健康或最新发布包已复验；运行环境门禁单独见正式执行清单。',
+    '',
     `- Coverage：${report.coveragePath}`,
     `- Catalog：${report.catalogPath}`,
+    ...(report.environmentFilter ? [`- 精确环境范围：${JSON.stringify(report.environmentFilter)}`] : []),
     `- 案例：${report.summary.totalCases}；完整验收 ${report.summary.completeCases}；非完整 ${report.summary.nonCompleteCases}`,
+    `- 已记录 checks：${checksText(report.summary.checksSummary)}`,
     `- 实际状态：${JSON.stringify(report.summary.actualStatusCounts)}`,
     `- 验收状态：${JSON.stringify(report.summary.acceptanceStatusCounts)}`,
     `- 原断言状态：${JSON.stringify(report.summary.assertionStatusCounts)}`,
     '',
     '## Suite 汇总',
     '',
-    '| Suite | 案例 | 完整 | 非完整 | 实际状态 | 验收状态 | 原断言状态 |',
-    '|---|---:|---:|---:|---|---|---|'
+    '| Suite | 案例 | 完整 | 非完整 | Checks | 实际状态 | 验收状态 | 原断言状态 |',
+    '|---|---:|---:|---:|---|---|---|---|'
   ]
   for (const suite of report.suites) {
     lines.push([
@@ -292,6 +369,7 @@ export function renderAcceptanceGapMarkdown (report) {
       suite.totalCases,
       suite.completeCases,
       suite.nonCompleteCases,
+      checksText(suite.checksSummary),
       JSON.stringify(suite.actualStatusCounts),
       JSON.stringify(suite.acceptanceStatusCounts),
       JSON.stringify(suite.assertionStatusCounts)
@@ -299,12 +377,13 @@ export function renderAcceptanceGapMarkdown (report) {
   }
 
   lines.push('', '## 全部案例状态与证据', '',
-    '| Case | Suite | 实际状态 | 验收状态 | 已执行 | Source | 证据路径 |',
-    '|---|---|---|---|---|---|---|')
+    '| Case | Suite | 实际状态 | 验收状态 | 已执行 | Checks | 剩余断言（remainingAssertions） | Source | 证据路径 |',
+    '|---|---|---|---|---|---|---|---|---|')
   for (const item of report.cases) {
     lines.push([
       item.id, item.suite, item.actualStatus, item.acceptanceStatus,
-      item.executed ? '是' : '否', item.sourcePath || '无', caseEvidence(item)
+      item.executed ? '是' : '否', checksText(item.checksSummary),
+      remainingAssertionsText(item.remainingAssertions), item.sourcePath || '无', caseEvidence(item)
     ].map(markdownCell).join(' | '))
   }
 
@@ -314,6 +393,9 @@ export function renderAcceptanceGapMarkdown (report) {
     lines.push(`- Suite：${item.suite}`)
     lines.push(`- 实际状态：${item.actualStatus}；验收状态：${item.acceptanceStatus}；已执行：${item.executed ? '是' : '否'}`)
     lines.push(`- Source：${item.sourcePath || '无'}；证据：${caseEvidence(item)}`)
+    lines.push(`- 完整验收阻断：${item.completionBlockers.join(', ')}`)
+    lines.push(`- 已记录 checks：${checksText(item.checksSummary)}`)
+    lines.push(`- 剩余断言（remainingAssertions）：${markdownCell(remainingAssertionsText(item.remainingAssertions))}`)
     if (item.assertions.length === 0) {
       lines.push('- 原catalog无 assertions，未形成可核验的验收映射')
     } else {
@@ -321,6 +403,9 @@ export function renderAcceptanceGapMarkdown (report) {
       for (const assertion of item.assertions) {
         lines.push(`  - [${assertion.status}] #${assertion.index} ${assertion.assertion} (${assertion.mappingIssue})`)
       }
+    }
+    for (const gate of item.acceptanceGates) {
+      lines.push(`- 附加门禁：[${gate.status}] ${gate.assertion} (${gate.mappingIssue})`)
     }
     lines.push('')
   }

@@ -17,12 +17,13 @@ const ok = (data) => ({ code: 0, data })
 const makeQualityApi = (marker, {
   failRule = false,
   unsafeItemId = false,
-  ruleEffectiveFrom = businessDateAsiaShanghai()
+  ruleEffectiveFrom
 } = {}) => {
   const calls = []
   let published = false
   let planRemark = ''
   let planName = ''
+  let storedRuleEffectiveFrom = ruleEffectiveFrom
   const itemId = unsafeItemId ? Number.MAX_SAFE_INTEGER + 1 : '201'
   const planId = '202'
   const ruleId = '203'
@@ -32,6 +33,10 @@ const makeQualityApi = (marker, {
       calls.push({ method: 'POST', path, body })
       if (failRule && path === '/mes/quality/qualityMaterial/add') {
         throw new Error('simulated quality rule failure')
+      }
+      if (path === '/mes/quality/qualityMaterial/add' &&
+          storedRuleEffectiveFrom === undefined) {
+        storedRuleEffectiveFrom = body.effectiveFrom
       }
       return ok(true)
     },
@@ -69,7 +74,7 @@ const makeQualityApi = (marker, {
           materialId: query.get('materialId'),
           planId,
           type: query.get('types'),
-          effectiveFrom: ruleEffectiveFrom,
+          effectiveFrom: storedRuleEffectiveFrom ?? businessDateAsiaShanghai(),
           effectiveTo: null,
           applyOrgId: '',
           businessSubType: '',
@@ -125,7 +130,10 @@ test('专属委外104前置使用生产入库项目、104已发布方案和专�
   assert.equal(ruleAdd.body.materialId, '301')
   assert.equal(ruleAdd.body.planId, result.plan.planId)
   assert.equal(ruleAdd.body.type, '104')
-  assert.equal(ruleAdd.body.effectiveFrom, businessDateAsiaShanghai())
+  assert.equal(
+    ruleAdd.body.effectiveFrom,
+    businessDateAsiaShanghai(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  )
   assert.ok(api.calls
     .filter((call) => call.method === 'POST')
     .every((call) => call.body?.itemName === undefined || String(call.body.itemName).length <= 32))
@@ -146,6 +154,9 @@ test('104方案回读不允许默认按101查询', async () => {
   })
   const planList = api.calls.find((call) => call.path.includes('/mes/quality/qualityPlan/list/dictText'))
   assert.match(planList.path, /[?&]type=104(?:&|$)/)
+  assert.match(planList.path, /[?&]planName=/)
+  assert.equal(result.plan.row.remark, result.plan.token)
+  assert.equal(result.plan.row.planName, result.plan.planName)
   assert.equal(result.plan.type, 104)
 })
 
@@ -199,7 +210,7 @@ test('规则合法LocalDate数组可通过归属校验', async () => {
   const result = await createDedicatedOutsourceQuality(
     makeQualityApi(marker, { ruleEffectiveFrom: tuple }),
     { checks: [], notes: [], fixtures: [] },
-    { marker, product: { id: '902' } }
+    { marker, product: { id: '902' }, effectiveFrom: tuple }
   )
   assert.equal(result.rule.row.effectiveFrom, tuple)
 })

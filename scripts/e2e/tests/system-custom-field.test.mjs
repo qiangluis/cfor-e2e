@@ -8,6 +8,7 @@ import {
   catalogConclusion,
   dataOf,
   evaluateObjectPlacements,
+  evaluateRuntimeLifecycle,
   evaluateRuntimeSnapshot,
   initializeCatalogChecks
 } from '../suites/system-custom-field.mjs'
@@ -204,4 +205,39 @@ test('custom-field object and runtime helpers reject empty or unpublished eviden
   }]
   assert.equal(evaluateRuntimeSnapshot(schema, definition, true), true)
   assert.equal(evaluateRuntimeSnapshot([], { ...definition, status: 'DRAFT' }, false), false)
+})
+
+test('custom-field lifecycle accepts empty exclusions only with the same field nonempty published proof', () => {
+  const definition = {
+    id: '7', fieldCode: 'E2E_PB040_TEST', dataType: 'TEXT', currentVersion: 1
+  }
+  const fixture = {
+    runId: 'run-1', tenantId: '1', createdThisRun: true,
+    fieldId: definition.id, fieldCode: definition.fieldCode,
+    runtime: ['DRAFT', 'PENDING_PUBLISH', 'PUBLISHED', 'DISABLED'].map((status) => ({
+      runId: 'run-1', definition: { ...definition, status }, visible: status === 'PUBLISHED',
+      schema: status === 'PUBLISHED'
+        ? [{ ...definition, status, bindings: [{ businessObject: 'crm.customer', placement: 'FORM_HEADER' }] }]
+        : []
+    }))
+  }
+  assert.equal(evaluateRuntimeLifecycle(fixture, 'run-1'), true)
+  for (const mutate of [
+    (f) => { f.runId = 'other-run' },
+    (f) => { f.createdThisRun = false },
+    (f) => { f.tenantId = '2' },
+    (f) => { f.runtime[2].schema = [] },
+    (f) => { f.runtime[2].schema[0].id = '8' },
+    (f) => { f.runtime[1].runId = 'other-run' },
+    (f) => { f.runtime[3].definition.id = '8' },
+    (f) => { f.runtime[3].schema = f.runtime[2].schema },
+    (f) => { f.runtime[1].definition.dataType = 'INTEGER' },
+    (f) => { f.runtime.splice(3, 1) }
+  ]) {
+    const invalid = structuredClone(fixture)
+    mutate(invalid)
+    assert.equal(evaluateRuntimeLifecycle(invalid, 'run-1'), false)
+  }
+  assert.equal(evaluateRuntimeLifecycle(fixture, 'other-run'), false)
+  assert.equal(evaluateRuntimeLifecycle(null, 'run-1'), false)
 })

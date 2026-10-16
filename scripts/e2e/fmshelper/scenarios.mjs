@@ -10,9 +10,23 @@ import {
   expectRejected, receiptMappingBody, openingQuery, catalogResult
   , openingDateInputOrder
 } from './contracts.mjs'
+import { runFms004Closure } from '../fixtures/fms-write-closure.mjs'
 
 const catalog = JSON.parse(fs.readFileSync(new URL('../cases/catalog.json', import.meta.url), 'utf8'))
 const definitions = catalog.suites.find((suite) => suite.id === 'fms').cases
+
+export function comparableDraftEntries (entries = []) {
+  return entries.map((entry) => ({
+    lineNo: entry.lineNo,
+    accountCode: entry.accountCode,
+    direction: entry.direction,
+    amount: entry.amount,
+    auxiliaryType: entry.auxiliaryType ?? null,
+    auxiliaryCode: entry.auxiliaryCode ?? null,
+    auxiliaryName: entry.auxiliaryName ?? null,
+    summary: entry.summary ?? null
+  })).sort((left, right) => Number(left.lineNo || 0) - Number(right.lineNo || 0))
+}
 const statement = (id, index, reverse = false) =>
   definitions.find((item) => item.id === id)[reverse ? 'reverse' : 'assertions'][index]
 const certify = (ctx, index, passed, detail, reverse = false) =>
@@ -259,29 +273,33 @@ async function confirmationCase (ctx) {
   certify(ctx, 1, confirmed.status === 'CONFIRMED' &&
     JSON.stringify(beforeVouchers) === JSON.stringify(afterVouchers), 'Chrome 人工确认只更新草稿，正式凭证快照未变')
   certify(ctx, 2, JSON.stringify(beforeLedger) === JSON.stringify(afterLedger) &&
-    JSON.stringify(draft.entries) === JSON.stringify(confirmed.entries), '确认前后真实账簿 API 相同，分录未改变')
+    JSON.stringify(comparableDraftEntries(draft.entries)) ===
+    JSON.stringify(comparableDraftEntries(confirmed.entries)), '确认前后真实账簿 API 相同，分录未改变')
   await show(ctx, 'fms/voucherDraft/index', draft.draftNo, 'draft-confirmed', { detail: true })
   defer(ctx, 3, '正式凭证有 create/review API，但没有 confirmed draft 转正式凭证/过账契约；不把审核 APPROVED 冒称 POSTED')
   defer(ctx, 4, '草稿没有过账操作，未关闭当前期间以免改变后续验证环境；不以缺接口冒称关闭阻断过账')
   defer(ctx, 0, '草稿无取消 API，正式凭证无基于草稿的冲销契约；不能直接删除/改分录替代', true)
 }
 
-async function cashCase (ctx) {
-  const sources = []
-  for (const role of ['receivable', 'payable']) {
-    const source = await moneySource(ctx, role)
-    sources.push(source)
-    await show(ctx, 'fms/eventInbox/index', source.id, `${role}-arrived-inbox`)
+async function fms004ClosureCase (ctx) {
+  const result = await runFms004Closure({
+    api: ctx.api,
+    caseRecord: ctx.caseRecord,
+    outputDir: ctx.outputDir,
+    page: ctx.page,
+    record: ctx.record
+  })
+  for (const source of result.sources || []) {
+    await show(
+      ctx,
+      'fms/eventInbox/index',
+      source.cash.event?.sourceBillId,
+      `${source.role}-written-off-arrived-inbox`
+    )
   }
-  certify(ctx, 0, sources.every((s) => s.delivery.sent[0][1] === 'SENT' &&
-    s.delivery.event.eventType === (s.role === 'receivable' ? 'ERP_RECEIPT_ARRIVED' : 'ERP_PAYMENT_DISBURSED')),
-  sources.map((s) => `${s.delivery.event.eventType}: ${s.id}`).join('; '))
-  defer(ctx, 1, '本轮独立收付款无销售/采购匹配来源，不会触发 ERP 自动核销；不能以 checkedAmt=0 证明自动核销链')
-  certify(ctx, 2, sources.every((s) => s.delivery.draft?.status === 'DRAFT' &&
-    balancedDraft(s.delivery.draft, s.amount)), '两种到账/出账来源均必须形成金额一致的会计草稿，而非自动正式凭证')
-  certify(ctx, 3, sources.every((s) => s.delivery.duplicate.duplicated &&
-    s.delivery.duplicate.draftId === s.delivery.event.draftId), '分别重投真实 outbox 原载荷，复用 inbox/draft')
-  defer(ctx, 0, 'ErpFmsEventPublisher 目前只发 FORWARD；未找到退款/付款冲销的受控 REVERSE 发布入口，不能伪造反向来源', true)
+  ctx.caseRecord.evidence.push(
+    '单次 FMS-004 写侧闭环：收款/付款及核销事件并行等待后台 outbox 调度，浏览器回读本轮事件 inbox'
+  )
 }
 
 async function workbook (ctx, role, partners, batch) {
@@ -773,9 +791,13 @@ export async function runOwnedCase (ctx) {
   if (token.tenantId !== '1') throw new Error('BLOCKED: Chrome 登录返回租户非1')
   ctx.api = createApiClient({ token: token.token, tenantId: token.tenantId, record: ctx.record })
   await preflight(ctx.api, ctx.caseRecord)
+  if (ctx.caseId === 'FMS-004') {
+    await fms004ClosureCase(ctx)
+    return catalogResult(ctx.caseRecord, definitions.find((item) => item.id === ctx.caseId))
+  }
   try {
     const functions = { 'FMS-001': sourceCase, 'FMS-002': costCase,
-      'FMS-003': confirmationCase, 'FMS-004': cashCase, 'FMS-005': openingCase,
+      'FMS-003': confirmationCase, 'FMS-005': openingCase,
       'FMS-006': mappingCase, 'FMS-007': openingDisplayCase }
     await functions[ctx.caseId](ctx)
     ctx.caseRecord.evidence.push('本轮真实 API、租户隔离只读 DB 快照、headed Chrome 截图与 trace')

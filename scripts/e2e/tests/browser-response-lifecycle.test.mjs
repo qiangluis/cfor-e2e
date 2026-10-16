@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { gotoSite, observePage } from '../lib/browser.mjs'
+import { gotoSite, isReleasedResponseBodyError, observePage } from '../lib/browser.mjs'
 
 const responseFor = (request, text, status = 200) => ({
   url: () => 'http://127.0.0.1:48083/admin-api/pms/pm/project/get?id=101',
@@ -58,6 +58,37 @@ test('response body read failures cannot disappear from runtime evidence', async
   await observer.flushResponses()
   assert.equal(record.failedApiResponses[0].responseError, true)
   assert.match(record.failedApiResponses[0].error, /body unavailable/)
+})
+
+test('navigation-released successful response bodies do not become API failures', async () => {
+  const page = new EventEmitter()
+  const record = { failedApiResponses: [] }
+  const observer = observePage(page, record)
+  const request = requestFor()
+  page.emit('response', responseFor(request, async () => {
+    throw new Error(
+      'Protocol error (Network.getResponseBody): No resource with given identifier found'
+    )
+  }))
+  page.emit('requestfinished', request)
+  await observer.flushResponses()
+  assert.deepEqual(record.failedApiResponses, [])
+})
+
+test('browser-close response bodies do not become API failures', async () => {
+  const page = new EventEmitter()
+  const record = { failedApiResponses: [] }
+  const observer = observePage(page, record)
+  const request = requestFor()
+  page.emit('response', responseFor(request, async () => {
+    throw new Error('Target page, context or browser has been closed')
+  }))
+  page.emit('requestfinished', request)
+  await observer.flushResponses()
+  assert.equal(isReleasedResponseBodyError(
+    new Error('Target page, context or browser has been closed')
+  ), true)
+  assert.deepEqual(record.failedApiResponses, [])
 })
 
 test('HTTP failures are recorded without waiting for a response body', async () => {
@@ -129,6 +160,30 @@ test('non-JSON streaming responses do not block case or navigation drains', asyn
     headers: () => ({ 'content-type': 'text/event-stream' })
   })
   await observer.flushResponses()
+})
+
+test('shared material-grade prefetch does not block case reuse', async () => {
+  const page = new EventEmitter()
+  const observer = observePage(page, { failedApiResponses: [] })
+  page.emit('request', {
+    url: () => 'http://127.0.0.1:48083/admin-api/base/material-grade/simple-list',
+    method: () => 'GET',
+    resourceType: () => 'fetch',
+    failure: () => null
+  })
+  await observer.flushResponses({ timeoutMs: 20, quietMs: 0 })
+})
+
+test('portal announcement polling does not block case reuse', async () => {
+  const page = new EventEmitter()
+  const observer = observePage(page, { failedApiResponses: [] })
+  page.emit('request', {
+    url: () => 'http://127.0.0.1:48083/admin-api/oa/announcement/received-page?pageNo=1&pageSize=10',
+    method: () => 'GET',
+    resourceType: () => 'fetch',
+    failure: () => null
+  })
+  await observer.flushResponses({ timeoutMs: 20, quietMs: 0 })
 })
 
 test('a drain timeout rejects navigation reuse and reports the pending request', async () => {

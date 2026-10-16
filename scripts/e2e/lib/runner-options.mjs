@@ -21,6 +21,7 @@ export function parseRunnerArgs (
   { reuseSession = true, caseTimeoutMs = DEFAULT_CASE_TIMEOUT_MS } = {}
 ) {
   const args = {
+    help: false,
     list: false,
     suite: '',
     caseIds: [],
@@ -33,7 +34,8 @@ export function parseRunnerArgs (
 
   for (let index = 0; index < argv.length; index++) {
     const value = argv[index]
-    if (value === '--list') args.list = true
+    if (value === '--help' || value === '-h') args.help = true
+    else if (value === '--list') args.list = true
     else if (value === '--suite') {
       args.suite = readValue(argv, index, '--suite')
       index++
@@ -52,6 +54,7 @@ export function parseRunnerArgs (
       args.caseTimeoutMs = Number(readValue(argv, index, '--case-timeout-ms'))
       index++
     }
+    else throw new Error(`未知参数：${value}`)
   }
 
   args.caseIds = [...new Set(args.caseIds)]

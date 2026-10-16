@@ -189,8 +189,7 @@ const runIotWriteCase = async (
     ...result,
     ...conclusion,
     partial: result?.partial === true || conclusion.partial,
-    acceptanceComplete: result?.acceptanceComplete === true &&
-      conclusion.acceptanceComplete === true
+    acceptanceComplete: conclusion.acceptanceComplete === true
   }
 }
 

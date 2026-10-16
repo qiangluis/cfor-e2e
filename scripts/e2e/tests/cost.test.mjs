@@ -278,6 +278,78 @@ test('COST-030/031/032 missing registration remains PARTIAL with zero writes', a
   }
 })
 
+test('COST-002 uses the dedicated opening fixture after write safety and skips the generic scenario fixture', async () => {
+  const events = []
+  const record = {
+    runId: 'cost002-wiring',
+    environment: { target: 'local', tenantId: '1' }
+  }
+  const caseRecord = {
+    id: 'COST-002',
+    caseId: 'COST-002',
+    checks: [],
+    evidence: [],
+    notes: []
+  }
+  const api = {
+    async getBusiness (path) {
+      if (path.startsWith('/cost/model-versions?')) {
+        return { code: 0, data: { list: [], total: 0 } }
+      }
+      if (path.startsWith('/cost/periods?')) {
+        return {
+          code: 0,
+          data: {
+            list: [{
+              id: '9001',
+              period: '2099-12',
+              status: 'ACCOUNTING',
+              modelVersionId: '9002',
+              modelVersionNo: 'E2E-COST002-WIRING'
+            }],
+            total: 1
+          }
+        }
+      }
+      throw new Error(`unexpected COST-002 wiring read: ${path}`)
+    }
+  }
+
+  const result = await runCase(
+    { caseId: 'COST-002', page: {}, record, caseRecord, outputDir: '/unused' },
+    {
+      login: async () => 'token',
+      createApiClient: () => api,
+      writeFixtures: true,
+      assertLocalWriteSafety: async () => {
+        events.push('safety')
+      },
+      prepareCostOpeningFixture: async ({ effectiveMonth }) => {
+        events.push('opening')
+        assert.equal(effectiveMonth, '2099-12')
+        caseRecord.fixtures = {
+          costOpening: {
+            caseId: 'COST-002',
+            runId: record.runId,
+            tenantId: '1',
+            month: '2099-12',
+            effectiveMonth: '2099-12'
+          }
+        }
+      },
+      prepareCostScenario: async () => {
+        throw new Error('generic COST-002 scenario fixture must not run')
+      },
+      runCostOpeningClosure: async () => {
+        events.push('closure')
+      }
+    }
+  )
+
+  assert.deepEqual(events, ['safety', 'opening', 'closure'])
+  assert.equal(result.token, 'token')
+})
+
 test('COST-030/031/032 reject mismatched or shared fixture members without any writes', async () => {
   const mutations = [
     (context) => { context.registration.runId = 'previous-run' },

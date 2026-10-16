@@ -75,6 +75,10 @@ export const config = Object.freeze({
   tenant: env('CFOR_TENANT_NAME', env('CFOR_TENANT', 'CFOR 标准平台')),
   username: env('CFOR_USERNAME', env('CFOR_USER', 'admin')),
   password: env('CFOR_PASSWORD', env('CFOR_PASS', '')),
+  // Keep the legacy CRM two-user suites compatible with the newer role-specific
+  // account names used by procurement and BPM acceptance.
+  secondUsername: env('CFOR_SECOND_USERNAME', ''),
+  secondPassword: env('CFOR_SECOND_PASSWORD', ''),
   purchaseApproverUsername: env('CFOR_PURCHASE_APPROVER_USERNAME', 'purmgr01'),
   purchaseApproverPassword: env('CFOR_PURCHASE_APPROVER_PASSWORD', ''),
   financeApproverUsername: env('CFOR_FINANCE_APPROVER_USERNAME', 'finrvw01'),
@@ -85,6 +89,8 @@ export const config = Object.freeze({
   warehouseApproverPassword: env('CFOR_WAREHOUSE_APPROVER_PASSWORD', ''),
   warehouseFinalApproverUsername: env('CFOR_WAREHOUSE_FINAL_APPROVER_USERNAME', 'invmgr01'),
   warehouseFinalApproverPassword: env('CFOR_WAREHOUSE_FINAL_APPROVER_PASSWORD', ''),
+  hrmApproverUsername: env('CFOR_HRM_APPROVER_USERNAME', 'hrmgr01'),
+  hrmApproverPassword: env('CFOR_HRM_APPROVER_PASSWORD', ''),
   registerTenantName: env('CFOR_REGISTER_TENANT_NAME', env('CFOR_TENANT_NAME', 'CFOR 标准平台')),
   registerContactName: env('CFOR_REGISTER_CONTACT_NAME', ''),
   registerEmail: env('CFOR_REGISTER_EMAIL', ''),
@@ -126,6 +132,7 @@ export const environmentSummary = () => ({
   finalApproverUsername: config.finalApproverUsername,
   warehouseApproverUsername: config.warehouseApproverUsername,
   warehouseFinalApproverUsername: config.warehouseFinalApproverUsername,
+  hrmApproverUsername: config.hrmApproverUsername,
   registerTenantName: config.registerTenantName,
   fmsAccountSetId: config.fmsAccountSetId || 'from-env',
   dbName: config.db.name

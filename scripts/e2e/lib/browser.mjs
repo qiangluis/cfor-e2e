@@ -6,7 +6,7 @@ import { config, resolveChromePath } from '../config/index.mjs'
 import { ensureDir } from './report.mjs'
 import { decryptResponse, ENCRYPT_HEADER } from './crypto.mjs'
 import { extractAccessToken, resolveLoginContext } from './session.mjs'
-import { isBusinessSuccess } from './assertions.mjs'
+import { assertBusinessSuccess, isBusinessSuccess } from './assertions.mjs'
 import { resourceUrl } from './redact.mjs'
 
 /**
@@ -67,6 +67,17 @@ const SELECTORS = {
 const loginContexts = new WeakMap()
 const pageObservers = new WeakMap()
 
+// Layout and form-prefetch requests are shared background work. They may outlive
+// a business case, but HTTP and business failures must still be recorded.
+const isBackgroundLifecycleRequest = (url) =>
+  /\/system\/system-init\/(?:state|readiness)(?:[/?]|$)/.test(url || '') ||
+  /\/base\/material-grade\/simple-list(?:[/?]|$)/.test(url || '') ||
+  /\/system\/notify-message\/get-unread-list(?:[/?]|$)/.test(url || '') ||
+  // The portal notification panel keeps this request alive while a case
+  // navigates through business pages. It remains observable for failures,
+  // but must not block reuse of an otherwise healthy browser session.
+  /\/oa\/announcement\/received-page(?:[/?]|$)/.test(url || '')
+
 export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
   error === 'net::ERR_ABORTED' &&
   (
@@ -76,6 +87,12 @@ export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
     // registry. It is a navigation teardown, not a business request failure.
     (resourceType === 'fetch' && /^http:\/\/127\.0\.0\.1:\d+\/$/.test(url || ''))
   )
+
+export const isReleasedResponseBodyError = (error) => {
+  const message = String(error?.message || error || '')
+  return /No resource with given identifier found|Response body is not available for a response that was navigated away from|Target page, context or browser has been closed/i
+    .test(message)
+}
 
 async function firstVisible (page, selectors, timeout = 30000) {
   for (const selector of selectors) {
@@ -208,6 +225,7 @@ export function observePage (page, record) {
   if (existing) return existing
   const responseTasks = new Map()
   const pendingRequests = new Map()
+  const consoleTasks = new Set()
   const trackRequest = (request) => {
     if (!/\/(?:admin|app)-api\//.test(request.url())) return
     if (!pendingRequests.has(request)) {
@@ -215,7 +233,8 @@ export function observePage (page, record) {
       const finished = new Promise((settle) => { resolve = settle })
       pendingRequests.set(request, {
         finished, resolve, startedAt: Date.now(),
-        method: request.method(), url: resourceUrl(request.url())
+        method: request.method(), url: resourceUrl(request.url()),
+        background: isBackgroundLifecycleRequest(request.url())
       })
     }
     return pendingRequests.get(request)
@@ -227,12 +246,31 @@ export function observePage (page, record) {
   page.on('request', trackRequest)
   page.on('console', (message) => {
     if (message.type() !== 'error') return
-    record?.consoleErrors?.push(message.text())
+    const text = message.text()
+    record?.consoleErrors?.push(text)
     const location = message.location()
-    record?.consoleErrorDetails?.push({
-      text: message.text(), url: resourceUrl(location.url),
+    const entry = {
+      text, url: resourceUrl(location.url),
       line: location.lineNumber, column: location.columnNumber
-    })
+    }
+    record?.consoleErrorDetails?.push(entry)
+    const task = (async () => {
+      const details = []
+      for (const arg of message.args()) {
+        try {
+          const error = await arg.evaluate((value) => {
+            if (value instanceof Error) {
+              return { name: value.name, message: value.message, stack: value.stack }
+            }
+            return null
+          })
+          if (error) details.push(error)
+        } catch {}
+      }
+      if (details.length) entry.errors = details
+    })()
+    consoleTasks.add(task)
+    task.finally(() => consoleTasks.delete(task))
   })
   page.on('requestfailed', (request) => {
     finishRequest(request, false)
@@ -262,7 +300,9 @@ export function observePage (page, record) {
       finishRequest(response.request(), false)
       return
     }
-    const { finished } = trackRequest(response.request())
+    const trackedRequest = trackRequest(response.request())
+    if (!trackedRequest) return
+    const { finished } = trackedRequest
     const task = (async () => {
       try {
         // Reading before requestfinished can leave a body read pending across navigations.
@@ -274,12 +314,19 @@ export function observePage (page, record) {
           record?.failedApiResponses?.push({ ...entry, code: body.code })
         }
       } catch (error) {
+        // Chrome can release a successful background response body when a route
+        // navigation replaces the old document. This is not an API or business failure.
+        if (isReleasedResponseBodyError(error)) return
         record?.failedApiResponses?.push({
           ...entry, responseError: true, error: String(error.message || error)
         })
       }
     })()
-    responseTasks.set(task, { ...entry, startedAt: Date.now() })
+    responseTasks.set(task, {
+      ...entry,
+      startedAt: Date.now(),
+      background: trackedRequest.background
+    })
     task.finally(() => responseTasks.delete(task))
   })
   const capture = {
@@ -291,17 +338,29 @@ export function observePage (page, record) {
           (async () => {
             do {
               await Promise.all([
-                ...responseTasks.keys(),
-                ...[...pendingRequests.values()].map((entry) => entry.finished)
+                ...[...responseTasks.entries()]
+                  .filter(([, entry]) => !entry.background)
+                  .map(([task]) => task),
+                ...[...pendingRequests.values()]
+                  .filter((entry) => !entry.background)
+                  .map((entry) => entry.finished),
+                ...consoleTasks
               ])
               // Drain events queued during body reads before freezing case evidence or navigating.
               await new Promise((resolve) => setTimeout(resolve, quietMs))
-            } while (!expired && (responseTasks.size || pendingRequests.size))
+            } while (!expired && (
+              [...responseTasks.values()].some((entry) => !entry.background) ||
+              [...pendingRequests.values()].some((entry) => !entry.background) ||
+              consoleTasks.size > 0
+            ))
           })(),
           new Promise((resolve, reject) => {
             timer = setTimeout(() => {
               expired = true
-              const pending = [...responseTasks.values(), ...pendingRequests.values()]
+              const pending = [
+                ...[...responseTasks.values()].filter((entry) => !entry.background),
+                ...[...pendingRequests.values()].filter((entry) => !entry.background)
+              ]
                 .map(({ startedAt, finished, resolve, ...entry }) => ({
                 ...entry, pendingMs: Date.now() - startedAt
               }))
@@ -422,6 +481,8 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
     await (await findLoginButton(page)).click()
     const loginResponse = await responsePromise
     const loginPayload = await readLoginResponse(loginResponse)
+    // Reject bad credentials before waiting for token and router bootstrap.
+    assertBusinessSuccess(loginPayload, `登录 ${username}（租户 ${tenantName}）`)
     // The login page completes authentication through Vue router and permission
     // bootstrap. Waiting for a full "load" event is flaky for history.pushState
     // navigations, so poll the actual URL and storage state instead.
@@ -616,7 +677,23 @@ export async function bodyContainsAny (page, keywords) {
 export async function saveScreenshot (page, outputDir, name, record) {
   ensureDir(outputDir)
   const target = path.join(outputDir, `${name}.png`)
-  await page.screenshot({ path: target, fullPage: true, animations: 'disabled', caret: 'hide' })
-  record?.screenshots?.push(target)
-  return target
+  const screenshotOptions = {
+    animations: 'disabled',
+    caret: 'hide',
+    timeout: Math.min(config.browserTimeoutMs, 15000)
+  }
+  try {
+    await page.screenshot({ ...screenshotOptions, path: target, fullPage: true })
+    record?.screenshots?.push(target)
+    return target
+  } catch (error) {
+    // Very tall or continuously changing pages can block full-page layout
+    // capture. Keep a usable viewport artifact so the business result is not
+    // lost only because the evidence page could not be stitched.
+    const viewportTarget = path.join(outputDir, `${name}-viewport.png`)
+    await page.screenshot({ ...screenshotOptions, path: viewportTarget, fullPage: false })
+    record?.screenshots?.push(viewportTarget)
+    record?.notes?.push(`全屏截图失败，已降级为视口截图：${String(error?.message || error).split('\n')[0]}`)
+    return viewportTarget
+  }
 }

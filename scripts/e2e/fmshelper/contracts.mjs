@@ -56,21 +56,33 @@ export function check (caseRecord, name, passed, details = '') {
 // Only evidence explicitly assigned to a catalog assertion can complete it.
 export function catalogResult (caseRecord, definition) {
   const proofs = caseRecord.catalogEvidence || {}
-  const required = [...definition.assertions, ...(definition.reverse || [])]
-  caseRecord.catalogAssertions = required.map((assertion) => ({
+  const row = (assertion, index) => ({
+    index,
     assertion,
-    status: proofs[assertion]?.status || 'UNVERIFIED',
+    // catalogEvidence preserves the internal PASS/FAIL audit trail. The
+    // acceptance report accepts only this explicit catalog mapping status.
+    status: proofs[assertion]?.status === 'PASS' ? 'VERIFIED' : 'GAP',
     evidence: proofs[assertion]?.evidence || '尚无本轮真实闭环证据'
-  }))
-  caseRecord.remainingAssertions = caseRecord.catalogAssertions
-    .filter((item) => item.status !== 'PASS')
+  })
+  // The report maps these rows against the catalog's declared assertions by
+  // original index. Reverse assertions have a separate index namespace.
+  const catalogAssertions = (definition.assertions || []).map(row)
+  const reverseAssertions = (definition.reverse || []).map(row)
+  caseRecord.catalogAssertions = catalogAssertions
+  caseRecord.catalogReverseAssertions = reverseAssertions
+  caseRecord.remainingAssertions = [
+    ...catalogAssertions.filter((item) => item.status !== 'VERIFIED'),
+    ...reverseAssertions
+      .filter((item) => item.status !== 'VERIFIED')
+      .map((item) => ({ ...item, reverse: true }))
+  ]
   const failed = caseRecord.checks.some((item) => item.passed === false) ||
-    caseRecord.catalogAssertions.some((item) => item.status === 'FAIL')
+    Object.values(proofs).some((item) => item?.status === 'FAIL')
   caseRecord.passCandidate = !failed && caseRecord.remainingAssertions.length === 0
   return {
     partial: !caseRecord.passCandidate,
     note: caseRecord.passCandidate
-      ? '本轮全部 catalog 原断言具备证据；catalog 状态未修改，候选待主线程审核'
+      ? '本轮全部 catalog 原断言及 reverse 具备证据；catalog 状态未修改，候选待主线程审核'
       : `剩余 ${caseRecord.remainingAssertions.length} 项 catalog 断言，不能升级完整 PASS`
   }
 }
@@ -78,7 +90,9 @@ export function catalogResult (caseRecord, definition) {
 export function proof (caseRecord, assertion, passed, evidence) {
   caseRecord.catalogEvidence ||= {}
   const previous = caseRecord.catalogEvidence[assertion]
-  const status = passed && previous?.status !== 'FAIL' ? 'PASS' : 'FAIL'
+  // 同一断言可能由主场景与写侧闭环分别取证；一旦出现失败即保持 FAIL，否则取并集 PASS。
+  const status = passed && previous?.status !== 'FAIL' ? 'PASS'
+    : passed && previous?.status === 'FAIL' ? 'FAIL' : 'FAIL'
   caseRecord.catalogEvidence[assertion] = {
     status,
     evidence: [previous?.evidence, evidence].filter(Boolean).join('; ')

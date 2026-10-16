@@ -34,7 +34,6 @@ export const parallelSafeCases = new Set([
   'PROC-002',
   'PROC-003',
   'PROC-004',
-  'MES-PROD-003',
   'PB038-003',
   'PB149-OUTSOURCE-WIP-001',
   'PB154-OUTSOURCE-PAYABLE-001',
@@ -58,9 +57,7 @@ export const parallelSafeCases = new Set([
   'PB040-001',
   'PB006-001',
   'MES-TASK-REPORT-001',
-  'MES-MONITOR-001',
   'INT-001',
-  'PB029-001',
 ])
 
 export function allDefinitions (sourceCatalog = catalog) {
@@ -76,7 +73,7 @@ export function validateCaseTimeoutMs (value) {
   return value
 }
 
-function parseArgs (argv) {
+export function parseParallelArgs (argv) {
   const args = {
     cases: [],
     suites: [],
@@ -84,18 +81,26 @@ function parseArgs (argv) {
     caseTimeoutMs: Number(process.env.CFOR_E2E_CASE_TIMEOUT_MS || 180000),
     outputRoot: process.env.CFOR_E2E_OUT || '/tmp/cfor-e2e',
     headless: true,
-    plan: false
+    plan: false,
+    help: false
+  }
+  const readValue = (index, option) => {
+    const value = argv[index + 1]
+    if (value === undefined || value.startsWith('--')) throw new Error(`${option} 缺少参数`)
+    return value
   }
   for (let index = 0; index < argv.length; index++) {
     const value = argv[index]
-    if (value === '--case') args.cases.push(argv[++index])
-    else if (value === '--suite') args.suites.push(argv[++index])
-    else if (value === '--workers') args.workers = Number(argv[++index])
-    else if (value === '--case-timeout-ms') args.caseTimeoutMs = Number(argv[++index])
-    else if (value === '--out') args.outputRoot = argv[++index]
+    if (value === '--help' || value === '-h') args.help = true
+    else if (value === '--case') { args.cases.push(readValue(index, value)); index++ }
+    else if (value === '--suite') { args.suites.push(readValue(index, value)); index++ }
+    else if (value === '--workers') { args.workers = Number(readValue(index, value)); index++ }
+    else if (value === '--case-timeout-ms') { args.caseTimeoutMs = Number(readValue(index, value)); index++ }
+    else if (value === '--out') { args.outputRoot = readValue(index, value); index++ }
     else if (value === '--headed') args.headless = false
     else if (value === '--headless') args.headless = true
     else if (value === '--plan') args.plan = true
+    else throw new Error(`未知参数：${value}`)
   }
   if (!Number.isInteger(args.workers) || args.workers < 1) {
     throw new Error(`--workers 必须是大于 0 的整数，当前=${args.workers}`)
@@ -821,7 +826,21 @@ function printPlan () {
 }
 
 async function main () {
-  const args = parseArgs(process.argv.slice(2))
+  const args = parseParallelArgs(process.argv.slice(2))
+  if (args.help) {
+    console.log([
+      'Usage: node scripts/e2e/parallel-runner.mjs [options]',
+      '  --plan                     Show parallel/serial groups without executing',
+      '  --case ID                  Select safe cases (repeatable)',
+      '  --suite ID                 Select safe suites (repeatable)',
+      '  --workers N                Concurrent suite sessions (default 3)',
+      '  --headed | --headless      Browser visibility',
+      '  --case-timeout-ms N        Per-case timeout (default 180000)',
+      '  --out PATH                 Evidence output directory',
+      '  --help, -h                 Show usage without executing'
+    ].join('\n'))
+    return
+  }
   if (args.plan) {
     printPlan()
     return

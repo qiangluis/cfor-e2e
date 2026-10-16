@@ -1,6 +1,10 @@
 import { createApiClient } from '../lib/api.mjs'
 import { nonEmpty } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import { config } from '../config/index.mjs'
+import {
+  assertPlmLocalTarget, createPlmKnowledgeApi, runPlmWriteClosure
+} from '../fixtures/plm-write-closure.mjs'
 
 export const cases = ['PLM-001', 'PLM-002']
 
@@ -63,119 +67,79 @@ export const releaseFacts = (baselines, logs) => {
 
 const check = (caseRecord, name, passed, details) => caseRecord.checks.push({ name, passed, details })
 
-const readList = async (api, caseRecord, path, label) => {
-  const rows = strictList(await api.getBusiness(path))
-  caseRecord.evidence.push(`${label}: GET ${path}; rows=${rows.length}（仅响应结构，不代表业务验收）`)
-  if (!rows.length) caseRecord.notes.push(`缺前置：${label}当前查询为空，未进行该业务事实断言。`)
-  return rows
-}
-
-const inspectRows = (caseRecord, label, rows, predicate) => {
-  if (rows.length) check(caseRecord, label, rows.every(predicate), `sampleRows=${rows.length}; 仅当前查询样本`)
-}
-
-const view = async (api, page, record, caseRecord, outputDir, components, selector, name, dependencies) => {
+const view = async (api, page, record, caseRecord, outputDir, components, selector, name, dependencies, sample) => {
   const permission = await api.getBusiness('/system/auth/get-permission-info')
   const route = components.map((component) => menuRoute(permission?.data?.menus, [component])).find(Boolean)
   if (!route) {
     caseRecord.notes.push(`缺前置：${name}权限菜单未找到唯一组件路由，未猜测旧路径。`)
-    return
+    return false
   }
   await (dependencies.openRoute || openRoute)(page, route, { readySelector: selector })
   check(caseRecord, `${name}真实页面控件就绪`, new URL(page.url()).pathname === route, page.url())
+  if (sample) {
+    await page.getByPlaceholder(sample.placeholder, { exact: true }).first().fill(sample.value)
+    await page.getByRole('button', { name: '搜索', exact: true }).first().click()
+    const ownedRow = page.locator('.el-table__row').filter({ hasText: sample.value }).first()
+    await ownedRow.waitFor({ state: 'visible', timeout: 30000 })
+    check(caseRecord, `${name}展示本轮专属样本`,
+      (await ownedRow.innerText()).includes(sample.value), `fixture=${sample.value}`)
+  }
   await (dependencies.saveScreenshot || saveScreenshot)(page, outputDir, name, record)
   caseRecord.evidence.push(`${name}: permission menu -> ${route}; selector=${selector}`)
+  return true
 }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
   if (!cases.includes(caseId)) return { designed: true }
-  caseRecord.notes.push('只读前置门禁，不创建/审核/冻结/发布业务模型，不将空集或页面可见视为正式业务通过。')
-  const token = await (dependencies.login || login)(page)
-  const api = (dependencies.createApiClient || createApiClient)({ token, record })
-  const products = await readList(api, caseRecord, '/plm/core/product/page?pageNo=1&pageSize=100', '产品主档')
-  inspectRows(caseRecord, '产品样本包含主键、编号、生命周期', products,
-    (row) => Boolean(row.id && row.productNo && row.lifecycleStatus))
-
+  const runtime = dependencies.runtime || config
+  // Check the service origin before touching the shared browser session.
+  assertPlmLocalTarget({ ...runtime, tenantId: runtime.tenantId || '1' })
+  const auth = await (dependencies.login || login)(page, { returnContext: true })
+  const token = auth?.token
+  const tenantId = auth?.tenantId
+  if (!token || !tenantId) throw new Error('BLOCKED: PLM 登录缺少可验证的 token/tenantId 上下文')
+  const verifiedRuntime = { ...runtime, tenantId }
+  assertPlmLocalTarget(verifiedRuntime)
+  const apiFactory = dependencies.createApiClient || createApiClient
+  const api = apiFactory({ token, tenantId, record })
+  const knowledgeApi = createPlmKnowledgeApi({ token, tenantId, record, apiFactory })
+  caseRecord.notes.push('本地专属写侧：只创建本轮 E2E-PLM 标记的数据，临时成员账号最终停用；缺少正式契约保留 GAP，意外放行记录 FAIL。')
+  const result = await (dependencies.runPlmWriteClosure || runPlmWriteClosure)({
+    caseId, api, knowledgeApi, caseRecord, record, runtime: verifiedRuntime, apiFactory,
+    ...(dependencies.writeSafety ? { writeSafety: dependencies.writeSafety } : {}),
+    ...(dependencies.tokenFactory ? { tokenFactory: dependencies.tokenFactory } : {})
+  })
+  const fixture = result.fixture
+  const productVisible = await view(api, page, record, caseRecord, outputDir,
+    ['plm/product-part/product-ledger/index', 'plm/core/product-ledger/index'],
+    '.plm-product-page input[placeholder="请输入产品编号"]', `${caseId.toLowerCase()}-product-write`, dependencies,
+    { placeholder: '请输入产品编号', value: fixture.productNo })
+  let secondVisible
   if (caseId === 'PLM-001') {
-    const projects = await readList(api, caseRecord, '/plm/rdm/project/ledger/page?pageNo=1&pageSize=100', '研发项目')
-    const parts = await readList(api, caseRecord, '/plm/core/part/page?pageNo=1&pageSize=100', '零件主档')
-    const eboms = await readList(api, caseRecord, '/plm/core/ebom/page?pageNo=1&pageSize=100', 'EBOM')
-    inspectRows(caseRecord, '研发项目样本保留阶段、状态与负责人', projects,
-      (row) => Boolean(row.id && row.stageCode && row.status && row.ownerId))
-    const product = products.find((row) => row.id && row.sourceProjectId)
-    if (product) {
-      const project = (await api.getBusiness(`/plm/rdm/project/ledger/get?id=${encodeURIComponent(product.sourceProjectId)}`)).data
-      check(caseRecord, '产品来源研发项目可追溯', String(project?.id) === String(product.sourceProjectId),
-        `product=${product.id}; sourceProject=${product.sourceProjectId}`)
-      const tasks = await readList(api, caseRecord,
-        `/plm/rdm/project/ledger/tasks?projectId=${encodeURIComponent(product.sourceProjectId)}`, '项目阶段任务')
-      inspectRows(caseRecord, '阶段任务归属来源项目', tasks,
-        (row) => String(row.projectId) === String(product.sourceProjectId))
-    } else caseRecord.notes.push('缺前置：没有包含 sourceProjectId 的产品样本，未验证项目到产品来源链。')
-    const part = parts.find((row) => row.id)
-    if (part) {
-      const revisions = await readList(api, caseRecord,
-        `/plm/core/part/revision/page?pageNo=1&pageSize=100&partId=${encodeURIComponent(part.id)}`, '零件版本')
-      inspectRows(caseRecord, '零件版本有版本号、状态且属于查询零件', revisions,
-        (row) => String(row.partId) === String(part.id) && Boolean(row.revisionNo && row.revisionStatus))
-    }
-    const ebom = eboms.find((row) => row.ebomId || row.id)
-    if (ebom) {
-      const id = ebom.ebomId || ebom.id
-      const tree = strictTree(await api.getBusiness(`/plm/core/ebom/tree?ebomId=${encodeURIComponent(id)}`))
-      caseRecord.evidence.push(`EBOM 树: GET /plm/core/ebom/tree?ebomId=${id}; rows=${tree.length}（仅响应结构，不代表业务验收）`)
-      if (!tree.length) caseRecord.notes.push(`缺前置：EBOM=${id}没有 BOM 行，版本链路未验证。`)
-      inspectRows(caseRecord, 'EBOM 行引用零件版本且数量有效', tree,
-        (row) => Boolean(row.componentPartId && row.componentRevisionId && row.partVersion) &&
-          ['number', 'string'].includes(typeof row.quantity) && nonEmpty(row.quantity) &&
-          Number.isFinite(Number(row.quantity)))
-      await readList(api, caseRecord, `/plm/core/ebom/downstream-refs?ebomId=${encodeURIComponent(id)}`, 'EBOM 下游引用')
-    }
-    await view(api, page, record, caseRecord, outputDir,
-      ['plm/product-part/product-ledger/index', 'plm/core/product-ledger/index'],
-      '.plm-product-page input[placeholder="请输入产品编号"]', 'plm-001-product-prerequisites', dependencies)
-    await view(api, page, record, caseRecord, outputDir,
+    secondVisible = await view(api, page, record, caseRecord, outputDir,
       ['plm/project-rdm/project-ledger/index', 'plm/rdm/project/project-ledger/index'],
-      '.el-form-item__label:has-text("项目状态")', 'plm-001-project-prerequisites', dependencies)
-    caseRecord.notes.push(
-      'PARTIAL：仅读取当前租户建模样本；尚缺 PMS 项目关联、完整阶段流转、工艺版本来源、两个成员权限身份与知识中枢引用/正文不复制证据。未创建或推进共享项目。'
-    )
+      '.el-form-item__label:has-text("项目状态")', 'plm-001-project-write', dependencies,
+      { placeholder: '请输入单号', value: fixture.projectBody.bizNo })
   } else {
-    const baselines = await readList(api, caseRecord, '/plm/core/baseline/page?pageNo=1&pageSize=100', '配置基线')
-    inspectRows(caseRecord, '基线样本保留主键、产品与状态', baselines,
-      (row) => Boolean(row.id && row.productId && row.status))
-    const missingVersions = baselines.filter((row) => !nonEmpty(row.versionNo))
-    if (missingVersions.length) caseRecord.notes.push(
-      `缺前置：基线 versionNo 为空，无法证明版本追溯；baselineIds=${missingVersions.map((row) => row.id).join(',')}。`
-    )
-    const facts = releaseFacts(baselines, [])
-    if (!facts.released.length) caseRecord.notes.push('缺前置：没有同时保留版本、产品及发布时间的 RELEASED 基线。')
-    const baseline = facts.released[0] || baselines.find((row) => row.id)
-    if (baseline) {
-      const detail = (await api.getBusiness(`/plm/core/baseline/get?id=${encodeURIComponent(baseline.id)}`)).data
-      check(caseRecord, '基线详情与分页身份一致',
-        String(detail?.id) === String(baseline.id),
-        `baseline=${baseline.id}; version=${baseline.versionNo}`)
-      if (nonEmpty(baseline.versionNo)) check(caseRecord, '非空基线版本在详情和分页保持一致',
-        detail?.versionNo === baseline.versionNo, `baseline=${baseline.id}; version=${baseline.versionNo}`)
-      const product = (await api.getBusiness(`/plm/core/product/get?id=${encodeURIComponent(baseline.productId)}`)).data
-      check(caseRecord, '基线产品来源可读', String(product?.id) === String(baseline.productId),
-        `baseline=${baseline.id}; product=${baseline.productId}`)
-      if (!product?.targetMaterialId) caseRecord.notes.push('缺前置：基线产品尚未绑定 MES 目标物料。')
-      const logs = await readList(api, caseRecord,
-        `/plm/core/baseline/route-release-logs?baselineId=${encodeURIComponent(baseline.id)}&limit=20`, '既有路线发布日志')
-      inspectRows(caseRecord, '日志归属查询基线', logs, (row) => String(row.baselineId) === String(baseline.id))
-      const receipts = releaseFacts(baselines, logs).receipts
-      caseRecord.evidence.push(`既有正式 release SUCCESS 日志（非 check/dryRun）=${receipts.length}; baseline=${baseline.id}`)
-      if (!receipts.length) caseRecord.notes.push('缺前置：没有同时保留业务键、产品、目标物料及 MES 接收标志的正式发布记录。')
-    }
     // route-context is a GET with persisted check logs; the release workbench invokes it automatically.
-    await view(api, page, record, caseRecord, outputDir,
+    secondVisible = await view(api, page, record, caseRecord, outputDir,
       ['plm/configuration-baseline/product-baseline/index', 'plm/core/baseline/index'],
-      '.plm-baseline-page input[placeholder="请输入基线编号"]', 'plm-002-baseline-prerequisites', dependencies)
-    caseRecord.notes.push(
-      'PARTIAL：PLM-001 尚未完整 PASS；未验证未发布版本被 ERP/MES 拒绝、正式消费回执、重复发布幂等和历史版本保护。route-context 会持久化 check 日志，故不调用该 GET 或自动调用它的 CAPP 下发页。'
-    )
+      '.plm-baseline-page input[placeholder="请输入基线编号"]', 'plm-002-baseline-write', dependencies)
+    if (!fixture.baselineId) caseRecord.notes.push('基线页只验证控件，不把共享列表或空集作为本轮专属基线发布证据。')
   }
-  return { token, api, partial: true }
+  const uiComplete = productVisible && secondVisible
+  if (!uiComplete) {
+    // The runner also inspects catalogAssertions, so a return flag alone is insufficient.
+    for (const assertion of caseRecord.catalogAssertions || []) {
+      assertion.status = 'GAP'
+      assertion.details = `${assertion.details || ''} 本轮真实页面验收缺少权限路由证据。`.trim()
+    }
+    caseRecord.catalogComplete = false
+    caseRecord.remainingAssertions = (caseRecord.catalogAssertions || []).map((row) => row.assertion)
+  }
+  return { token, api, ...result,
+    partial: result.partial || !uiComplete,
+    acceptanceComplete: result.acceptanceComplete === true && uiComplete &&
+      caseRecord.checks.every((item) => item.passed === true),
+    note: caseRecord.notes.join('；') }
 }

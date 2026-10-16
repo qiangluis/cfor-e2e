@@ -10,6 +10,7 @@ import {
   allDefinitions,
   groupDefinitionsBySuite,
   parallelSafeCases,
+  parseParallelArgs,
   partitionDefinitions,
   processTreeHasExited,
   resultFromChildReport,
@@ -23,6 +24,44 @@ import {
   validateParallelPreflight,
   waitForChildExit
 } from '../parallel-runner.mjs'
+
+test('parallel CLI rejects unknown options and missing values before scheduling', () => {
+  assert.equal(parseParallelArgs(['--help']).help, true)
+  assert.equal(parseParallelArgs(['-h']).help, true)
+  assert.deepEqual(parseParallelArgs(['--case', 'SMOKE-001', '--case', 'SMOKE-002']).cases,
+    ['SMOKE-001', 'SMOKE-002'])
+  for (const option of ['--case', '--suite', '--workers', '--case-timeout-ms', '--out']) {
+    assert.throws(() => parseParallelArgs([option]), /缺少参数/)
+    assert.throws(() => parseParallelArgs([option, '--plan']), /缺少参数/)
+  }
+  assert.throws(() => parseParallelArgs(['--cases', 'SMOKE-001']), /未知参数/)
+})
+
+test('both CLI help commands exit without opening browsers or writing evidence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cfor-cli-help-test-'))
+  try {
+    for (const entry of ['runner.mjs', 'parallel-runner.mjs']) {
+      const output = path.join(root, entry)
+      const result = spawnSync(process.execPath, [
+        fileURLToPath(new URL(`../${entry}`, import.meta.url)), '--help'
+      ], {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: {
+          ...process.env, CFOR_E2E_OUT: output,
+          CFOR_TARGET: 'local',
+          CFOR_API_BASE: 'http://127.0.0.1:48083', CFOR_WEB_BASE: 'http://127.0.0.1:9151'
+        }
+      })
+      assert.equal(result.status, 0, result.stderr)
+      assert.match(result.stdout, /Usage:/)
+      assert.doesNotMatch(result.stdout, /\[RUN|\[parallel\] RUN|\[e2e\]/)
+      assert.equal(fs.existsSync(output), false)
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('parallel plan keeps safe cases disjoint from serial cases', () => {
   const { parallel, serial } = partitionDefinitions(allDefinitions())
@@ -158,6 +197,12 @@ test('owned write fixtures cannot enter the automatic read-only worker pool', ()
 test('read-only WBF-008 is eligible for the parallel pool', () => {
   assert.equal(parallelSafeCases.has('WBF-008'), true)
   assert.equal(parallelSafeCases.has('WBF-005'), true)
+})
+
+test('MES-PROD-003 stays serial because its material fixture can be referenced by procurement', () => {
+  assert.equal(parallelSafeCases.has('MES-PROD-003'), false)
+  const { serial } = partitionDefinitions(allDefinitions())
+  assert.equal(serial.some((item) => item.id === 'MES-PROD-003'), true)
 })
 
 test('outsource draft builders stay serial because GET probes allocate bill numbers', () => {

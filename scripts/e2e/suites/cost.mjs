@@ -1,15 +1,342 @@
+import fs from 'node:fs'
+import { config } from '../config/index.mjs'
 import { createApiClient } from '../lib/api.mjs'
 import { isBusinessSuccess, nonEmpty } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
-import { prepareCostModelFixture, createLockedCostModelFixture } from '../fixtures/cost-model.mjs'
+import {
+  COST_OPENING_FIXTURE_MONTH,
+  prepareCostModelFixture,
+  prepareCostOpeningFixture,
+  createLockedCostModelFixture
+} from '../fixtures/cost-model.mjs'
 import {
   COST_SCENARIO_BY_CASE,
+  cleanupCostScenarioReviewer,
   loadCostScenario,
+  loginAs,
   prepareCostScenario
 } from '../fixtures/cost-scenario.mjs'
-import { runReadOnlySql } from '../lib/db.mjs'
+import { assertLocalDatabase, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
+import {
+  cleanupDedicatedCostDepartment,
+  costWritesEnabled,
+  prepareDedicatedCostDepartment,
+  scopedCostScenarioApi
+} from '../fixtures/cost-write-scope.mjs'
+import {
+  COST_ALLOCATION_CLOSURE_CHECKS,
+  runCostAllocationClosure,
+  verifyCostSharedWorkspaceBoundary
+} from '../fixtures/cost-allocation-closure.mjs'
+import { COST_OPENING_CHECKS, runCostOpeningClosure } from '../fixtures/cost-opening-closure.mjs'
+import {
+  COST_OPENING_BROWSER_CHECKS,
+  verifyCostOpeningBrowserClosure
+} from '../fixtures/cost-opening-browser-closure.mjs'
+import { costOpeningPageActions } from '../fixtures/cost-opening-page.mjs'
+import {
+  COST_APPROVAL_CHECKS,
+  COST_APPROVAL_PAGE_CHECKS,
+  COST_OUTBOX_CHECKS,
+  COST_SEPARATION_CHECKS,
+  COST_WORKFLOW_CHECKS,
+  runCostPublicationApprovalClosure,
+  runCostOutboxClosure,
+  runCostSeparationClosure,
+  runCostWorkflowClosure
+} from '../fixtures/cost-workflow-closure.mjs'
+import {
+  COST_PURCHASE_FREIGHT_CHECKS,
+  runCostPurchaseFreightClosure
+} from '../fixtures/cost-purchase-freight-closure.mjs'
+import {
+  COST_PURCHASE_SOURCE_CHECKS,
+  COST_PURCHASE_RETURN_CHECKS,
+  runCostPurchaseReceiptClosure,
+  runCostPurchaseReturnClosure
+} from '../fixtures/cost-purchase-source-closure.mjs'
+import {
+  COST_PURCHASE_REPORT_CHECKS,
+  runCostPurchaseReportClosure
+} from '../fixtures/cost-purchase-report-closure.mjs'
+import {
+  COST_ENTERPRISE_CHECKS,
+  auditCostEnterpriseRoutes,
+  readCostEnterpriseFactSnapshot,
+  verifyCostEnterpriseRejections,
+  verifyCostEnterpriseWorkbench
+} from '../fixtures/cost-enterprise-route-evidence.mjs'
+import {
+  COST_CENTER_PERMISSION_CHECKS,
+  hasCostCenterPermissionEvidence,
+  preflightCostCenterPermissionClosure,
+  runCostCenterPermissionClosure
+} from '../fixtures/cost-center-permission-closure.mjs'
+import {
+  COST_OPERATING_CHECKS,
+  hasCostOperatingEvidence,
+  runCostOperatingClosure
+} from '../fixtures/cost-operating-closure.mjs'
+import {
+  COST_STAGE_EVIDENCE_BINDINGS,
+  costStageEvidenceBindings,
+  runCostStageEvidenceClosure
+} from '../fixtures/cost-stage-evidence-closure.mjs'
+import {
+  COST_FORMAL_REPORT_BINDINGS,
+  COST_FORMAL_REPORT_CHECKS,
+  hasCostFormalReportEvidence,
+  runCostFormalReportClosure
+} from '../fixtures/cost-formal-report-closure.mjs'
 
-export const cases = ['COST-001', 'COST-002', 'COST-003', 'COST-004', 'COST-005', 'COST-006', 'COST-007', 'COST-008', 'COST-009', 'COST-010', 'COST-011', 'COST-012', 'COST-013', 'COST-014', 'COST-015', 'COST-016', 'COST-017', 'COST-018', 'COST-019', 'COST-020', 'COST-021', 'COST-022', 'COST-023', 'COST-024', 'COST-025', 'COST-026', 'COST-027', 'COST-028', 'COST-029', 'COST-030', 'COST-031', 'COST-032', 'COST-033', 'COST-034']
+export const cases = ['COST-001', 'COST-002', 'COST-003', 'COST-004', 'COST-005', 'COST-006', 'COST-007', 'COST-008', 'COST-009', 'COST-010', 'COST-011', 'COST-012', 'COST-013', 'COST-014', 'COST-015', 'COST-016', 'COST-017', 'COST-018', 'COST-019', 'COST-020', 'COST-021', 'COST-022', 'COST-023', 'COST-024', 'COST-025', 'COST-026', 'COST-027', 'COST-028', 'COST-029', 'COST-030', 'COST-031', 'COST-032', 'COST-033', 'COST-034', 'COST-035', 'COST-036', 'COST-037', 'COST-038', 'COST-039']
+
+// A catalog assertion can only be VERIFIED by the exact, named runtime checks
+// below. Empty-list, route-only, or combined success-or-blocked probes remain GAP.
+export const costCatalogBindings = Object.freeze({
+  'COST-001': Object.freeze({
+    0: [COST_ALLOCATION_CLOSURE_CHECKS.saveReadback],
+    1: [COST_ALLOCATION_CLOSURE_CHECKS.fixture],
+    2: [COST_ALLOCATION_CLOSURE_CHECKS.modes],
+    3: [
+      COST_ALLOCATION_CLOSURE_CHECKS.browserRoute,
+      COST_ALLOCATION_CLOSURE_CHECKS.browserCancel,
+      COST_ALLOCATION_CLOSURE_CHECKS.browserRefresh
+    ]
+  }),
+  'COST-002': Object.freeze({
+    0: [COST_OPENING_CHECKS.draft],
+    1: [COST_OPENING_CHECKS.material],
+    2: [COST_OPENING_CHECKS.amounts],
+    3: [COST_OPENING_CHECKS.unit],
+    4: [COST_OPENING_CHECKS.states],
+    5: Object.values(COST_OPENING_BROWSER_CHECKS)
+  }),
+  'COST-003': Object.freeze({
+    0: ['成本写接口返回 requestId 与期间版本'],
+    1: [COST_WORKFLOW_CHECKS.headers],
+    2: [COST_WORKFLOW_CHECKS.replay],
+    3: [COST_WORKFLOW_CHECKS.version]
+  }),
+  'COST-004': Object.freeze({
+    1: [COST_OUTBOX_CHECKS.owned],
+    3: [COST_OUTBOX_CHECKS.fields]
+  }),
+  'COST-005': Object.freeze({
+    0: [COST_OPERATING_CHECKS.refresh, COST_OPERATING_CHECKS.collections],
+    1: [COST_OPERATING_CHECKS.calculation],
+    2: [COST_OPERATING_CHECKS.confirmationGate],
+    3: [COST_OPERATING_CHECKS.publication, COST_OPERATING_CHECKS.page],
+    4: [COST_OPERATING_CHECKS.rollback]
+  }),
+  'COST-007': Object.freeze({
+    0: [COST_ENTERPRISE_CHECKS.trade, COST_ENTERPRISE_CHECKS.tradeUnchanged],
+    1: [COST_ENTERPRISE_CHECKS.purchase, COST_ENTERPRISE_CHECKS.purchaseUnchanged]
+  }),
+  'COST-008': Object.freeze({
+    0: [COST_OPERATING_CHECKS.allocationBasis, COST_OPERATING_CHECKS.invalidBasis],
+    1: [COST_OPERATING_CHECKS.salesCost],
+    2: [COST_OPERATING_CHECKS.publication, COST_OPERATING_CHECKS.page]
+  }),
+  'COST-009': Object.freeze({
+    0: [COST_PURCHASE_SOURCE_CHECKS.receipt],
+    1: [COST_PURCHASE_SOURCE_CHECKS.mapping],
+    2: [COST_PURCHASE_SOURCE_CHECKS.draft, COST_PURCHASE_SOURCE_CHECKS.browser],
+    3: [COST_PURCHASE_SOURCE_CHECKS.empty]
+  }),
+  'COST-010': Object.freeze({
+    0: [COST_PURCHASE_RETURN_CHECKS.receipt],
+    1: [COST_PURCHASE_RETURN_CHECKS.returned],
+    2: [COST_PURCHASE_RETURN_CHECKS.draft, COST_PURCHASE_RETURN_CHECKS.browser],
+    3: [COST_PURCHASE_RETURN_CHECKS.net],
+    4: [COST_PURCHASE_RETURN_CHECKS.overflow]
+  }),
+  'COST-011': Object.freeze({
+    0: [COST_PURCHASE_FREIGHT_CHECKS.wmsSource],
+    1: [COST_PURCHASE_FREIGHT_CHECKS.expense],
+    2: [COST_PURCHASE_FREIGHT_CHECKS.shared],
+    3: [COST_PURCHASE_FREIGHT_CHECKS.zero]
+  }),
+  'COST-012': Object.freeze({
+    0: [COST_PURCHASE_REPORT_CHECKS.fields],
+    1: [COST_PURCHASE_REPORT_CHECKS.aggregate],
+    2: [COST_PURCHASE_REPORT_CHECKS.fallback],
+    3: [COST_PURCHASE_REPORT_CHECKS.frozen]
+  }),
+  'COST-022': Object.freeze({
+    0: ['反月结重开接口可达且强制要求重开原因'],
+    1: ['没有正式发布批次时反月结被业务规则阻断而非未知异常'],
+    2: ['反月结后原发布批次保留为REVERSED、原试算保留为SUPERSEDED，期间回到ACCOUNTING并解绑当前批次'],
+    3: ['重开后必须重新试算、人工确认并发布新批次，已发布金额不被覆盖']
+  }),
+  'COST-023': Object.freeze({
+    0: [COST_SEPARATION_CHECKS.creator],
+    1: [COST_SEPARATION_CHECKS.selfConfirm],
+    2: [COST_SEPARATION_CHECKS.maintainer],
+    3: [COST_SEPARATION_CHECKS.publicationRequest],
+    4: [COST_SEPARATION_CHECKS.operatingConfirm],
+    5: [COST_SEPARATION_CHECKS.operatingRollback]
+  }),
+  'COST-028': Object.freeze({
+    0: [COST_APPROVAL_CHECKS.pending],
+    1: [COST_APPROVAL_CHECKS.binding],
+    2: [COST_APPROVAL_CHECKS.actors],
+    3: [COST_APPROVAL_CHECKS.execution],
+    4: [COST_APPROVAL_CHECKS.unique],
+    5: [COST_APPROVAL_PAGE_CHECKS.strip],
+    6: [COST_APPROVAL_PAGE_CHECKS.dialogs]
+  }),
+  'COST-029': Object.freeze({
+    0: ['成本中心可引用真实部门并按启用日期创建'],
+    1: ['同一部门在重叠有效期内禁止重复归属'],
+    2: ['成本中心稳定编码创建后不可修改'],
+    3: ['成本中心停用后关闭部门有效关系', '停用后的部门可按后续日期归属新成本中心'],
+    4: Object.values(COST_CENTER_PERMISSION_CHECKS)
+  }),
+  'COST-030': Object.freeze({
+    0: ['成本构成项正式接口返回分类/构成项/来源规则三段结构'],
+    1: ['成本构成项与来源规则可写入正式接口', '锁定成本模型拒绝构成项与来源规则写入，原配置不改变'],
+    2: ['业务方向/金额口径/日期依据/报表归属/经营利润标志往返不丢失'],
+    3: ['来源规则随构成项一并保存']
+  }),
+  'COST-031': Object.freeze({
+    0: ['COST-031 经营项目及固定收入支出根分类在专属模型正式共享构成表精确落库'],
+    1: ['经营收支方向/报表归属/经营利润标志往返不丢失'],
+    2: ['取数范围经 scope_json 往返不丢失'],
+    3: ['主来源与核对来源按优先级保存为来源规则'],
+    4: ['经营配置固定收入支出根分类，并保留既有成本构成项及取数规则业务值']
+  }),
+  'COST-032': Object.freeze({
+    0: [
+      'LABOR_HOUR 因子缺少来源时被拒绝',
+      'MACHINE_HOUR 因子缺少来源时被拒绝',
+      'AREA 因子缺少来源时被拒绝',
+      'OUTPUT 因子缺少来源时被拒绝'
+    ],
+    1: ['未知分摊模式被拒绝'],
+    2: ['原有数量分摊模式仍可写入']
+  }),
+  'COST-033': Object.freeze({
+    0: ['期初在制非法行按模板行号返回错误'],
+    1: ['多行批次错误定位到具体出错行']
+  }),
+  'COST-034': COST_STAGE_EVIDENCE_BINDINGS,
+  'COST-035': COST_FORMAL_REPORT_BINDINGS['COST-035'],
+  'COST-036': COST_FORMAL_REPORT_BINDINGS['COST-036'],
+  'COST-037': COST_FORMAL_REPORT_BINDINGS['COST-037'],
+  'COST-038': COST_FORMAL_REPORT_BINDINGS['COST-038'],
+  'COST-039': COST_FORMAL_REPORT_BINDINGS['COST-039']
+})
+
+export const costCatalogGapContexts = Object.freeze({
+  'COST-001': '专属正式 API 与显式模型选择、取消/刷新页面边界已接入，仍以真实运行具名检查为准。原三模式限定与 COST-032 正式受控因子扩展存在口径冲突，未擅自改原断言',
+  'COST-002': '专属期初状态机及正式模型/期间页面已接入；取消、刷新及完整 API/SQL 不变性须全部真实运行，不允许共享状态或首行兜底',
+  'COST-003': '缺少 X-Input-Hash 重放结果回读及 If-Match 冲突写侧样本',
+  'COST-004': '专属正式期间入箱、载荷哈希、请求/审计关联、回放及非DEAD人工门禁已接入；成功共存不能替代事务失败回滚。dispatch 无事件过滤且无安全真实瞬态失败入口，退避/死信/正向人工审计仍待验证',
+  'COST-005': '专属正式归集、计算、独立复核、发布、回退及页面已接入；本轮具名检查、API/SQL事实、页面和账号清理必须全部完成，不以空事实或共享workspace回执判通过',
+  'COST-006': '只读取单一报表接口，未覆盖全部报表、不可比较基线和导出同口径',
+  'COST-007': '精确拒绝消息及正式期间/工作流请求不变已接入；全量菜单审核可证明既有工作台组件复用，但公开与 legacy 工作台、正式 control-rules 与通用 validation-threshold 设置入口并存，未确认“无平行设置入口”的范围，也无“不新增”的历史基线证据，第三原断言保留 GAP',
+  'COST-008': '专属经营费用分摊正反例、销售成本排除和正式页面已接入；本轮非空正式事实、全部具名检查及清理不完整时保留缺口',
+  'COST-009': '刷新检查把“生成草稿”和“无来源阻断”合并，不能分别证明来源字段、DRAFT 边界和无来源门禁',
+  'COST-010': '现有采购样本没有采购退回，未验证负数退回映射和超额退回阻断写侧',
+  'COST-011': '专属WMS来源、应付freight、采购费用快照与正式清理已接入，仍以真实运行的精确ID/金额及页面证据为准',
+  'COST-012': '采购成本报表行为空，缺少发票累计、行级不可比较和已发布来源快照样本',
+  'COST-013': '当前无已完工已结算委外来源，未验证 MES API 边界、金额拆分与 DRAFT 写侧',
+  'COST-014': '比较报表未形成同时具备自产/外购与约束冻结事实的专属样本',
+  'COST-015': '质量刷新把草稿成功和不同阻断原因合并，未形成 payload/hash、已确认禁止补写的真实样本',
+  'COST-016': '交期/产能刷新只得到泛化阻断，未形成正式字段/hash、不可比较和已确认禁止补写样本',
+  'COST-017': '收入草稿为空，未验证 ERP API 边界、来源单号、退货红字和不落正式快照',
+  'COST-018': '支出草稿为空，未验证 ERP 报销 API 边界、来源单号、采购应付排除和不落正式快照',
+  'COST-019': '其他应付草稿为空，未验证过滤规则、分摊基数正数门禁及发布阻断',
+  'COST-020': '当前采购样本未覆盖委外和四种应付状态，且没有人工确认后的正式发布边界回读',
+  'COST-021': '当前没有 AVAILABLE 付款核销轨迹，未验证逐行金额/状态及不重复相加',
+  'COST-022': '缺少反月结审批执行、历史状态回读和重新试算发布的完整证据',
+  'COST-023': '已补专属试算、独立复核、发布批次和回退/反月结审批 API/数据库证据；模型维护人独立拒绝、发布人申请回退/反月结与经营域双人断言缺少现有权限下的独立业务主体或可写事实，保留 GAP；审批拒绝不替代申请拒绝',
+  'COST-024': '当前只验证部分 CARRYOVER 读取，未覆盖确认锁定、缺上期门禁、对象汇总、料工费拆分和完整页面交互',
+  'COST-025': '未形成单条处理审计或 WARN+OPEN 批量放行真实样本，也未验证规则版本快照',
+  'COST-026': '没有已发布采购成本行级/订单级发票快照样本，无法验证字段、回落和页面弹窗口径',
+  'COST-027': '没有覆盖来源、试算平衡、成本中心和 UNRESOLVED 的真实影响金额样本及批量放行弹窗',
+  'COST-028': '已补专属期间、模型、发布批次、审批申请/决策和令牌清理证据；审批页面绑定专属期间与审批弹窗尚未在真实页面上下文验证',
+  'COST-029': '专属维护/只读 CUSTOM 账号页面、精确403、全字段哈希及退出清理须全部真实执行；正式拒绝不绕过授权、不转静默PARTIAL',
+  'COST-030': '缺少精确具名的运行时证据',
+  'COST-031': '经营项目落库、固定根分类及合并保留需精确具名运行时证据，不以 API 成功冒充数据库证据',
+  'COST-032': '缺少精确具名的运行时证据',
+  'COST-033': '缺少精确具名的运行时证据',
+  'COST-034': '缺少取数阶段、完整阶段证据载荷、BLOCK/WARN 页面优先级和同证据去重的真实样本',
+  'COST-035': '缺少成本发布与经营发布双侧非空正式事实、未经营发布空值反控制或两条路由逐行页面证据',
+  'COST-036': '不以生产型拒绝或未发布TRADE门禁冒充正控制；缺少既有合法已发布TRADE、原始远期空月分配来源或真实页面期间证据',
+  'COST-037': '缺少非空自产/外购比较行、真实不可比较原因、精确期间绑定或正式列与单元格页面证据',
+  'COST-038': '缺少完整菜单库存、当前用户权限、隐藏占位保留/不泄漏以及真实工作台入口页面证据',
+  'COST-039': '缺少全部成本报表别名标题/页键/权限映射及正式企业管理全成本页面证据'
+})
+
+const costCatalogDefinition = (caseId) => {
+  const catalog = JSON.parse(fs.readFileSync(new URL('../cases/catalog.json', import.meta.url), 'utf8'))
+  const definition = catalog.suites.flatMap((suite) => suite.cases)
+    .find((item) => item.id === caseId)
+  if (!definition) throw new Error(`缺少原 catalog 案例 ${caseId}`)
+  return definition
+}
+
+/**
+ * Fail closed for catalog acceptance: each original assertion must name the
+ * exact checks that prove it. A missing, failed, non-boolean, or duplicate
+ * check is a GAP; a similarly named check never counts as a substitute.
+ */
+export function costCatalogEvidence (caseId, caseRecord, bindings = costCatalogBindings) {
+  const definition = costCatalogDefinition(caseId)
+  const checks = Array.isArray(caseRecord?.checks) ? caseRecord.checks : []
+  const caseBindings = caseId === 'COST-034'
+    ? costStageEvidenceBindings(caseRecord)
+    : bindings?.[caseId] || {}
+  const namedBindings = Object.values(caseBindings).flat().filter((name) => typeof name === 'string' && name)
+  const repeatedBindings = new Set(namedBindings.filter((name, index) => namedBindings.indexOf(name) !== index))
+  const gapContext = costCatalogGapContexts[caseId] || '缺少与原断言一一对应的真实运行时证据'
+  const fixtureKey = {
+    'COST-009': 'costPurchaseReceipt',
+    'COST-010': 'costPurchaseReturn',
+    'COST-011': 'costPurchaseFreight',
+    'COST-012': 'costPurchaseReport'
+  }[caseId]
+  const runtimeFixtureReady = ['COST-005', 'COST-008'].includes(caseId)
+    ? hasCostOperatingEvidence(caseRecord)
+    : COST_FORMAL_REPORT_CASES.has(caseId)
+      ? hasCostFormalReportEvidence(caseRecord, caseId)
+      : !fixtureKey || caseRecord?.fixtures?.[fixtureKey]?.complete === true
+
+  caseRecord.catalogAssertions = definition.assertions.map((assertion, index) => {
+    const evidenceChecks = Array.isArray(caseBindings[index])
+      ? caseBindings[index].filter((name) => typeof name === 'string' && name)
+      : []
+    const matchedChecks = evidenceChecks.map((name) => checks.filter((check) => check?.name === name))
+    const verified = evidenceChecks.length > 0 &&
+      evidenceChecks.length === (caseBindings[index] || []).length &&
+      evidenceChecks.every((name) => !repeatedBindings.has(name)) &&
+      matchedChecks.every((items) => items.length === 1 && items[0].passed === true) &&
+      runtimeFixtureReady &&
+      (caseId !== 'COST-029' || index !== 4 || hasCostCenterPermissionEvidence(caseRecord))
+    return {
+      index,
+      assertion,
+      status: verified ? 'VERIFIED' : 'GAP',
+      evidenceChecks,
+      details: verified
+        ? matchedChecks.flat().map((check) => `${check.name}: ${check.details || ''}`).join('; ')
+        : `GAP: ${gapContext}`
+    }
+  })
+  caseRecord.remainingAssertions = caseRecord.catalogAssertions
+    .filter((item) => item.status !== 'VERIFIED').map((item) => item.assertion)
+  caseRecord.catalogComplete = caseRecord.remainingAssertions.length === 0
+  caseRecord.passCandidate = caseRecord.catalogComplete && checks.length > 0 &&
+    checks.every((check) => check?.passed === true)
+  caseRecord.notes ||= []
+  caseRecord.notes.push(
+    `原 catalog 未修改；PASS候选=${caseRecord.passCandidate}；` +
+    `剩余=${caseRecord.remainingAssertions.join('；') || '无'}`
+  )
+  return caseRecord
+}
 
 const accountingOrgId = 1
 const currentMonth = new Date().toISOString().slice(0, 7)
@@ -24,6 +351,26 @@ const flattenDepartments = (nodes) =>
   (nodes || []).flatMap((node) => [node, ...flattenDepartments(node.children || [])])
 
 const responseData = (payload) => payload?.data ?? payload
+
+/**
+ * MySQL BIT(1) values can be serialized as booleans, numeric strings,
+ * control characters, or Node Buffer-shaped JSON objects depending on the
+ * API/database adapter. Treat only the explicit true/1 forms as soft-deleted.
+ */
+export const isSoftDeletedValue = (value) => {
+  if (value === true || value === 1) return true
+  if (typeof value === 'string') {
+    return value === '1' || value === '\u0001' || value.trim().toLowerCase() === 'true'
+  }
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return value.length === 1 && value[0] === 1
+  }
+  if (value && typeof value === 'object' && value.type === 'Buffer' &&
+      Array.isArray(value.data)) {
+    return value.data.length === 1 && value.data[0] === 1
+  }
+  return false
+}
 
 export const costConfigurationSignature = (configuration) => {
   const categories = new Map(configuration.categories.map((row) => [row.id, row.code]))
@@ -348,11 +695,19 @@ export const loadOwnedCostFixture = async ({ api, modelVersions, ...context }) =
 }
 
 const loadFormalModelPage = async (api) => {
-  const result = await api.getBusiness(
-    `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-  )
-  const list = costPageRows(result, '成本模型版本')
-  return { list, model: list.find((item) => item.status === 'LOCKED') || list[0] || null }
+  const list = []
+  for (let pageNo = 1; pageNo <= 1000; pageNo++) {
+    const result = await api.getBusiness(
+      `/cost/model-versions?accountingOrgId=${accountingOrgId}&pageNo=${pageNo}&pageSize=100`
+    )
+    const rows = costPageRows(result, '成本模型版本')
+    list.push(...rows)
+    if (list.length >= result.data.total) {
+      return { list, model: list.find((item) => item.status === 'LOCKED') || list[0] || null }
+    }
+    if (!rows.length) throw new Error('成本模型分页提前返回空列表')
+  }
+  throw new Error('成本模型分页超出安全上限')
 }
 
 const trackedTraceShape = (rows) =>
@@ -363,11 +718,188 @@ const trackedTraceShape = (rows) =>
       Array.isArray(row.payableSettlementTraces)
   )
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
-  const token = await (dependencies.login || login)(page)
-  const api = (dependencies.createApiClient || createApiClient)({ token, record })
+const COST_FORMAL_REPORT_CASES = new Set(Object.keys(COST_FORMAL_REPORT_CHECKS))
+
+const preferredFormalReportPeriodId = (record) => (record?.cases || []).findLast((entry) =>
+  entry?.id === 'COST-008' && entry.fixtures?.costOperating?.runId === record.runId &&
+  hasCostOperatingEvidence(entry)
+)?.fixtures.costOperating.periodId
+
+const runTokens = new Map()
+const guardedPages = new WeakMap()
+export const protectSharedCostWorkspace = async (page, caseRecord, { rejectWrites = false } = {}) => {
+  if (typeof page?.route !== 'function') return
+  const existing = guardedPages.get(page)
+  if (existing) {
+    existing.caseRecord = caseRecord
+    existing.rejectWrites = rejectWrites
+    return
+  }
+  const guard = { caseRecord, rejectWrites }
+  guardedPages.set(page, guard)
+  await page.route('**/cost/workspace-states/save', async (route) => {
+    if (route.request().method() === 'PUT') {
+      if (guard.rejectWrites) {
+        guard.caseRecord.checks.push({
+          name: '经营闭环禁止保存共享workspace',
+          passed: false,
+          details: '共享workspace PUT已中止，未转发也未返回模拟成功'
+        })
+        await route.abort('blockedbyclient')
+        return
+      }
+      const payload = route.request().postDataJSON()
+      if (!payload || !Number.isSafeInteger(payload.version) || payload.version < 0 ||
+          typeof payload.stateKey !== 'string' || typeof payload.payloadJson !== 'string') {
+        throw new Error('Cost workspace guard received an invalid save request')
+      }
+      guard.caseRecord.guardedWorkspaceWrites ||= []
+      guard.caseRecord.guardedWorkspaceWrites.push({
+        stateKey: payload.stateKey,
+        accountingOrgId: payload.accountingOrgId,
+        version: payload.version,
+        persisted: false
+      })
+      guard.caseRecord.notes.push(`共享页面状态写请求 ${payload.stateKey} 已拦截，未落库，不计入保存验收证据`)
+      // Keep the caller's version unchanged. This temporary UI receipt is not
+      // persistence evidence and never forwards a shared workspace mutation.
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 0, data: payload, msg: 'E2E read-only guard: not persisted' })
+      })
+      return
+    }
+    await route.continue()
+  })
+  caseRecord.notes.push(rejectWrites
+    ? '经营闭环共享workspace PUT仅中止，不返回模拟保存回执；任何尝试均为失败证据'
+    : '成本页面共享 workspace-state 写请求由 E2E 只读保护拦截；临时页面回执不是正式保存证据')
+}
+
+const runCostCase = async ({
+  caseId, page, ctx, token: suppliedToken, record, caseRecord, outputDir
+}, dependencies = {}) => {
+  const operatingCase = ['COST-005', 'COST-008'].includes(caseId)
+  const formalReportCase = COST_FORMAL_REPORT_CASES.has(caseId)
+  page ||= ctx?.page
+  const token = ((operatingCase || formalReportCase) && (suppliedToken || ctx?.token)) ||
+    await (dependencies.login || login)(page)
+  runTokens.set(record.runId, token)
+  let api = (dependencies.createApiClient || createApiClient)({ token, record })
+  const rawApi = api
+  if (formalReportCase) {
+    const result = await (dependencies.runCostFormalReportClosure || runCostFormalReportClosure)({
+      api, page, token, record, caseRecord, outputDir, caseId,
+      periodId: dependencies.formalReportPeriodId ??
+        preferredFormalReportPeriodId(record)
+    }, dependencies.costFormalReportDependencies || {})
+    const complete = result?.acceptanceComplete === true &&
+      hasCostFormalReportEvidence(caseRecord, caseId)
+    return { token, api, ...result, partial: !complete, acceptanceComplete: complete }
+  }
+  await protectSharedCostWorkspace(page, caseRecord, { rejectWrites: operatingCase })
   const savePrerequisiteEvidence = dependencies.saveCostPrerequisiteEvidence || saveCostPrerequisiteEvidence
+  if (operatingCase) {
+    caseRecord.fixtures ||= {}
+    delete caseRecord.fixtures.costOperating
+    if ((dependencies.writeFixtures ?? costWritesEnabled()) !== true) {
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '经营正式写侧未显式启用；仅记录工作台只读前置，不创建夹具或保存共享workspace'
+      })
+      return { token, api, partial: true, acceptanceComplete: false, note: '经营完整写侧未启用' }
+    }
+    const result = await (dependencies.runCostOperatingClosure || runCostOperatingClosure)({
+      api, page, token, record, caseRecord, outputDir
+    }, {
+      ...dependencies.costOperatingDependencies,
+      writeFixtures: dependencies.writeFixtures ?? costWritesEnabled()
+    })
+    const complete = result?.acceptanceComplete === true && hasCostOperatingEvidence(caseRecord)
+    return { token, api, ...result, partial: !complete, acceptanceComplete: complete }
+  }
+  if (caseId === 'COST-034') {
+    const result = await (dependencies.runCostStageEvidenceClosure || runCostStageEvidenceClosure)({
+      api, page, token, record, caseRecord, outputDir
+    }, {
+      ...dependencies.costStageEvidenceDependencies,
+      writeFixtures: dependencies.writeFixtures ?? costWritesEnabled()
+    })
+    const complete = result?.acceptanceComplete === true &&
+      Object.keys(costStageEvidenceBindings(caseRecord)).length === 4
+    return { token, api, ...result, partial: !complete, acceptanceComplete: complete }
+  }
+  if (caseId === 'COST-004') {
+    const result = await (dependencies.runCostOutboxClosure || runCostOutboxClosure)({
+      api, record, caseRecord, page, outputDir,
+      dependencies: {
+        ...dependencies.costOutboxDependencies,
+        writeFixtures: dependencies.writeFixtures ?? costWritesEnabled()
+      }
+    })
+    return { token, api, partial: true, note: `COST-004 ${result.status}: ${result.reasons.join('；')}` }
+  }
+  if (caseId === 'COST-012') {
+    if (!(dependencies.writeFixtures ?? costWritesEnabled())) {
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '专属采购报表写侧未启用；未创建采购发票、正式来源快照或发布报表'
+      })
+      return { token, api, partial: true, note: 'COST-012 专属采购报表写侧未启用' }
+    }
+    await (dependencies.runCostPurchaseReportClosure || runCostPurchaseReportClosure)({
+      api, page, record, caseRecord, outputDir, caseId
+    }, dependencies.costPurchaseReportDependencies || {})
+    return { token, api }
+  }
+  if (['COST-009', 'COST-010'].includes(caseId)) {
+    if (!(dependencies.writeFixtures ?? costWritesEnabled())) {
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '专属采购来源写侧未启用；未刷新共享期间或以空行替代业务证据'
+      })
+      return { token, api, partial: true, note: '采购来源完整写侧未启用' }
+    }
+    const closure = caseId === 'COST-009'
+      ? dependencies.runCostPurchaseReceiptClosure || runCostPurchaseReceiptClosure
+      : dependencies.runCostPurchaseReturnClosure || runCostPurchaseReturnClosure
+    await closure({ api, page, record, caseRecord, outputDir, caseId },
+      dependencies.costPurchaseSourceDependencies || {})
+    return { token, api }
+  }
+  if (caseId === 'COST-001' &&
+      (dependencies.writeFixtures ?? process.env.CFOR_E2E_WRITE_FIXTURES === 'true')) {
+    await (dependencies.runCostAllocationClosure || runCostAllocationClosure)({
+      api, page, record, caseRecord, outputDir,
+      dependencies: dependencies.costAllocationDependencies || {}
+    })
+    return { token, api }
+  }
+  if (caseId === 'COST-002') {
+    const writeFixtures = dependencies.writeFixtures ?? costWritesEnabled()
+    if (!writeFixtures && !dependencies.prepareCostOpeningFixture) {
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '写侧开关未启用；未创建专属模型、期间、成本中心或期初在制记录'
+      })
+      return { token, api, partial: true, note: 'COST-002 专属写侧夹具未启用' }
+    }
+    await (dependencies.assertLocalWriteSafety || assertLocalWriteSafety)(caseRecord)
+    if (!caseRecord.fixtures?.costOpening) {
+      await (dependencies.prepareCostOpeningFixture || prepareCostOpeningFixture)({
+        api, record, caseRecord,
+        effectiveMonth: COST_OPENING_FIXTURE_MONTH,
+        writeFixtures
+      }, {
+        assertLocalDatabase: dependencies.assertLocalDatabase || assertLocalDatabase
+      })
+    }
+  }
   if (MODEL_DEPENDENT_CASES.has(caseId) && !caseRecord.fixtures?.cost) {
+    if (!(dependencies.writeFixtures ?? costWritesEnabled()) && !dependencies.prepareCostFixture) {
+      return { token, api, partial: true, note: '成本模型写侧开关未启用' }
+    }
     await (dependencies.prepareCostFixture || prepareCostModelFixture)({
       api, caseId, record, caseRecord,
       effectiveMonth: COST_CASE_EFFECTIVE_MONTH, remarkForFixture: costFixtureRemark
@@ -384,10 +916,51 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
   // 正式报表 / 采购来源刷新 / 试算职责分离 / 上期结转都需要真实写侧事实，
   // 因此先按案例语义建立专属远期期间的夹具，再进入只读断言。
-  const scenarioKind = COST_SCENARIO_BY_CASE[caseId]
+  const scenarioKind = caseId === 'COST-002' ? null : COST_SCENARIO_BY_CASE[caseId]
   if (scenarioKind && !loadCostScenario(caseRecord)) {
+    if (!(dependencies.writeFixtures ?? costWritesEnabled())) {
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '写侧开关未启用；未操作任何共享成本期间'
+      })
+      return { token, api, partial: true, note: 'CFOR_E2E_WRITE_FIXTURES 未启用' }
+    }
     await (dependencies.prepareCostScenario || prepareCostScenario)({
       api, record, caseRecord, scenario: scenarioKind
+    })
+  }
+  if (caseId === 'COST-011') {
+    const writeFixtures = dependencies.writeFixtures ?? costWritesEnabled()
+    if (!writeFixtures && !dependencies.runCostPurchaseFreightClosure) {
+      await savePrerequisiteEvidence({
+        caseId, page, record, caseRecord, outputDir,
+        note: '写侧开关未启用；未创建专属应付、未刷新采购费用快照、未执行清理写入'
+      })
+      return { token, api, partial: true, note: 'COST-011 专属采购费用写侧未启用' }
+    }
+    const fixture = loadCostScenario(caseRecord)
+    await (dependencies.runCostPurchaseFreightClosure || runCostPurchaseFreightClosure)({
+      api: rawApi,
+      page,
+      outputDir,
+      record,
+      caseRecord,
+      fixture,
+      dependencies: dependencies.costPurchaseFreightDependencies || {}
+    })
+  }
+  if (scenarioKind) {
+    if (caseId === 'COST-022') {
+      const published = caseRecord.fixtures.costScenario
+      const negativeRecord = { ...caseRecord, fixtures: {}, checks: [], evidence: [], notes: [] }
+      const negative = await (dependencies.prepareCostScenario || prepareCostScenario)({
+        api, record, caseRecord: negativeRecord, scenario: 'accounting'
+      })
+      caseRecord.fixtures.costUnpublishedScenario = negative
+      caseRecord.fixtures.costScenario = { ...published }
+    }
+    api = await (dependencies.scopedCostScenarioApi || scopedCostScenarioApi)({
+      api, record, caseRecord
     })
   }
 
@@ -510,57 +1083,30 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'COST-002') {
-    // PB-075：期初在制草稿、确认、锁定、回退走后端状态机。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const periods = periodsResult?.data?.list || []
-    caseRecord.checks.push({
-      name: '成本期间列表接口可用',
-      passed: Array.isArray(periods),
-      details: `periods=${periods.length}`
-    })
-    const period = periods[0]
-    if (period?.id) {
-      const wipResult = await api.getBusiness(
-        `/cost/periods/${period.id}/opening-wip?stage=OPENING`
-      )
-      const wipRows = wipResult?.data || []
-      caseRecord.checks.push({
-        name: '期初在制正式接口返回阶段记录',
-        passed: Array.isArray(wipRows),
-        details: `rows=${Array.isArray(wipRows) ? wipRows.length : 'n/a'}`
-      })
-      if (wipRows.length) {
-        caseRecord.checks.push({
-          name: '期初在制暴露状态、版本与库存档案字段',
-          passed: wipRows.every(
-            (row) =>
-              nonEmpty(row.status) &&
-              Object.prototype.hasOwnProperty.call(row, 'version') &&
-              Object.prototype.hasOwnProperty.call(row, 'materialId')
-          ),
-          details: `rows=${wipRows.length}`
+    await (dependencies.runCostOpeningClosure || runCostOpeningClosure)({
+      api, caseRecord, record,
+      dependencies: {
+        config,
+        writeFixtures: dependencies.writeFixtures ?? costWritesEnabled(),
+        assertLocalDatabase: dependencies.assertLocalDatabase || assertLocalDatabase
+      },
+      onDraft: async ({ fixture, openingRow }) => {
+        await (dependencies.verifyCostOpeningBrowserClosure || verifyCostOpeningBrowserClosure)({
+          api, page, fixture, openingRow, caseRecord, record,
+          dependencies: {
+            browserActions: costOpeningPageActions({ outputDir, record }),
+            ...(dependencies.costOpeningBrowserDependencies || {})
+          }
         })
       }
-    } else {
-      caseRecord.checks.push({
-        name: '存在成本期间用于期初在制校验',
-        passed: false,
-        details: '当前核算组织暂无成本期间，需先建立期间'
-      })
-    }
-    await openRoute(page, '/cost-management/monthly/opening-wip')
-    caseRecord.checks.push({
-      name: '期初在制页面可打开',
-      passed: (await page.locator('.opening-wip-workspace').count()) > 0,
-      details: '真实 Chrome 期初在制页'
     })
-    await saveScreenshot(page, outputDir, 'cost-opening-wip', record)
-    caseRecord.evidence.push('期初在制正式 API、期间列表与页面截图')
+    caseRecord.evidence.push('专属期初 DRAFT 页面、取消/刷新草稿隔离、完整 API/SQL 及确认锁定回退')
   }
 
   if (caseId === 'COST-003') {
+    await (dependencies.runCostWorkflowClosure || runCostWorkflowClosure)({
+      api, record, caseRecord
+    })
     // 成本工作流写接口统一返回 requestId/version，并接受 If-Match 请求契约。
     const periodsResult = await api.getBusiness(
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
@@ -606,114 +1152,6 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push('成本工作流 requestId/If-Match 契约 API 与页面截图')
   }
 
-  if (caseId === 'COST-004') {
-    // 成本可靠事件以独立 Outbox 记录重试、死信与人工接管状态。
-    const deadLetterResult = await api.getBusiness('/cost/outbox/dead-letters?limit=100')
-    const deadLetters = costArrayData(deadLetterResult, '成本死信查询')
-    caseRecord.checks.push({
-      name: '成本死信查询接口返回可靠事件列表',
-      passed: Array.isArray(deadLetters),
-      details: `rows=${Array.isArray(deadLetters) ? deadLetters.length : 'n/a'}`
-    })
-    if (hasDeadLetterSamples(deadLetters)) caseRecord.checks.push({
-      name: '成本死信包含幂等、重试和人工接管字段',
-      passed:
-        Array.isArray(deadLetters) &&
-        deadLetters.every(
-          (row) =>
-            nonEmpty(row.id) &&
-            nonEmpty(row.periodId) &&
-            nonEmpty(row.action) &&
-            nonEmpty(row.requestId) &&
-            nonEmpty(row.eventKey) &&
-            nonEmpty(row.payloadHash) &&
-            row.status === 'DEAD' &&
-            Number.isInteger(row.retryCount) &&
-            Number.isInteger(row.maxRetry) &&
-            Object.prototype.hasOwnProperty.call(row, 'manualOperator') &&
-            Object.prototype.hasOwnProperty.call(row, 'manualAt') &&
-            Object.prototype.hasOwnProperty.call(row, 'manualNote')
-        ),
-      details: deadLetters.length
-        ? `validated=${deadLetters.length}`
-        : '当前没有死信，已验证接口为空列表契约'
-    })
-    await openRoute(page, '/cost-management/workbench', { readySelector: '.title-line h1' })
-    caseRecord.checks.push({
-      name: '成本工作台可打开并承载可靠事件状态',
-      passed: (await page.getByText('成本', { exact: false }).count()) > 0,
-      details: '真实 Chrome 成本工作台'
-    })
-    await saveScreenshot(page, outputDir, 'cost-workflow-outbox', record)
-    caseRecord.evidence.push('成本 Outbox 死信接口结构与成本工作台截图')
-    if (!hasDeadLetterSamples(deadLetters)) {
-      return {
-        token,
-        api,
-        partial: true,
-        note: '当前没有死信样本，仅验证空列表接口；重试、死信字段和人工接管闭环待补真实事件后复测'
-      }
-    }
-  }
-
-  if (caseId === 'COST-005') {
-    // PB-440/441：经营收支归集、经营计算和经营发布只读正式事实接口。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const period = periodsResult?.data?.list?.[0]
-    if (period?.id) {
-      const income = await api.getBusiness(
-        `/cost/periods/${period.id}/operating-collections?direction=INCOME`
-      )
-      const expense = await api.getBusiness(
-        `/cost/periods/${period.id}/operating-collections?direction=EXPENSE`
-      )
-      const calculation = await api.getBusiness(
-        `/cost/periods/${period.id}/operating-calculation`
-      )
-      const publication = await api.getBusiness(
-        `/cost/periods/${period.id}/operating-publication`
-      )
-      caseRecord.checks.push({
-        name: '经营收入与支出归集正式接口可查询',
-        passed: income?.data === null || Array.isArray(income?.data?.rows || []),
-        details: `income=${income?.data?.rowCount ?? 0}, expense=${expense?.data?.rowCount ?? 0}`
-      })
-      caseRecord.checks.push({
-        name: '经营计算结果包含成本发布引用与利润字段',
-        passed:
-          calculation?.data === null ||
-          (nonEmpty(calculation?.data?.costPublicationId) &&
-            Object.prototype.hasOwnProperty.call(calculation.data, 'operatingProfit')),
-        details: calculation?.data?.batchNo || '当前期间暂无经营计算批次'
-      })
-      caseRecord.checks.push({
-        name: '经营发布只读正式经营事实',
-        passed:
-          publication?.data === null ||
-          (publication?.data?.status === 'PUBLISHED' &&
-            nonEmpty(publication?.data?.resultHash) &&
-            nonEmpty(publication?.data?.costPublicationId)),
-        details: publication?.data?.status || '当前期间暂无正式经营发布'
-      })
-    } else {
-      caseRecord.checks.push({
-        name: '存在成本期间用于经营事实校验',
-        passed: false,
-        details: '当前核算组织暂无成本期间，未执行经营事实写链路'
-      })
-    }
-    await openRoute(page, '/cost-management')
-    caseRecord.checks.push({
-      name: '成本工作台可打开经营收支与经营发布入口',
-      passed: (await page.getByText('经营', { exact: false }).count()) > 0,
-      details: '真实 Chrome 成本经营工作台'
-    })
-    await saveScreenshot(page, outputDir, 'cost-operating-facts', record)
-    caseRecord.evidence.push('经营收支归集、经营计算、经营发布正式接口与页面截图')
-  }
-
   if (caseId === 'COST-006') {
     // PB-424～PB-443：统一正式成本分析/结果报表接口。
     const period = loadCostScenario(caseRecord)?.period
@@ -753,78 +1191,45 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'COST-007') {
-    // 企业类型隔离：生产验证入口不得放行贸易型或采购来源。
-    const tradeTrial = await api.request('POST', '/cost/verification/production-trial', {
-      enterpriseType: 'TRADE',
-      periodId: currentMonth,
-      modelVersion: 'E2E-TRADE-REJECT',
-      sourceFacts: [],
-      finishedRatios: {}
+    const tenantId = record.environment?.tenantId || config.tenantId
+    await verifyCostEnterpriseRejections({
+      api, caseRecord, period: currentMonth, tenantId,
+      readSnapshot: () => readCostEnterpriseFactSnapshot(
+        dependencies.costEnterpriseReadSql || runReadOnlySql)
     })
+    const audit = await auditCostEnterpriseRoutes({
+      api, tenantId, readSql: dependencies.costEnterpriseReadSql || runReadOnlySql
+    })
+    caseRecord.costEnterpriseRouteEvidence = audit
     caseRecord.checks.push({
-      name: '生产验证接口拒绝贸易型企业',
-      passed: tradeTrial?.code === 422001,
-      details: `code=${tradeTrial?.code ?? 'missing'}`
+      name: COST_ENTERPRISE_CHECKS.inventory,
+      passed: audit.reusedComponent === true,
+      details: JSON.stringify({
+        workbench: audit.workbench, menuCount: audit.inventory.count,
+        menuHash: audit.inventory.sha256, workbenches: audit.workbenches,
+        controlRules: audit.controlRules, thresholds: audit.thresholds,
+        noParallelSettingsVerified: audit.noParallelSettingsVerified, gaps: audit.gaps
+      })
     })
-    const purchaseTrial = await api.request('POST', '/cost/verification/production-trial', {
-      enterpriseType: 'MANUFACTURING',
-      periodId: currentMonth,
-      modelVersion: 'E2E-PURCHASE-REJECT',
-      sourceFacts: [{
-        sourceType: 'PURCHASE_RECEIPT',
-        sourceNo: 'E2E-GR-001'
-      }],
-      finishedRatios: {}
+    await (dependencies.openRoute || openRoute)(page, audit.workbench.route, {
+      readySelector: '.cost-workbench'
     })
+    audit.browser = await verifyCostEnterpriseWorkbench(page, audit)
     caseRecord.checks.push({
-      name: '生产验证接口拒绝采购来源混入生产成本',
-      passed: purchaseTrial?.code === 422001,
-      details: `code=${purchaseTrial?.code ?? 'missing'}`
+      name: COST_ENTERPRISE_CHECKS.workbench,
+      passed: true,
+      details: JSON.stringify({ route: audit.browser.route, component: audit.browser.component })
     })
-    await openRoute(page, '/cost-management')
-    caseRecord.checks.push({
-      name: '成本工作台可打开企业类型隔离场景',
-      passed: (await page.getByText('成本', { exact: false }).count()) > 0,
-      details: '真实 Chrome 成本工作台'
-    })
-    await saveScreenshot(page, outputDir, 'cost-enterprise-type-isolation', record)
-    caseRecord.evidence.push('生产验证接口企业类型/来源路由拒绝响应与成本工作台截图')
-  }
-
-  if (caseId === 'COST-008') {
-    // 经营正式发布前，公共经营费用事实必须保留有效分摊依据。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
+    audit.screenshot = await (dependencies.saveScreenshot || saveScreenshot)(
+      page, outputDir, 'cost-enterprise-type-isolation', record)
+    caseRecord.evidence.push(
+      'COST-007 TRADE/六类采购来源精确拒绝消息与逐行正式事实不变证据',
+      `COST-007 全量菜单 count=${audit.inventory.count} hash=${audit.inventory.sha256}；` +
+      `既有工作台 ${audit.workbench.route} component=${audit.workbench.component}；` +
+      `原第三断言仍 GAP：${audit.gaps.join('；')}`
     )
-    const period = periodsResult?.data?.list?.[0]
-    if (period?.id) {
-      const publication = await api.getBusiness(`/cost/periods/${period.id}/operating-publication`)
-      const rows = publication?.data?.rows || []
-      const operatingExpenses = rows.filter(
-        (row) => row.direction === 'EXPENSE' && row.affectsProfit !== false && row.reportScope !== '销售成本'
-      )
-      caseRecord.checks.push({
-        name: '正式经营费用事实包含分摊依据',
-        passed:
-          publication?.data === null ||
-          operatingExpenses.every((row) => nonEmpty(row.allocationBasis)),
-        details: `expenseRows=${operatingExpenses.length}`
-      })
-    } else {
-      caseRecord.checks.push({
-        name: '存在成本期间用于经营分摊基数校验',
-        passed: false,
-        details: '当前核算组织暂无成本期间，未执行经营发布事实校验'
-      })
-    }
-    await openRoute(page, '/cost-management')
-    caseRecord.checks.push({
-      name: '成本工作台可打开经营分摊依据场景',
-      passed: (await page.getByText('经营', { exact: false }).count()) > 0,
-      details: '真实 Chrome 成本经营工作台'
-    })
-    await saveScreenshot(page, outputDir, 'cost-operating-allocation-basis', record)
-    caseRecord.evidence.push('经营正式发布分摊依据接口与成本工作台截图')
+    caseRecord.notes.push(...audit.gaps)
+    return { token, api, partial: true, note: 'COST-007 两类拒绝精确复验，入口边界待确认；未修改原断言或设置归属' }
   }
 
   if (caseId === 'COST-009') {
@@ -947,36 +1352,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'COST-011') {
-    // 采购到岸费用复用 ERP 应付明细 freight，并以采购费用分项进入同一 PURCHASE 草稿。
-    const period = loadCostScenario(caseRecord)?.period
-    if (period?.id) {
-      const refreshed = await api.request(
-        'POST',
-        `/cost/periods/${period.id}/source-snapshot/purchase/refresh`
-      )
-      const lines = refreshed?.data?.lines || []
-      const freightLines = lines.filter((row) => row.sourceType === 'PURCHASE_FREIGHT')
-      caseRecord.checks.push({
-        name: '采购到岸费用按ERP应付freight映射为PURCHASE_FREIGHT费用来源',
-        passed:
-          refreshed?.code === 0 &&
-          refreshed?.data?.snapshotKey === 'PURCHASE' &&
-          refreshed?.data?.status === 'DRAFT' &&
-          freightLines.every((row) =>
-            Number(row.quantity || 0) === 0 &&
-            Number(row.materialAmount || 0) === 0 &&
-            Number(row.expenseAmount || 0) > 0 &&
-            row.componentCode === 'PURCHASE_FREIGHT'
-          ),
-        details: `freightLines=${freightLines.length}, status=${refreshed?.data?.status || 'n/a'}`
-      })
-    } else {
-      caseRecord.checks.push({
-        name: '存在成本期间用于采购到岸费用刷新校验',
-        passed: false,
-        details: '当前核算组织暂无成本期间，未执行采购到岸费用来源刷新'
-      })
-    }
+    // COST-011 的正式 API 闭环已在写侧阶段完成；这里只补真实页面证据。
     await openRoute(page, '/cost-management')
     caseRecord.checks.push({
       name: '成本工作台可打开采购到岸费用场景',
@@ -1511,7 +1887,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'COST-022') {
-    // 反月结重开保留原发布/试算事实，期间回到核算中，不得覆盖已发布金额。
+    // 反月结重开必须经过申请、复核审批、重新试算、人工确认和再次发布。
     const periodsResult = await api.getBusiness(
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
     )
@@ -1556,6 +1932,160 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         details: '当前核算组织没有可用于反月结门禁校验的未发布期间样本'
       })
     }
+
+    const fixture = loadCostScenario(caseRecord)
+    if (!fixture?.periodId || !fixture.publicationId || !fixture.currentTrialId ||
+        !fixture.approvalReviewerUsername || !fixture.approvalReviewerPassword) {
+      throw new Error('COST-022 专属发布场景缺少反月结审批或原始试算登记')
+    }
+    const periodId = String(fixture.periodId)
+    const originalTrialId = String(fixture.currentTrialId)
+    const originalPublicationId = String(fixture.publicationId)
+    const originalPeriod = responseData(await api.getBusiness(`/cost/periods/${periodId}`))
+    const originalTrace = responseData(
+      await api.getBusiness(`/cost/publications/${originalPublicationId}/trace`)
+    )
+    const traceFacts = (trace) => JSON.stringify({
+      resultHash: trace?.resultHash || '',
+      configSnapshotHash: trace?.configSnapshotHash || '',
+      sourceSnapshotHash: trace?.sourceSnapshotHash || '',
+      engineVersion: trace?.engineVersion || '',
+      components: trace?.components || [],
+      sources: trace?.sources || [],
+      allocations: trace?.allocations || []
+    })
+    const originalTraceFacts = traceFacts(originalTrace)
+
+    const reopenRequest = await api.postBusiness(
+      `/cost/periods/${periodId}/publications/reopen`,
+      { reason: 'COST-022 E2E 反月结重开审批' }
+    )
+    const reopenApplication = responseData(reopenRequest)
+    const pendingPeriod = responseData(await api.getBusiness(`/cost/periods/${periodId}`))
+    const activeApproval = responseData(await api.getBusiness(
+      `/cost/publication-approvals/periods/${periodId}/active`
+    ))
+    if (pendingPeriod.status !== 'COST_PUBLISHED' ||
+        String(pendingPeriod.currentPublicationId) !== originalPublicationId ||
+        String(pendingPeriod.currentTrialId) !== originalTrialId ||
+        String(activeApproval?.id) !== String(reopenApplication?.approvalId)) {
+      throw new Error('COST-022 反月结申请阶段提前改变正式成本状态')
+    }
+    const reviewerToken = await loginAs(
+      record, fixture.approvalReviewerUsername, fixture.approvalReviewerPassword
+    )
+    const reviewerApi = createApiClient({ token: reviewerToken, record })
+    await reviewerApi.postBusiness(
+      `/cost/publication-approvals/${activeApproval.id}/approve`,
+      {
+        note: 'COST-022 E2E 复核通过并执行反月结重开',
+        expectedVersion: activeApproval.version
+      },
+      {
+        headers: {
+          'If-Match': String(activeApproval.version),
+          'X-Request-Id': `e2e-cost022-approve-${record.runId}`
+        }
+      }
+    )
+    const reopenedPeriod = responseData(await api.getBusiness(`/cost/periods/${periodId}`))
+    const originalTraceAfterReopen = responseData(
+      await api.getBusiness(`/cost/publications/${originalPublicationId}/trace`)
+    )
+    const stateEvidence = await runReadOnlySql(`
+      SELECT 'trial', CAST(id AS CHAR), status, CAST(period_id AS CHAR),
+             CAST(result_hash AS CHAR), CAST(finished_amount AS CHAR)
+      FROM cost_trial
+      WHERE tenant_id=1 AND id=${originalTrialId} AND deleted=b'0'
+      UNION ALL
+      SELECT 'publication', CAST(id AS CHAR), status, CAST(period_id AS CHAR),
+             CAST(result_hash AS CHAR), CAST(batch_no AS CHAR)
+      FROM cost_publication
+      WHERE tenant_id=1 AND id=${originalPublicationId} AND deleted=b'0'
+    `)
+    caseRecord.database = [...(caseRecord.database || []), {
+      stage: 'cost022-reopen-history', ...stateEvidence
+    }]
+    const trialHistory = stateEvidence.rows.find((row) =>
+      row[0] === 'trial' && row[1] === originalTrialId)
+    const publicationHistory = stateEvidence.rows.find((row) =>
+      row[0] === 'publication' && row[1] === originalPublicationId)
+    const historyPassed = reopenedPeriod.status === 'ACCOUNTING' &&
+      reopenedPeriod.currentTrialId == null &&
+      reopenedPeriod.currentPublicationId == null &&
+      trialHistory?.[2] === 'SUPERSEDED' &&
+      publicationHistory?.[2] === 'REVERSED' &&
+      traceFacts(originalTraceAfterReopen) === originalTraceFacts
+    caseRecord.checks.push({
+      name: '反月结后原发布批次保留为REVERSED、原试算保留为SUPERSEDED，期间回到ACCOUNTING并解绑当前批次',
+      passed: stateEvidence.available && historyPassed,
+      details: `period=${reopenedPeriod.status}; trial=${trialHistory?.[2] || 'missing'}; ` +
+        `publication=${publicationHistory?.[2] || 'missing'}; traceUnchanged=${traceFacts(originalTraceAfterReopen) === originalTraceFacts}`
+    })
+    if (!historyPassed) throw new Error('COST-022 反月结历史状态或原发布事实回读不符合契约')
+
+    const retrial = responseData(await api.postBusiness(
+      `/cost/periods/${periodId}/trials`,
+      {
+        enterpriseType: reopenedPeriod.enterpriseType,
+        periodId,
+        modelVersion: reopenedPeriod.modelVersionNo,
+        requestId: `e2e-cost022-retrial-${record.runId}`
+      }
+    ))
+    const trialPeriod = responseData(await api.getBusiness(`/cost/periods/${periodId}`))
+    const newTrialId = String(trialPeriod.currentTrialId || retrial?.trialId || '')
+    if (!newTrialId || newTrialId === originalTrialId || trialPeriod.status !== 'TRIAL_PENDING') {
+      throw new Error('COST-022 反月结后未生成新的待确认试算')
+    }
+    const confirmed = await reviewerApi.postBusiness(
+      `/cost/trials/${newTrialId}/confirm`,
+      undefined,
+      {
+        headers: {
+          'If-Match': String(trialPeriod.version),
+          'X-Request-Id': `e2e-cost022-confirm-${record.runId}`
+        }
+      }
+    )
+    const confirmedPeriod = responseData(await api.getBusiness(`/cost/periods/${periodId}`))
+    if (confirmedPeriod.status !== 'TRIAL_CONFIRMED' ||
+        String(confirmedPeriod.currentTrialId) !== newTrialId) {
+      throw new Error(`COST-022 新试算确认后状态异常：${confirmedPeriod.status}`)
+    }
+    const republished = responseData(await reviewerApi.postBusiness(
+      `/cost/periods/${periodId}/publications`,
+      undefined,
+      {
+        headers: {
+          'If-Match': String(confirmedPeriod.version),
+          'X-Request-Id': `e2e-cost022-republish-${record.runId}`
+        }
+      }
+    ))
+    const republishedPeriod = responseData(await api.getBusiness(`/cost/periods/${periodId}`))
+    const newPublicationId = String(
+      republishedPeriod.currentPublicationId || republished?.publicationId || ''
+    )
+    const newTrace = responseData(
+      await api.getBusiness(`/cost/publications/${newPublicationId}/trace`)
+    )
+    const republishPassed = Boolean(
+      confirmed?.data || confirmed
+    ) && republishedPeriod.status === 'COST_PUBLISHED' &&
+      newPublicationId && newPublicationId !== originalPublicationId &&
+      String(republishedPeriod.currentTrialId) === newTrialId &&
+      traceFacts(newTrace) === originalTraceFacts
+    caseRecord.checks.push({
+      name: '重开后必须重新试算、人工确认并发布新批次，已发布金额不被覆盖',
+      passed: republishPassed,
+      details: `newTrial=${newTrialId}; oldTrial=${originalTrialId}; ` +
+        `newPublication=${newPublicationId}; oldPublication=${originalPublicationId}; ` +
+        `traceFactsPreserved=${traceFacts(newTrace) === originalTraceFacts}`
+    })
+    if (!republishPassed) throw new Error('COST-022 重开后的重新试算/确认/发布链路未闭环')
+    fixture.reopenedPublicationId = newPublicationId
+    fixture.reopenedTrialId = newTrialId
     await openRoute(page, '/cost-management')
     caseRecord.checks.push({
       name: '成本工作台可打开反月结重开入口',
@@ -1567,72 +2097,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'COST-023') {
-    // 成本试算执行人与复核人必须分离；同一账号确认当前试算必须被业务规则阻断。
-    const permission = await api.get('/system/auth/get-permission-info')
-    const currentUserId = String(permission?.data?.user?.id ?? permission?.user?.id ?? '')
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const periods = periodsResult?.data?.list || []
-    // 夹具期间的试算由当前登录人（admin）执行，用于验证"同人复核"必须被阻断。
-    const scenarioPeriod = loadCostScenario(caseRecord)?.period
-    const pending =
-      (scenarioPeriod?.status === 'TRIAL_PENDING' && scenarioPeriod.currentTrialId
-        ? scenarioPeriod
-        : null) ||
-      periods.find((row) => row.status === 'TRIAL_PENDING' && nonEmpty(row.currentTrialId))
-    if (pending) {
-      // getBusiness 返回 {code,data,msg}，试算事实在 data 内。
-      const trial = responseData(
-        await api.getBusiness(`/cost/periods/${pending.id}/trials/current`)
-      )
-      caseRecord.checks.push({
-        name: '当前试算返回执行人标识以支持职责分离校验',
-        passed: nonEmpty(trial?.creatorId),
-        details: `trialId=${pending.currentTrialId} creatorId=${trial?.creatorId || '空'}`
-      })
-      const sameUserTrial = nonEmpty(currentUserId) && String(trial?.creatorId) === currentUserId
-      caseRecord.checks.push({
-        name: '存在当前登录人执行且待复核的试算样本',
-        passed: sameUserTrial,
-        details: sameUserTrial
-          ? `periodId=${pending.id} trialId=${pending.currentTrialId}`
-          : `当前用户=${currentUserId || '未知'}，试算执行人=${trial?.creatorId || '未知'}`
-      })
-      if (sameUserTrial) {
-        const blocked = await api.request('POST', `/cost/trials/${pending.currentTrialId}/confirm`, undefined, {
-          headers: {
-            'If-Match': String(pending.version),
-            'X-Request-Id': `cost-separation-${Date.now()}`
-          }
-        })
-        caseRecord.checks.push({
-          name: '同一账号不能确认自己执行的成本试算',
-          passed:
-            blocked?.code !== undefined &&
-            blocked.code !== 0 &&
-            blocked.code !== 500 &&
-            /(执行人与复核确认人不能相同|模型维护人与试算复核人不能相同)/.test(
-              String(blocked.msg || blocked.message || '')
-            ),
-          details: `code=${blocked?.code} msg=${blocked?.msg || blocked?.message || ''}`
-        })
+    await (dependencies.runCostSeparationClosure || runCostSeparationClosure)({
+      api: rawApi,
+      actorApi: rawApi,
+      record,
+      caseRecord,
+      dependencies: {
+        ...dependencies.costWorkflowDependencies,
+        writeFixtures: dependencies.writeFixtures ?? costWritesEnabled()
       }
-    } else {
-      caseRecord.checks.push({
-        name: '存在待复核试算用于职责分离校验',
-        passed: false,
-        details: '当前核算组织没有 TRIAL_PENDING 且绑定 currentTrialId 的试算样本'
-      })
-    }
-    await openRoute(page, '/cost-management')
-    caseRecord.checks.push({
-      name: '成本工作台可打开试算复核入口',
-      passed: (await page.getByText('试算', { exact: false }).count()) > 0,
-      details: '真实 Chrome 成本工作台试算复核入口'
     })
-    await saveScreenshot(page, outputDir, 'cost-separation-of-duties', record)
-    caseRecord.evidence.push('成本试算执行人字段、同人复核阻断校验与成本工作台截图')
+    caseRecord.evidence.push('COST-023 专属期间、试算、独立复核、发布人与审批人 API/数据库证据')
   }
 
   if (caseId === 'COST-024') {
@@ -1702,8 +2177,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         details: `stage=CARRYOVER rows=${Array.isArray(listed) ? listed.length : 'n/a'}`
       })
     }
-    // 口径说明只在"上期在制"阶段渲染，需要临时把页面草稿状态切到该阶段再断言。
-    await withCarryoverStage(api, async () => {
+    // Shared workspace-state is not changed to force a browser acceptance state.
+    {
       await openRoute(page, '/cost-management/monthly/opening-wip', {
         readySelector: '.opening-wip-workspace'
       })
@@ -1714,10 +2189,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       })
       // 上期结转阶段由远端 workspace-state 异步 hydrate 派生，必须等分支真正切到
       // 上期在制后再取口径提示，否则会因初始渲染仍处于期初阶段而漏判提示。
-      await page
-        .getByText('上期结转', { exact: false })
-        .first()
-        .waitFor({ state: 'visible', timeout: 30000 })
+      const stageVisible = await page.getByText('上期结转', { exact: false })
+        .first().isVisible()
+      if (!stageVisible) {
+        caseRecord.notes.push('COST-024 浏览器当前共享阶段不是上期结转；未改共享模型、期间或 gate 状态')
+        await saveScreenshot(page, outputDir, 'cost-opening-wip-carry-forward', record)
+        return { token, api, partial: true, note: '专属 API 证据完成；共享页面阶段不可安全切换' }
+      }
       // 口径说明挂在悬浮提示里，逐个小问号 hover，直到目标文案出现。
       const carryoverRuleTriggers = page.locator(
         '.opening-wip-workspace .el-tooltip__trigger'
@@ -1737,7 +2215,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         details: '真实 Chrome 上期结转口径提示'
       })
       await saveScreenshot(page, outputDir, 'cost-opening-wip-carry-forward', record)
-    })
+    }
     caseRecord.evidence.push(
       '上期结转后端派生契约、CARRYOVER 阶段查询、料工费拆分提示与成本工作台截图'
     )
@@ -1889,7 +2367,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     }
     // 采购成本工作区只在月度深链接下挂载，直接打开目标路由而非依赖工作台快捷入口。
     await openRoute(page, '/cost-management/monthly/purchase-costing', {
-      readySelector: '.purchase-layout'
+      readySelector: '[data-testid="formal-purchase-cost"]'
     })
     caseRecord.checks.push({
       name: '采购成本页面说明发票行级与订单级比较口径',
@@ -1980,69 +2458,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'COST-028') {
-    // 回退与反月结先进入独立审批，审批通过并执行前不得改变正式成本。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const periods = periodsResult?.data?.list || []
-    // 回退入口在发布批次存在性校验之后才校验原因，因此必须使用真实已发布期间。
-    const candidate = loadCostScenario(caseRecord)?.period || periods.find((row) => nonEmpty(row.id))
-    if (candidate) {
-      const active = await api.request(
-        'GET',
-        `/cost/publication-approvals/periods/${candidate.id}/active`
-      )
-      caseRecord.checks.push({
-        name: '回退反月结审批查询接口返回正式审批事实',
-        passed:
-          active?.code === 0 &&
-          (!active.data ||
-            (nonEmpty(active.data.actionType) &&
-              active.data.status === 'PENDING' &&
-              typeof active.data.canApprove === 'boolean' &&
-              typeof active.data.canWithdraw === 'boolean')),
-        details: active?.data
-          ? `approvalId=${active.data.id} action=${active.data.actionType} status=${active.data.status}`
-          : '当前期间没有待审批申请，接口返回空事实'
-      })
-      const missingReason = await api.request(
-        'POST',
-        `/cost/publications/${candidate.currentPublicationId || candidate.id}/rollback`,
-        {}
-      )
-      caseRecord.checks.push({
-        name: '回退入口只提交独立审批且仍强制校验申请原因',
-        passed:
-          missingReason?.code !== undefined &&
-          missingReason.code !== 0 &&
-          missingReason.code !== 500 &&
-          String(missingReason.msg || missingReason.message || '').includes('回退或反月结原因'),
-        details: `code=${missingReason?.code} msg=${missingReason?.msg || missingReason?.message || ''}`
-      })
-    } else {
-      caseRecord.checks.push({
-        name: '存在可用于回退审批契约校验的成本期间',
-        passed: false,
-        details: '当前核算组织暂无成本期间'
-      })
-    }
-    // 成本发布工作区只在月度深链接下挂载，直接打开目标路由以读取常驻说明。
-    await openRoute(page, '/cost-management/monthly/cost-publish', {
-      readySelector: '.publish-workspace'
+    await (dependencies.runCostPublicationApprovalClosure || runCostPublicationApprovalClosure)({
+      api: rawApi,
+      actorApi: rawApi,
+      record,
+      caseRecord,
+      page,
+      outputDir,
+      dependencies: {
+        ...dependencies.costWorkflowDependencies,
+        writeFixtures: dependencies.writeFixtures ?? costWritesEnabled()
+      }
     })
-    caseRecord.checks.push({
-        name: '成本工作台常驻说明审批通过前不改变正式成本',
-        passed:
-        (await page.getByText('回退正式成本与反月结重开均采用独立审批', { exact: false }).count()) >
-          0 &&
-        (await page.getByText('申请人不能审批自己的申请', { exact: false }).count()) > 0 &&
-        (await page.getByText('同一批次仅允许一条待审批申请', { exact: false }).count()) > 0,
-        details: '真实 Chrome 成本发布工作台独立审批说明'
-      })
-    await saveScreenshot(page, outputDir, 'cost-publication-approval', record)
-    caseRecord.evidence.push(
-      '回退反月结审批查询契约、审批前不改变正式成本、发起审批原因校验与页面提示截图'
-    )
+    caseRecord.evidence.push('COST-028 专属期间、发布批次、审批申请/决策、状态机和令牌清理 API/数据库证据')
   }
 
   if (caseId === 'COST-029') {
@@ -2060,9 +2488,43 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         .flatMap((row) => row.departmentIds || [])
         .map(String)
     )
-    const availableDepartment = departments.find(
-      (row) => row.status === 0 && !occupiedDepartmentIds.has(String(row.id))
-    )
+    if (!(dependencies.writeFixtures ?? costWritesEnabled())) {
+      return { token, api, partial: true, note: '成本中心专属写侧开关未启用' }
+    }
+    if (config.target !== 'local' || config.tenantId !== '1' ||
+        String(record.environment?.tenantId) !== '1') {
+      throw new Error('BLOCKED: COST-029 only allows local tenant1')
+    }
+    const permissionDependencies = {
+      ...dependencies.costCenterPermissionDependencies,
+      writeFixtures: dependencies.writeFixtures ?? costWritesEnabled()
+    }
+    const permissionPreflight = await preflightCostCenterPermissionClosure({
+      api, record, caseRecord,
+      dependencies: {
+        ...permissionDependencies,
+        assertLocalWriteSafety: dependencies.assertLocalWriteSafety ||
+          permissionDependencies.assertLocalWriteSafety || assertLocalWriteSafety
+      }
+    })
+    let dedicatedDepartment
+    try {
+      dedicatedDepartment = await prepareDedicatedCostDepartment({ api, record, caseRecord })
+    } catch (error) {
+      const closure = caseRecord.costCenterPermissionClosure
+      closure.status = 'FAILED'
+      closure.residuals.push({
+        step: 'departmentPreparation',
+        department: caseRecord.fixtures?.costDepartment || null,
+        reason: error.message
+      })
+      caseRecord.checks.push({
+        name: 'COST-029 专属部门创建/正式回读失败不得转PARTIAL',
+        passed: false, details: error.message
+      })
+      throw error
+    }
+    const availableDepartment = { id: dedicatedDepartment.id, status: 0 }
     let firstCenterId
     let firstCenterActive = false
     let secondCenterId
@@ -2083,12 +2545,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         name: `E2E成本中心${suffix}`,
         enabledAt: firstDate,
         departmentIds: [availableDepartment.id],
-        remark: 'PB-071 E2E temporary cost center'
+        remark: permissionPreflight.marker
       }
       try {
         const firstCreate = await api.post('/cost/centers', firstPayload)
-        firstCenterId = responseData(firstCreate)?.id
-        firstCenterActive = firstCreate?.code === 0 && nonEmpty(firstCenterId)
+        firstCenterId = isCostFixtureId(responseData(firstCreate)?.id) ? responseData(firstCreate).id : null
+        firstCenterActive = firstCreate?.code === 0 && firstCenterId !== null
+        if (firstCreate?.code === 0 && !firstCenterId) {
+          caseRecord.costCenterPermissionClosure.residuals.push({
+            step: 'firstCenterCreateIdentity', code: firstCode, marker: permissionPreflight.marker,
+            reason: 'Formal create succeeded without a lossless string ID; no ID-targeted mutation attempted'
+          })
+        }
         caseRecord.checks.push({
           name: '成本中心可引用真实部门并按启用日期创建',
           passed: firstCenterActive,
@@ -2131,7 +2599,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
 
         const firstDeactivate = await api.post(`/cost/centers/${firstCenterId}/deactivate`, {
           disabledAt: firstDate,
-          reason: 'PB-071 E2E cleanup'
+          reason: permissionPreflight.marker
         })
         firstCenterActive = !(firstDeactivate?.code === 0)
         caseRecord.checks.push({
@@ -2147,8 +2615,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           name: `E2E后续成本中心${suffix}`,
           enabledAt: secondDate
         })
-        secondCenterId = responseData(secondCreate)?.id
-        secondCenterActive = secondCreate?.code === 0 && nonEmpty(secondCenterId)
+        secondCenterId = isCostFixtureId(responseData(secondCreate)?.id) ? responseData(secondCreate).id : null
+        secondCenterActive = secondCreate?.code === 0 && secondCenterId !== null
+        if (secondCreate?.code === 0 && !secondCenterId) {
+          caseRecord.costCenterPermissionClosure.residuals.push({
+            step: 'secondCenterCreateIdentity', code: secondCode, marker: permissionPreflight.marker,
+            reason: 'Formal create succeeded without a lossless string ID; no ID-targeted mutation attempted'
+          })
+        }
         caseRecord.checks.push({
           name: '停用后的部门可按后续日期归属新成本中心',
           passed: secondCenterActive,
@@ -2156,41 +2630,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         })
         if (!secondCenterActive) throw new Error('后续成本中心创建失败，停止页面数据断言')
 
-        await openRoute(page, '/cost-management/modeling/profile', {
-          readySelector: '.page-head h1',
-          readyTimeoutMs: 30000
+        await runCostCenterPermissionClosure({
+          preflight: permissionPreflight, api, record, caseRecord, page, outputDir,
+          department: dedicatedDepartment,
+          activeCenter: responseData(secondCreate),
+          ownedCenters: [responseData(firstCreate), responseData(secondCreate)],
+          dependencies: permissionDependencies
         })
-        const manageEntry = page.getByRole('button', { name: '管理成本中心' }).first()
-        if ((await manageEntry.count()) > 0) {
-          await manageEntry.click()
-          await page
-            .getByText('成本中心与部门归属', { exact: false })
-            .first()
-            .waitFor({ state: 'visible', timeout: 30000 })
-        }
-        const activeCenterNode = page.getByText(`E2E后续成本中心${suffix}`, { exact: true }).first()
-        await activeCenterNode.waitFor({ state: 'visible', timeout: 30000 })
-        await activeCenterNode.click()
-        await page
-          .getByRole('button', { name: '停用' })
-          .first()
-          .waitFor({ state: 'visible', timeout: 30000 })
-        caseRecord.checks.push({
-          name: '成本中心维护页按权限提供新增、编辑和停用入口',
-          passed:
-            (await page.getByText('成本中心与部门归属', { exact: false }).count()) > 0 &&
-            (await page.getByRole('button', { name: '新增' }).count()) > 0 &&
-            (await page.getByRole('button', { name: '编辑成本中心' }).count()) > 0 &&
-            (await page.getByRole('button', { name: '停用' }).count()) > 0,
-          details: page.url()
-        })
-        await saveScreenshot(page, outputDir, 'cost-center-period-permission', record)
       } finally {
         if (firstCenterId && firstCenterActive) {
           try {
             const cleanup = await api.post(`/cost/centers/${firstCenterId}/deactivate`, {
               disabledAt: firstDate,
-              reason: 'PB-071 E2E cleanup'
+              reason: permissionPreflight.marker
             })
             caseRecord.checks.push({
               name: '本轮首次成本中心失败后清理停用成功',
@@ -2209,7 +2661,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           try {
             const cleanup = await api.post(`/cost/centers/${secondCenterId}/deactivate`, {
               disabledAt: secondDate,
-              reason: 'PB-071 E2E cleanup'
+              reason: permissionPreflight.marker
             })
             caseRecord.checks.push({
               name: '本轮后续成本中心清理停用成功',
@@ -2495,6 +2947,25 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           costConfigurationSignature(retainedConfiguration) === costConfigurationSignature(originalNonOperating),
         details: `retainedItems=${retainedItems.length} originalItems=${nonOperatingItems.length}`
       })
+      if (!isCostFixtureId(String(probe?.id))) throw new Error('经营探针未返回精确构成项 ID')
+      const snapshot = await (dependencies.runReadOnlySql || runReadOnlySql)(`
+        SELECT COUNT(*) FROM cost_component_item i
+        JOIN cost_component_category c ON c.id=i.category_id
+          AND c.tenant_id=i.tenant_id AND c.model_version_id=i.model_version_id
+        WHERE i.tenant_id=1 AND i.model_version_id=${modelVersionId}
+          AND i.id=${probe.id} AND i.deleted=0 AND c.deleted=0
+          AND c.category_code='OP-EXP-ROOT'
+          AND EXISTS (SELECT 1 FROM cost_component_category r
+            WHERE r.tenant_id=1 AND r.model_version_id=${modelVersionId}
+              AND r.category_code='OP-INC-ROOT' AND r.deleted=0)
+      `)
+      caseRecord.database = [...(caseRecord.database || []), { stage: 'operating-probe', ...snapshot }]
+      const persisted = snapshot.available && snapshot.rows.length === 1 && snapshot.rows[0][0] === '1'
+      caseRecord.checks.push({
+        name: 'COST-031 经营项目及固定收入支出根分类在专属模型正式共享构成表精确落库',
+        passed: persisted, details: `model=${modelVersionId}; item=${probe.id}; rows=${JSON.stringify(snapshot.rows)}`
+      })
+      if (!persisted) throw new Error('经营探针共享构成表与根分类落库未证实')
       for (let iteration = 1; iteration <= 2; iteration++) {
         const repeated = responseData(await api.putBusiness(
           `/cost/model-versions/${modelVersionId}/components`,
@@ -2543,14 +3014,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
             allocationMode
           }
         ]
-      })
+      }, { expectedBusinessRejection: {
+        code: 422001, message: 'factor source must be SNAPSHOT or MANUAL for factor allocation'
+      } })
       caseRecord.checks.push({
         name: `${allocationMode} 因子缺少来源时被拒绝`,
         passed:
-          missingSource?.code !== 0 &&
-          String(missingSource?.msg || missingSource?.message || '').includes(
-            'factor source must be SNAPSHOT or MANUAL'
-          ),
+          missingSource?.code === 422001 &&
+          (missingSource?.msg || missingSource?.message) ===
+            'factor source must be SNAPSHOT or MANUAL for factor allocation',
         details: `code=${missingSource?.code} msg=${missingSource?.msg || missingSource?.message || ''}`
       })
       }
@@ -2564,14 +3036,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
             allocationMode: 'UNKNOWN_FACTOR'
           }
         ]
-      })
+      }, { expectedBusinessRejection: { code: 422001, message: 'unsupported allocation mode' } })
       caseRecord.checks.push({
         name: '未知分摊模式被拒绝',
         passed:
-          unknownMode?.code !== 0 &&
-          String(unknownMode?.msg || unknownMode?.message || '').includes(
-            'unsupported allocation mode'
-          ),
+          unknownMode?.code === 422001 &&
+          (unknownMode?.msg || unknownMode?.message) === 'unsupported allocation mode',
         details: `code=${unknownMode?.code} msg=${unknownMode?.msg || unknownMode?.message || ''}`
       })
       // 使用远期月份写入数量模式规则，确认原有模式未回归且不影响真实期间。
@@ -2674,74 +3144,6 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push('期初在制逐行错误定位与多行批次错误行号')
   }
 
-  if (caseId === 'COST-034') {
-    // PB-077：取数/试算/确认/发布四个阶段均落规则通过记录，并保留规则版本与证据。
-    const periodsResult = await api.getBusiness(
-      `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
-    )
-    const periods = periodsResult?.data?.list || []
-    const candidate =
-      loadCostScenario(caseRecord)?.period ||
-      periods.find((row) => row.status === 'COST_PUBLISHED' && nonEmpty(row.currentPublicationId)) ||
-      periods.find((row) => nonEmpty(row.currentPublicationId)) ||
-      periods.find((row) => nonEmpty(row.currentTrialId))
-    if (candidate) {
-      const hits = await api.request(
-        'GET',
-        `/cost/periods/${candidate.id}/rule-hits?pageNo=1&pageSize=100&level=PASS`
-      )
-      const rows = hits?.data?.list || []
-      caseRecord.checks.push({
-        name: '阶段通过类命中记录可按 PASS 级别分页查询',
-        passed: hits?.code === 0 && Array.isArray(rows) && rows.length > 0,
-        details: `periodId=${candidate.id} total=${hits?.data?.total ?? 0} rows=${rows.length}`
-      })
-      caseRecord.checks.push({
-        name: '通过类命中记录保留规则版本快照与阶段证据',
-        passed:
-          rows.length > 0 &&
-          rows.every((row) => nonEmpty(row.ruleVersion) && nonEmpty(row.basis)) &&
-          rows.every((row) => row.status === 'CLOSED'),
-        details: rows.length
-          ? `示例：ruleCode=${rows[0].ruleCode} ruleVersion=${rows[0].ruleVersion} status=${rows[0].status} basis=${rows[0].basis}`
-          : '无通过类命中记录'
-      })
-      const stages = ['试算', '确认', '发布', '取数']
-      const covered = stages.filter((stage) => rows.some((row) => String(row.basis).includes(stage)))
-      caseRecord.checks.push({
-        name: '试算/确认/发布阶段均有通过类命中记录',
-        passed: ['试算', '确认', '发布'].every((stage) => covered.includes(stage)),
-        details: `已覆盖阶段=${covered.join(',') || '无'}`
-      })
-      const blocking = await api.request(
-        'GET',
-        `/cost/periods/${candidate.id}/rule-hits?pageNo=1&pageSize=100&level=BLOCK&status=OPEN`
-      )
-      const blockingRows = blocking?.data?.list || []
-      caseRecord.checks.push({
-        name: '通过类记录不参与未处理阻断项统计',
-        passed:
-          rows.every((row) => row.level === 'PASS') &&
-          blockingRows.every((row) => row.level === 'BLOCK' && row.status === 'OPEN'),
-        details: `passRows=${rows.length} openBlocking=${blockingRows.length}`
-      })
-    } else {
-      caseRecord.checks.push({
-        name: '存在可用于阶段命中记录校验的成本期间',
-        passed: false,
-        details: '当前核算组织暂无已试算/已发布的成本期间'
-      })
-    }
-    await openRoute(page, '/cost-management')
-    caseRecord.checks.push({
-      name: '成本管理页面可进入并展示异常队列入口',
-      passed: page.url().includes('/cost-management'),
-      details: page.url()
-    })
-    await saveScreenshot(page, outputDir, 'cost-rule-stage-pass', record)
-    caseRecord.evidence.push('取数/试算/确认/发布阶段 PASS 命中记录、规则版本快照与阶段证据文本')
-  }
-
   if (ownedCostFixture) {
     await (dependencies.recordCostDatabase || recordCostDatabase)({
       modelVersionId: ownedCostFixture.model.id, caseRecord
@@ -2749,4 +3151,159 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
   caseRecord.evidence.push('真实成本模型、期间与截图证据')
   return { token, api }
+}
+
+export const runCase = async (context, dependencies = {}) => {
+  try {
+    if (['COST-001', 'COST-007'].includes(context.caseId) &&
+        typeof context.page?.on === 'function') {
+      return await verifyCostSharedWorkspaceBoundary({
+        page: context.page,
+        caseRecord: context.caseRecord,
+        operation: () => runCostCase(context, dependencies),
+        dependencies: dependencies.sharedWorkspaceDependencies || {}
+      })
+    }
+    return await runCostCase(context, dependencies)
+  } catch (error) {
+    context.caseRecord.checks.push({
+      name: '成本用例执行异常，catalog 验收不得通过',
+      passed: false,
+      details: error instanceof Error ? error.message : String(error)
+    })
+    throw error
+  } finally {
+    try {
+      if (context.caseId === 'COST-029' && context.caseRecord.fixtures?.costDepartment) {
+        try {
+          const token = await (dependencies.login || login)(context.page)
+          const api = (dependencies.createApiClient || createApiClient)({ token, record: context.record })
+          await cleanupDedicatedCostDepartment({ api, caseRecord: context.caseRecord })
+        } catch (error) {
+          const closure = context.caseRecord.costCenterPermissionClosure
+          if (closure) {
+            closure.complete = false
+            closure.status = 'FAILED'
+            closure.residuals.push({
+              step: 'departmentCleanup', department: context.caseRecord.fixtures.costDepartment,
+              reason: error.message
+            })
+          }
+          context.caseRecord.checks.push({
+            name: 'COST-029 专属部门清理失败保留准确残留台账',
+            passed: false, details: error.message
+          })
+          throw error
+        }
+      }
+    } finally {
+      costCatalogEvidence(context.caseId, context.caseRecord)
+    }
+  }
+}
+
+export async function teardownRun ({ record, token = runTokens.get(record.runId) }) {
+  if (!token) return
+  if (config.target !== 'local' || config.tenantId !== '1' ||
+      String(record.environment?.tenantId) !== '1') {
+    throw new Error('成本整轮清理仅允许 local tenant1')
+  }
+  const api = createApiClient({ token, record })
+  const fixtures = new Map()
+  for (const entry of record.cases) {
+    for (const fixture of [
+      entry.fixtures?.cost, entry.fixtures?.costScenario, entry.fixtures?.costUnpublishedScenario
+    ]) {
+      if (!fixture?.departmentId) continue
+      if (fixture.runId !== record.runId || fixture.tenantId !== '1') {
+        throw new Error('成本清理夹具不属于本轮租户')
+      }
+      const modelId = fixture.modelVersionId || fixture.modelId
+      const marker = fixture.remark || costFixtureRemark(fixture)
+      fixtures.set(fixture.departmentId, { ...fixture, modelId, marker, entry })
+    }
+  }
+  const errors = []
+  for (const fixture of fixtures.values()) {
+    try {
+      for (const reviewerKey of ['reviewer', 'approvalReviewer']) {
+        try {
+          await cleanupCostScenarioReviewer({ api, fixture, key: reviewerKey })
+        } catch (error) {
+          errors.push(new Error(`${fixture.departmentId}/${reviewerKey}: ${error.message}`))
+        }
+      }
+      const model = fixture.modelId
+        ? responseData(await api.getBusiness(`/cost/model-versions/${fixture.modelId}`))
+        : null
+      if (model && (String(model.id) !== fixture.modelId || model.remark !== fixture.marker ||
+          String(model.accountingOrgId) !== '1')) {
+        throw new Error('专属成本模型清理所有权不符')
+      }
+      const center = fixture.costCenterId
+        ? responseData(await api.getBusiness(`/cost/centers/${fixture.costCenterId}`))
+        : null
+      if (center) {
+        if (String(center.id) !== fixture.costCenterId || center.remark !== fixture.marker ||
+            String(center.accountingOrgId) !== '1' ||
+            center.departmentIds.map(String).join() !== fixture.departmentId) {
+          throw new Error('专属成本中心清理所有权不符')
+        }
+        if (center.status === 'ENABLED') {
+          await api.postBusiness(`/cost/centers/${fixture.costCenterId}/deactivate`, {
+            disabledAt: `${fixture.effectiveMonth || fixture.month}-28`, reason: fixture.marker
+          })
+        }
+        const after = responseData(await api.getBusiness(`/cost/centers/${fixture.costCenterId}`))
+        if (after.status !== 'DISABLED' || after.remark !== fixture.marker) {
+          throw new Error('专属成本中心未正式停用')
+        }
+      }
+      const department = responseData(await api.getBusiness(`/system/dept/get?id=${fixture.departmentId}`))
+      const suffix = fixture.suffix || fixture.fixtureId?.split('-').at(-1)
+      if (String(department?.id) !== fixture.departmentId ||
+          !suffix || !department.name.endsWith(suffix) ||
+          !department.code.endsWith(suffix)) {
+        throw new Error('专属部门清理所有权不符')
+      }
+      await api.deleteBusiness(`/system/dept/delete?id=${fixture.departmentId}`)
+      let removed = null
+      for (let attempt = 0; attempt < 5; attempt++) {
+        removed = responseData(await api.getBusiness(`/system/dept/get?id=${fixture.departmentId}`))
+        const softDeleted = removed != null && isSoftDeletedValue(removed.deleted)
+        if (removed == null || softDeleted) break
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      let softDeleted = removed != null && isSoftDeletedValue(removed.deleted)
+      if (removed != null && !softDeleted) {
+        const databaseEvidence = await runReadOnlySql(`
+          SELECT CAST(tenant_id AS CHAR), CAST(id AS CHAR), name, code, deleted
+          FROM system_dept
+          WHERE tenant_id=1 AND id=${fixture.departmentId}
+        `)
+        const row = databaseEvidence.rows?.[0]
+        softDeleted = databaseEvidence.available &&
+          row?.[0] === '1' &&
+          row?.[1] === fixture.departmentId &&
+          row?.[2] === department.name &&
+          row?.[3] === department.code &&
+          isSoftDeletedValue(row?.[4])
+        fixture.entry.database = [...(fixture.entry.database || []), {
+          stage: 'cost-department-cleanup',
+          ...databaseEvidence
+        }]
+      }
+      if (removed != null && !softDeleted) throw new Error('专属成本部门删除后仍可见')
+      fixture.entry.notes.push(
+        `整轮清理：center=${fixture.costCenterId || '-'} 已停用，department=${fixture.departmentId} 已删除；` +
+        `model=${fixture.modelId || '-'}、期间、正式规则/来源/发布事实无删除 API，保留专属审计；` +
+        `部门软删除证据=${removed == null ? 'API不可见' : softDeleted ? 'API/只读数据库确认' : '未确认'}`
+      )
+    } catch (error) {
+      errors.push(new Error(`${fixture.departmentId}: ${error.message}`))
+    }
+  }
+  runTokens.delete(record.runId)
+  if (errors.length) throw new AggregateError(errors,
+    `成本整轮清理失败：${errors.map((error) => error.message).join('; ')}`)
 }

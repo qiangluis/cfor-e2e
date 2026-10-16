@@ -39,3 +39,11 @@ test('runner validates timeout without changing the existing default', () => {
   assert.throws(() => validateCaseTimeoutMs(999), /不小于 1000/)
   assert.throws(() => parseRunnerArgs(['--case']), /--case 缺少参数/)
 })
+
+test('runner help is recognized and unknown arguments fail closed', () => {
+  assert.equal(parseRunnerArgs(['--help']).help, true)
+  assert.equal(parseRunnerArgs(['-h']).help, true)
+  for (const args of [['--unknown'], ['--cases', 'SMOKE-001'], ['--out', '/tmp/test']]) {
+    assert.throws(() => parseRunnerArgs(args), /未知参数/)
+  }
+})

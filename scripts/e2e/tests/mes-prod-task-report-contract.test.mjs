@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import test from 'node:test'
+import { isBusinessRejection } from '../lib/api.mjs'
 import {
   hasPausedWorkReadback,
   isPauseValidationRejection,
@@ -48,8 +49,14 @@ async function pauseHarness (options = {}) {
       assert.equal(path, `/mes/prodWork/queryById?id=${encodeURIComponent(work.id)}`)
       return { code: 0, data: snapshot() }
     },
-    async request (method, path, body) {
-      calls.push({ action: 'negative', method, path, body: structuredClone(body) })
+    async request (method, path, body, requestOptions) {
+      calls.push({
+        action: 'negative',
+        method,
+        path,
+        body: structuredClone(body),
+        options: structuredClone(requestOptions)
+      })
       assert.equal(method, 'POST')
       assert.equal(path, '/mes/prodWork/pause')
       assert.equal(body.id, work.id)
@@ -58,7 +65,7 @@ async function pauseHarness (options = {}) {
       if (options.failAt === 'negative') throw new Error('unit negative transport failure')
       if (options.negativeMutation) work.status = 3
       return options.negativeResponse || {
-        code: 500,
+        code: 400,
         msg: body.pauseReason ? '预计恢复时间不能为空' : '暂停原因不能为空'
       }
     }
@@ -105,7 +112,7 @@ async function pauseHarness (options = {}) {
     }
   }
   const suite = await isolatedSuite({
-    '../lib/api.mjs': { createApiClient: () => api },
+    '../lib/api.mjs': { createApiClient: () => api, isBusinessRejection },
     '../lib/browser.mjs': {
       login: async () => 'unit-token',
       openRoute: async (_page, route, routeOptions) => {
@@ -159,11 +166,13 @@ test('failed or malformed work pages cannot be reported as missing formal work',
 
 test('only explicit pause mandatory-field errors count as negative validation evidence', () => {
   for (const message of ['暂停原因不能为空', '预计恢复时间不能为空']) {
-    assert.equal(isPauseValidationRejection({ code: 500, msg: message }, message), true)
+    assert.equal(isPauseValidationRejection({ code: 400, msg: message }, message), true)
     for (const result of [
       undefined,
       { code: 0, msg: message },
       { code: 200, success: true, message },
+      { code: 400, success: true, msg: message },
+      { code: 400, msg: '其他业务错误' },
       { code: 404, msg: '请求地址不存在' },
       { code: 500, msg: '工单不存在' },
       { code: 500, msg: '系统异常' }
@@ -188,6 +197,20 @@ test('002 runs owned start, mandatory-field negatives, pause readback, resume an
     {
       id: '9223372036854775806', prodWorkOrderId: '9223372036854775806',
       pauseReason: h.fixture().marker
+    }
+  ])
+  assert.deepEqual(negatives.map((call) => call.options), [
+    {
+      expectedBusinessRejection: {
+        code: 400,
+        message: '暂停原因不能为空'
+      }
+    },
+    {
+      expectedBusinessRejection: {
+        code: 400,
+        message: '预计恢复时间不能为空'
+      }
     }
   ])
   const pause = h.calls.find((call) => call.action === 'pause')
@@ -231,6 +254,7 @@ test('002 business success and unrelated failures never count as mandatory-field
   for (const response of [
     { code: 0, msg: '暂停原因不能为空' },
     { code: 200, success: true, message: '暂停原因不能为空' },
+    { code: 400, success: true, msg: '暂停原因不能为空' },
     { code: 404, msg: '请求地址不存在' },
     { code: 500, msg: '工单不存在' },
     { code: 500, msg: '系统异常' }

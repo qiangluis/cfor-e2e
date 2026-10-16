@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { caseOutcome, caseErrorStatus } from '../lib/report.mjs'
+import { acceptanceIsComplete, caseOutcome, caseErrorStatus } from '../lib/report.mjs'
 
 test('failed assertions cannot be masked by partial implementation', () => {
   assert.equal(caseOutcome({
@@ -29,6 +29,33 @@ test('passing implemented steps do not promote incomplete cases', () => {
 test('only complete cases with nonempty passing assertions pass', () => {
   assert.equal(caseOutcome({ failedChecks: [], hasAssertions: false }).status, 'PARTIAL')
   assert.equal(caseOutcome({ failedChecks: [], hasAssertions: true }).status, 'PASS')
+})
+
+test('explicitly incomplete business or page evidence overrides every generic completion candidate', () => {
+  assert.equal(acceptanceIsComplete({
+    candidates: [true, true], remainingAssertions: [], incomplete: true
+  }), false)
+  for (const flag of ['partial', 'notImplemented', 'designed', 'blocked', 'skipped']) {
+    assert.equal(caseOutcome({
+      failedChecks: [], hasAssertions: true,
+      result: { acceptanceComplete: true, [flag]: true, note: 'Real page gap' }
+    }).status, 'PARTIAL', flag)
+  }
+  const source = fs.readFileSync(new URL('../runner.mjs', import.meta.url), 'utf8')
+  assert.match(source, /const explicitlyIncomplete = Boolean\([\s\S]*?result\?\.partial[\s\S]*?result\?\.acceptanceComplete === false/)
+  assert.match(source, /incomplete: explicitlyIncomplete/)
+  assert.match(source, /const partial = !acceptanceComplete && \(\s*explicitlyIncomplete \|\|/)
+})
+
+test('an explicitly complete write-side acceptance can close a historical PARTIAL catalog status', () => {
+  assert.equal(caseOutcome({
+    failedChecks: [], partial: true, hasAssertions: true,
+    result: { acceptanceComplete: true }
+  }).status, 'PASS')
+  assert.equal(caseOutcome({
+    failedChecks: [], partial: true, hasAssertions: false,
+    result: { acceptanceComplete: true }
+  }).status, 'PARTIAL')
 })
 
 test('mocked supplier smoke cannot run as real workflow acceptance', async () => {

@@ -45,6 +45,47 @@ const dataOf = (response) => response?.data ?? response
 const unique = (prefix) =>
   `${prefix}-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString('hex').toUpperCase()}`
 
+// Preserve the catalog status in the audit report, but allow a complete,
+// evidence-backed write-side run to close the current acceptance gap.
+// Reverse evidence is intentionally stored separately because the gap report
+// matches only the catalog's declared assertions array.
+export function recordFms005Acceptance (caseRecord, definition = fmsDefinitions.find((item) => item.id === 'FMS-005')) {
+  const evidence = caseRecord.catalogEvidence || {}
+  const row = (assertion, index) => ({
+    index,
+    assertion,
+    status: evidence[assertion]?.status === 'PASS' ? 'VERIFIED' : 'GAP',
+    evidence: evidence[assertion]?.evidence || '尚无本轮真实闭环证据'
+  })
+  const catalogAssertions = (definition.assertions || []).map(row)
+  const reverseAssertions = (definition.reverse || []).map(row)
+  caseRecord.catalogAssertions = catalogAssertions
+  caseRecord.catalogReverseAssertions = reverseAssertions
+  caseRecord.remainingAssertions = [
+    ...catalogAssertions.filter((item) => item.status !== 'VERIFIED'),
+    ...reverseAssertions
+      .filter((item) => item.status !== 'VERIFIED')
+      .map((item) => ({ ...item, reverse: true }))
+  ]
+  const failedChecks = (caseRecord.checks || []).filter((item) => item.passed === false)
+  const acceptanceComplete = failedChecks.length === 0 &&
+    caseRecord.remainingAssertions.length === 0
+  caseRecord.passCandidate = acceptanceComplete
+  caseRecord.notes.push(
+    `FMS-005 五项原断言按 index/evidence 精确记录，reverse 单独记录 ${reverseAssertions.length} 项；` +
+    (acceptanceComplete
+      ? '本轮写侧闭环与专属夹具清理均完成，可结案'
+      : `仍有 ${caseRecord.remainingAssertions.length} 项断言或 ${failedChecks.length} 个失败检查`)
+  )
+  return {
+    partial: !acceptanceComplete,
+    acceptanceComplete,
+    note: acceptanceComplete
+      ? '本轮全部 catalog 原断言及 reverse 具备真实证据，写侧验收闭环完成'
+      : `剩余 ${caseRecord.remainingAssertions.length} 项断言或 ${failedChecks.length} 个失败检查`
+  }
+}
+
 async function waitForTableRows (page, expectedText = null) {
   await page.waitForFunction(
     (expected) =>
@@ -156,40 +197,82 @@ async function importOpeningBatch (api, role, partner, caseRecord) {
   return { batchNo, bill, entries: Array.isArray(entries) ? entries : [] }
 }
 
-async function cleanOpeningBatch (api, { billId, batchNo, role, partnerId }) {
-  let resolvedBillId = billId
-  if (!resolvedBillId && batchNo) {
-    try {
-      const listResult = await api.getBusiness(
-        '/finance/dealingsBeginning/list?pageNo=1&pageSize=100'
-      )
-      const rows = listResult?.data?.records || listResult?.data?.list || []
-      const bill = rows.find(
-        (item) => item.importBatchNo === batchNo &&
-          (!role || String(item.dealingsLogotype).startsWith(role))
-      )
-      resolvedBillId = bill?.id
-    } catch {}
+async function openingBillRows (api, batchNo, role) {
+  if (!batchNo) throw new Error('期初清理缺少本轮批次号')
+  const params = new URLSearchParams({
+    pageNo: '1',
+    pageSize: '100',
+    importBatchNo: batchNo,
+    ...(role ? { dealingsLogotype: role } : {})
+  })
+  const result = await api.getBusiness(`/finance/dealingsBeginning/list?${params}`)
+  return result?.data?.records || result?.data?.list || []
+}
+
+async function readOpeningBill (api, billId) {
+  if (!billId) throw new Error('期初清理缺少主单 ID')
+  return dataOf(await api.getBusiness(
+    `/finance/dealingsBeginning/queryById?id=${encodeURIComponent(billId)}`
+  ))
+}
+
+async function deleteOpeningBill (api, { billId, batchNo, role }) {
+  const rows = await openingBillRows(api, batchNo, role)
+  const row = rows.find((item) => String(item.id) === String(billId))
+  if (!row) {
+    throw new Error(`期初清理主单与批次回读不一致：billId=${billId}, rows=${JSON.stringify(rows)}`)
   }
+
+  const current = await readOpeningBill(api, billId)
+  if (String(current?.isVoided) !== '1') {
+    const isEffective = String(current?.isEffective)
+    if (isEffective === '1') {
+      await api.putBusiness('/finance/dealingsBeginning/void', { id: billId })
+      const voided = await readOpeningBill(api, billId)
+      if (String(voided?.isVoided) !== '1') {
+        throw new Error(`期初批次弃审后未回读为已作废：${JSON.stringify(voided)}`)
+      }
+    } else if (isEffective !== '0') {
+      throw new Error(`期初批次生效状态未知，拒绝清理：${JSON.stringify(current)}`)
+    }
+  }
+
+  await api.deleteBusiness(
+    `/finance/dealingsBeginning/delete?id=${encodeURIComponent(billId)}`
+  )
+  const remaining = await openingBillRows(api, batchNo, role)
+  if (remaining.some((item) => String(item.id) === String(billId))) {
+    throw new Error(`期初批次删除后仍可回读：billId=${billId}, rows=${JSON.stringify(remaining)}`)
+  }
+  return true
+}
+
+export async function cleanOpeningBatch (api, { billId, batchNo, role, partnerId }) {
+  const rows = await openingBillRows(api, batchNo, role)
+  const matched = rows.filter((item) => !billId || String(item.id) === String(billId))
+  if (matched.length > 1) {
+    throw new Error(`期初清理命中多个主单：batchNo=${batchNo}, role=${role}, rows=${JSON.stringify(matched)}`)
+  }
+  const resolvedBillId = billId || matched[0]?.id
   if (resolvedBillId) {
-    try {
-      await api.putBusiness('/finance/dealingsBeginning/void', { id: resolvedBillId })
-    } catch {}
-    try {
-      await api.deleteBusiness(
-        `/finance/dealingsBeginning/delete?id=${encodeURIComponent(resolvedBillId)}`
-      )
-    } catch {}
+    await deleteOpeningBill(api, { billId: resolvedBillId, batchNo, role })
+  } else if (rows.length > 0) {
+    throw new Error(`期初清理未能唯一定位主单：batchNo=${batchNo}, role=${role}, rows=${JSON.stringify(rows)}`)
   }
+
   if (partnerId) {
-    try {
-      const detail = dataOf(await api.getBusiness(
+    const detail = dataOf(await api.getBusiness(
+      `/base/partner/get?id=${encodeURIComponent(partnerId)}`
+    ))
+    if (detail?.id) {
+      await api.deleteBusiness(`/base/partner/delete?id=${encodeURIComponent(partnerId)}`)
+      const remaining = dataOf(await api.getBusiness(
         `/base/partner/get?id=${encodeURIComponent(partnerId)}`
       ))
-      if (detail?.id) {
-        await api.deleteBusiness(`/base/partner/delete?id=${encodeURIComponent(partnerId)}`)
+      if (remaining?.id) {
+        throw new Error(`期初测试客商删除后仍可回读：partnerId=${partnerId}`)
       }
-    } catch {}
+    }
   }
 }
 
@@ -290,13 +373,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       const token = await login(page)
       const api = createApiClient({ token, record })
       try {
-        await runFmsWriteClosure({ caseId, api, caseRecord, outputDir })
+        await runFmsWriteClosure({ caseId, api, caseRecord, outputDir, page, record })
       } catch (error) {
         // 运行期后端异常（例如运行中 fat jar 被替换导致的类加载失败）不应伪装成业务通过，
         // 也不应吞掉证据：记录原始错误并保留 PARTIAL。
         caseRecord.notes.push(`FMS-005 写侧闭环未完成：${error.message}`)
       }
-      return catalogResult(
+      return recordFms005Acceptance(
         caseRecord,
         fmsDefinitions.find((definition) => definition.id === caseId)
       )
@@ -305,7 +388,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     if (caseId === 'FMS-006') {
       const token = await login(page)
       const api = createApiClient({ token, record })
-      await runFmsWriteClosure({ caseId, api, caseRecord, outputDir })
+      await runFmsWriteClosure({ caseId, api, caseRecord, outputDir, page, record })
+      return catalogResult(
+        caseRecord,
+        fmsDefinitions.find((definition) => definition.id === caseId)
+      )
+    }
+    if (['FMS-001', 'FMS-002', 'FMS-003', 'FMS-007'].includes(caseId)) {
+      const token = await login(page)
+      const api = createApiClient({ token, record })
+      await runFmsWriteClosure({ caseId, api, caseRecord, outputDir, page, record })
       return catalogResult(
         caseRecord,
         fmsDefinitions.find((definition) => definition.id === caseId)

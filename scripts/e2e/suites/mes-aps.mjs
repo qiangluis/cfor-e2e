@@ -1,4 +1,5 @@
 import { createApiClient } from '../lib/api.mjs'
+import { assertBusinessSuccess } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { ApsSchedulingFixture } from '../fixtures/mes-aps-write.mjs'
 
@@ -15,9 +16,7 @@ const SCHEME_STATUSES = new Set([
 const GATE_CODES = ['MATERIAL', 'EQUIPMENT', 'TEAM', 'CALENDAR']
 
 const unwrap = (response, label) => {
-  if (response?.code !== 200) {
-    throw new Error(`${label} 失败：${JSON.stringify(response)}`)
-  }
+  assertBusinessSuccess(response, label)
   return response && Object.prototype.hasOwnProperty.call(response, 'data')
     ? response.data
     : response
@@ -45,7 +44,10 @@ export const runCase = async ({ page, record, caseRecord, outputDir }) => {
 
 // PB-305：发布门禁 + 受控重排变更审计
 const runPublishGateCase = async ({ page, api, record, caseRecord, outputDir }) => {
-  const fixture = new ApsSchedulingFixture(api, record, caseRecord.id, { calculate: true })
+  const fixture = new ApsSchedulingFixture(api, record, caseRecord.id, {
+    calculate: true,
+    withOpeningInventory: true
+  })
   try {
     await fixture.setup(caseRecord)
     const versionId = fixture.versionId
@@ -90,9 +92,15 @@ const runPublishGateCase = async ({ page, api, record, caseRecord, outputDir }) 
 
     // 非本版本的排产结果必须被受控重排审批入口拒绝。
     const rejected = await api.request('POST', '/mes/aps/scheduling/change/submit-approval', {
-      versionId: Number(versionId),
+      versionId,
       resultIds: [-1],
       reason: `${fixture.marker} 受控重排负向校验`
+    }, {
+      expectedBusinessRejection: {
+        code: 500,
+        message: '存在不属于当前排产版本的受影响任务',
+        allowServiceCode: true
+      }
     })
     const rejectedMessage = rejected?.msg || rejected?.message || ''
     caseRecord.checks.push({
@@ -117,14 +125,17 @@ const runPublishGateCase = async ({ page, api, record, caseRecord, outputDir }) 
 
 // PB-303/304：五状态机 + 计算快照 + 比较指标
 const runSchemeSnapshotCase = async ({ page, api, record, caseRecord, outputDir }) => {
-  const fixture = new ApsSchedulingFixture(api, record, caseRecord.id, { calculate: true })
+  const fixture = new ApsSchedulingFixture(api, record, caseRecord.id, {
+    calculate: true,
+    withOpeningInventory: true
+  })
   try {
     await fixture.setup(caseRecord)
-    const versionId = Number(fixture.versionId)
+    const versionId = String(fixture.versionId)
 
     const pageResult = await api.getBusiness('/mes/aps/scheduling/page?pageNo=1&pageSize=100')
     const { data: pageData, rows } = pageRows(pageResult, '排产版本分页')
-    const ownRows = rows.filter((row) => Number(row?.id) === versionId)
+    const ownRows = rows.filter((row) => String(row?.id) === versionId)
     caseRecord.checks.push({
       name: '排产版本分页返回方案状态、算法版本、生成时间与快照字段且分页不超过 100',
       passed:

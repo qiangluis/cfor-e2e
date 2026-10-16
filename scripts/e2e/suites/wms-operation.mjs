@@ -1,10 +1,46 @@
 import { randomUUID } from 'node:crypto'
+import fs from 'node:fs'
 import { config } from '../config/index.mjs'
 import { createApiClient } from '../lib/api.mjs'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
 export const cases = ['WMS-OP-001']
+
+/**
+ * Map the real run against the frozen original catalog. Only structured
+ * VERIFIED evidence for every original assertion may set passCandidate.
+ */
+export function operationCatalogEvidence (caseRecord, evidence = {}) {
+  const catalog = JSON.parse(fs.readFileSync(new URL('../cases/catalog.json', import.meta.url), 'utf8'))
+  const definition = catalog.suites.flatMap((suite) => suite.cases)
+    .find((item) => item.id === 'WMS-OP-001')
+  if (!definition) throw new Error('缺少原 catalog 案例 WMS-OP-001')
+  caseRecord.catalogAssertions = (definition.assertions || []).map((assertion, index) => {
+    const item = evidence[index] || {}
+    const names = Array.isArray(item) ? item : item.checks || []
+    const checks = names.map((name) => caseRecord.checks.find((check) => check.name === name))
+    const verified = names.length > 0 && checks.every((check) => check?.passed === true)
+    return {
+      index,
+      assertion,
+      status: verified ? 'VERIFIED' : 'GAP',
+      evidenceChecks: names,
+      details: item.details || (verified
+        ? checks.map((check) => `${check.name}: ${check.details || ''}`).join('; ')
+        : (item.gap || '本轮未形成完整证据'))
+    }
+  })
+  caseRecord.remainingAssertions = caseRecord.catalogAssertions
+    .filter((item) => item.status === 'GAP').map((item) => item.assertion)
+  caseRecord.passCandidate = caseRecord.remainingAssertions.length === 0 &&
+    caseRecord.checks.length > 0 && caseRecord.checks.every((check) => check.passed !== false)
+  caseRecord.notes.push(
+    `原 catalog 未修改；PASS候选=${caseRecord.passCandidate}；` +
+    `剩余=${caseRecord.remainingAssertions.join('；') || '无'}`
+  )
+  return caseRecord
+}
 export const ASN_BASE = '/mes/wms/arrival-notice'
 export const ASN_ROUTE = '/wireSideWarehouse/arrivalNotice'
 export const FIXTURE_MARK = 'WMS-OP-001 dedicated e2e fixture'
@@ -205,6 +241,8 @@ export const runCase = async (args = {}, dependencies = {}) => {
   const api = (dependencies.createApiClient || createApiClient)({ token, record })
   const env = dependencies.env || process.env
   const missing = []
+  let draftContractVerified = false
+  let idempotencyVerified = false
   const check = (name, passed, details) => {
     caseRecord.checks.push({ name, passed: Boolean(passed), details })
     if (!passed) throw new Error(name)
@@ -268,6 +306,7 @@ export const runCase = async (args = {}, dependencies = {}) => {
         }))
         assertReceiptDraft(bill, entries, notice, request)
         check('已有 101 草稿详情与 ASN 明细真实关联', true, `bill=${bill.id}; entries=${entries.length}`)
+        draftContractVerified = true
       } else missing.push(`101 单据 ${row.id} 非草稿；仅回读，不推断审核和库存闭环`)
     }
     caseRecord.fixtures = [...(caseRecord.fixtures || []), {
@@ -342,11 +381,13 @@ export const runCase = async (args = {}, dependencies = {}) => {
       const entries = operationRows(await api.getBusiness(`/mes/stkIo/queryEntryByMainId?id=${encodeURIComponent(createdId)}`), '新建 101 明细')
       assertReceiptDraft(bill, entries, notice, request)
       check('真实收货开单只生成可删除的 101 未审核草稿', true, `bill=${createdId}; key=${key}; entries=${entries.length}`)
+      draftContractVerified = true
       const retried = dataOf(await api.postBusiness(`${ASN_BASE}/create-receipt-bill?id=${encodeURIComponent(notice.id)}`, request), '收货幂等重试')
       check('同一收货请求幂等返回同一草稿 ID', sameId(retried, createdId), `first=${createdId}; retry=${retried}`)
       const after = await readBills(notice.id)
       check('同一 ASN 仅新增一张真实 101 草稿', after.total === 1 && after.rows.length === 1 &&
         sameId(after.rows[0].id, createdId), `total=${after.total}`)
+      idempotencyVerified = true
       check('草稿未推进 ASN 收货数量或采购订单入库数量', before === sourceSnapshot(
         await readNotice(notice.id), await readOrder(order.id)), `ASN=${notice.id}; order=${order.id}`)
     } catch (error) {
@@ -384,6 +425,37 @@ export const runCase = async (args = {}, dependencies = {}) => {
     }
     if (operationError) throw operationError
   } else missing.push('写侧未显式启用；未生成、重试或删除入库草稿')
+  const draftCheckName = writeRequested
+    ? '真实收货开单只生成可删除的 101 未审核草稿'
+    : '已有 101 草稿详情与 ASN 明细真实关联'
+  const operationEvidence = {
+    0: draftContractVerified
+      ? [draftCheckName]
+      : { gap: '未取得 101 收货草稿与 ASN 来源一致的真实证据，ASN 单一事实源未闭环' },
+    1: { gap: '收货月台容量/预约档位属 WMS 设置主数据，本轮未构造专属月台与档位' },
+    2: { gap: '月台容量校验与超容量排队需要专属启用月台、工作日和预约档位夹具' },
+    3: { gap: 'ASN 预约关联采购订单与预计到货时间未取专属预约样本' },
+    4: { gap: '短收差异原因与 RECEIPT_DIFFERENCE 异常未构造专属短收收货请求' },
+    5: idempotencyVerified
+      ? ['同一收货请求幂等返回同一草稿 ID', '同一 ASN 仅新增一张真实 101 草稿']
+      : { gap: '未在写侧夹具下取得同一幂等键重试返回同一草稿的证据' },
+    6: { gap: 'PB-297 上架建议 FIFO 与目标库位查询属 WMS 上架作业，未构造专属库位样本' },
+    7: { gap: 'PB-297 库位容量空值/非空预留校验未构造专属库位容量夹具' },
+    8: { gap: 'PB-298 自动组波只编排销售发货通知 PICK 任务，需专属发货通知与 PICK 任务夹具' },
+    9: { gap: 'PB-299 拣货确认现场数量与短拣上报需专属 PICK 任务与库位夹具' },
+    10: { gap: 'PB-300 复核并入装箱核验需专属 PICK 结果与装箱明细夹具' },
+    11: { gap: 'PB-301 发运交接复用 ASN out/装箱结果/SHIP 任务，需专属运输车辆档案' },
+    12: { gap: 'PB-301 SHIP 任务详情回读物流公司/单号/车辆未构造专属 SHIP 任务' },
+    13: { gap: 'PB-302 异常附件统一文件地址与关闭回写需专属异常单夹具' },
+    14: { gap: 'PB-302 异常日志 CREATE/START/CLOSE 前后值与附件地址需专属异常单夹具' },
+    15: { gap: '自动组波单波上限来自 warehouse/wave 配置，未构造专属波次配置夹具' },
+    16: { gap: '自动组波创建只写 wms_wave 并回填 wms_task.wave_id，需专属波次创建证据' },
+    17: draftContractVerified
+      ? [draftCheckName]
+      : { gap: '未取得 stock_io_type=101 待审核采购入库草稿的真实证据' },
+    18: { gap: '审核链路完成后才回写收货数量并影响库存未执行；草稿阶段已证明不回写，审核阶段需专属库存对账夹具' }
+  }
+  operationCatalogEvidence(caseRecord, operationEvidence)
   missing.push('未执行审核/弃审、质检放行、库存余额及流水对账；未覆盖 catalog 其余现场作业断言')
   const note = `PARTIAL：${[...new Set(missing)].join('；')}。HTTP 200、页面渲染及空集不视为完整 PASS。`
   caseRecord.notes.push(note)

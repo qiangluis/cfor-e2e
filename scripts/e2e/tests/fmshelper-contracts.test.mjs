@@ -54,11 +54,42 @@ test('partial evidence never completes missing catalog assertions or masks an ea
   assert.equal(catalogResult(record, definition).partial, true)
   assert.equal(record.passCandidate, false)
   assert.deepEqual(record.remainingAssertions.map((item) => item.assertion), ['posted', 'reversed'])
+  assert.deepEqual(record.catalogAssertions, [
+    { index: 0, assertion: 'confirmed', status: 'VERIFIED', evidence: 'browser confirmation' },
+    { index: 1, assertion: 'posted', status: 'GAP', evidence: '尚无本轮真实闭环证据' }
+  ])
+  assert.deepEqual(record.catalogReverseAssertions, [
+    { index: 0, assertion: 'reversed', status: 'GAP', evidence: '尚无本轮真实闭环证据' }
+  ])
+  assert.equal(record.catalogAssertions.some((item) => item.assertion === 'reversed'), false)
   proof(record, 'posted', false, 'posting failed')
   proof(record, 'posted', true, 'later unrelated success')
   proof(record, 'reversed', true, 'reversal proof')
   assert.equal(catalogResult(record, definition).partial, true)
   assert.equal(record.catalogEvidence.posted.status, 'FAIL')
+  assert.deepEqual(record.catalogAssertions.map((item) => item.status), ['VERIFIED', 'GAP'])
+  assert.deepEqual(record.catalogReverseAssertions.map((item) => item.status), ['VERIFIED'])
+})
+
+test('complete FMS evidence emits strict indexed positive mappings without exposing reverse indexes', () => {
+  const record = { checks: [], notes: [] }
+  const definition = { assertions: ['created', 'posted'], reverse: ['reversed'] }
+  proof(record, 'created', true, 'create response and readback')
+  proof(record, 'posted', true, 'posting response and ledger readback')
+  proof(record, 'reversed', true, 'reversal response and ledger readback')
+
+  const result = catalogResult(record, definition)
+
+  assert.equal(result.partial, false)
+  assert.equal(record.passCandidate, true)
+  assert.equal(record.remainingAssertions.length, 0)
+  assert.deepEqual(record.catalogAssertions.map(({ index, assertion, status }) => ({ index, assertion, status })), [
+    { index: 0, assertion: 'created', status: 'VERIFIED' },
+    { index: 1, assertion: 'posted', status: 'VERIFIED' }
+  ])
+  assert.deepEqual(record.catalogReverseAssertions.map(({ index, assertion, status }) => ({ index, assertion, status })), [
+    { index: 0, assertion: 'reversed', status: 'VERIFIED' }
+  ])
 })
 
 test('receipt mapping uses the real ERP event, existing accounts and source-line amounts without auxiliary fabrication', () => {

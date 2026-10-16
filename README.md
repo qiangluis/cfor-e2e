@@ -1,7 +1,7 @@
 # CFOR E2E
 
 独立自动化仓库，使用 `playwright-core` 和本机真实 Chrome。案例来源为
-`scripts/e2e/cases/catalog.json`，当前有 34 个套件、268 个案例。
+`scripts/e2e/cases/catalog.json`，当前有 47 个套件、310 个案例。
 `READY/PARTIAL/DESIGNED/BLOCKED` 是实现状态，不是验收结果。
 
 ## 本地执行

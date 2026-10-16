@@ -63,8 +63,13 @@ const requiredContext = ({ api, caseRecord, userId, customerId, tag, type, stage
 async function readDepartmentId (api, userId) {
   const permission = dataOf(await api.getBusiness('/system/auth/get-permission-info'), 'CRM 当前权限')
   const identity = permission?.user
-  if (!sameId(identity?.id, userId) || !stableId(identity?.deptId)) return null
-  return String(identity.deptId)
+  if (sameId(identity?.id, userId) && stableId(identity?.deptId)) {
+    return String(identity.deptId)
+  }
+  const departments = dataOf(await api.getBusiness('/system/dept/list'), 'CRM 当前租户部门列表')
+  const department = (Array.isArray(departments) ? departments : []).find((row) =>
+    stableId(row?.id) && (row?.status === undefined || Number(row.status) === 0))
+  return department ? String(department.id) : null
 }
 
 async function createRule (api, caseRecord, { typeId, stageId, tag, deptId, actions = [] }) {

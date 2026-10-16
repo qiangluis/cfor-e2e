@@ -13,7 +13,7 @@ import { addCheck, caseOutcome, createCaseRecord, createRunRecord, ensureDir, fi
 export const cases = Object.freeze(['PB032-006'])
 const data = (body) => assertBusinessSuccess(body, 'material capability API').data
 const fields = ['id', 'code', 'name', 'remark', 'unitId', 'inventoryNature', 'source',
-  'purchased', 'saled', 'produced', 'isMaterial', 'parented', 'assembled', 'defaultProdBom',
+  'purchased', 'saled', 'produced', 'isMaterial', 'defaultProdBom',
   'leadTime', 'bufferTime', 'isEnabled', 'batchManaged', 'gradeManaged', 'periodManaged']
 const snapshot = (row) => Object.fromEntries(fields.map((field) => [field, row?.[field] ?? null]))
 const fact = (record, label, passed, details) => {
@@ -44,8 +44,7 @@ export function materialBody(unitId, code, marker, component = false) {
   return {
     code, name: code, unitId: String(unitId), remark: marker,
     isEnabled: 1, inventoryNature: 'STOCK', virtualGoods: 'N', source: 'mixed',
-    purchased: 'Y', saled: 'Y', produced: 'Y', parented: component ? 'N' : 'Y',
-    isMaterial: component ? 'Y' : 'N', assembled: 'N', soned: 'N',
+    purchased: 'Y', saled: 'Y', produced: 'Y', isMaterial: 'Y',
     batchManaged: 'N', oneBarcode: 'N', periodManaged: 'N', gradeManaged: 'N',
     colorManaged: 'N', brandManaged: 'N', backflush: 'N',
     leadTime: 1, bufferTime: 1, refPrice: 88.8, refCost: 50
@@ -149,7 +148,7 @@ export class MaterialCapabilityFixtures {
   async materialState(resource, stage) {
     const api = await this.read(resource)
     const database = await this.query(stage,
-      `SELECT id,code,purchased,saled,produced,is_material,parented,assembled,source,
+      `SELECT id,code,purchased,saled,produced,is_material,source,
        inventory_nature,unit_id,COALESCE(default_prod_bom,''),lead_time,buffer_time
        FROM mes_bas_material WHERE tenant_id=1 AND deleted=0 AND id='${resource.id}'`)
     return { api: snapshot(api), database }
@@ -215,9 +214,15 @@ export class MaterialCapabilityFixtures {
         }
         const parameter = ['purchase', 'sale'].includes(resource.kind) ? 'ids' : 'id'
         data(await this.api.deleteBusiness(`${meta.remove}?${parameter}=${resource.id}`))
-        const response = await this.api.get(`${meta.get}?id=${resource.id}`)
-        const absent = ['material', 'bom', 'production'].includes(resource.kind)
-          ? response?.success === false && (response.message || response.msg) === '未找到对应数据'
+        const legacyDetail = ['material', 'bom', 'production'].includes(resource.kind)
+        const response = await this.api.get(`${meta.get}?id=${resource.id}`, legacyDetail
+          ? { expectedBusinessRejection: {
+              code: 500, message: '未找到对应数据', allowServiceCode: true
+            } }
+          : undefined)
+        const absent = legacyDetail
+          ? response?.code === 500 && response?.success === false &&
+            (response.message || response.msg) === '未找到对应数据'
           : assertBusinessSuccess(response, 'cleanup readback').data == null
         fact(this.record, `${resource.kind} 正式删除后 API 回读不存在`, absent, { id: resource.id, response })
         const counts = await this.query(`cleanup-${resource.kind}`, [
@@ -263,15 +268,17 @@ async function verifyPage(context, fixtures, material) {
   const dialog = page.locator('.el-dialog:visible').filter({ has: page.locator('.material-form-shell') }).last()
   await dialog.waitFor({ state: 'visible' })
   const capabilities = {}
-  for (const label of ['可采购', '可销售', '可生产', '是否成品', '是否物料']) {
+  for (const label of ['可采购', '可销售', '可生产', '是否物料']) {
     const formItem = dialog.locator('.el-form-item').filter({
       has: page.locator('.el-form-item__label').getByText(label, { exact: true })
     }).first()
     await formItem.waitFor({ state: 'visible' })
-    capabilities[label] = await formItem.locator('input[type=checkbox]').isChecked()
+    capabilities[label] = await formItem.locator('.el-checkbox__input').evaluate(
+      (element) => element.classList.contains('is-checked')
+    )
   }
   fact(caseRecord, '专属存货编辑页真实读取采购/销售/生产/BOM能力',
-    capabilities['可采购'] && capabilities['可销售'] && capabilities['可生产'] && capabilities['是否成品'],
+    capabilities['可采购'] && capabilities['可销售'] && capabilities['可生产'] && capabilities['是否物料'],
     { code: material.identity, capabilities })
   caseRecord.evidence.push(await saveScreenshot(page, outputDir, 'PB032-006-capabilities', record))
   await dialog.getByRole('button', { name: /取\s*消/ }).last().click()
@@ -312,12 +319,22 @@ export async function runCase(context, dependencies = {}) {
     const parent = await fixtures.create('material', materialBody(template.unitId, `${fixtures.marker}-FG`, fixtures.marker))
     const component = await fixtures.create('material', materialBody(template.unitId, `${fixtures.marker}-RM`, fixtures.marker, true))
     const material = await fixtures.read(parent)
+    const existingSupplier = asList(data(await api.getBusiness(
+      '/base/partner/simple-list?roleType=SUPPLIER'
+    ))).find((row) => /^[1-9]\d*$/.test(String(row?.id)))
+    const existingCustomer = asList(data(await api.getBusiness(
+      '/base/partner/simple-list?roleType=CUSTOMER'
+    ))).find((row) => /^[1-9]\d*$/.test(String(row?.id)))
+    if (!existingSupplier?.id || !existingCustomer?.id) {
+      throw new Error('BLOCKED: no enabled supplier/customer available for material capability references')
+    }
     await attempt([0], () => (dependencies.verifyPage || verifyPage)(context, fixtures, parent))
     for (const [kind, index, field, capability] of [
       ['purchase', 1, 'purchased', '可采购能力'], ['sale', 2, 'saled', '可销售能力']
     ]) {
       await attempt([index], async () => {
-        const body = orderBody(kind, fixtures.marker, material, '1')
+        const partnerId = kind === 'purchase' ? existingSupplier.id : existingCustomer.id
+        const body = orderBody(kind, fixtures.marker, material, partnerId)
         if (kind === 'purchase') {
           const permissions = data(await api.getPermissionInfo())
           if (!(permissions.permissions || []).some((permission) =>
@@ -327,15 +344,7 @@ export async function runCase(context, dependencies = {}) {
           body.directCreate = 1
           body.directCreateReason = `${fixtures.marker} isolated capability protection`
         }
-        const partner = await fixtures.create('partner', {
-          name: `${fixtures.marker}-${kind === 'purchase' ? 'SUP' : 'CUS'}`,
-          shortName: fixtures.marker, partnerKind: 'ORGANIZATION', status: 'ACTIVE',
-          customerEnabled: kind === 'sale', supplierEnabled: kind === 'purchase',
-          carrierEnabled: false, remark: fixtures.marker
-        })
-        body[kind === 'purchase' ? 'supplierId' : 'customerId'] = partner.id
         await fixtures.ownership(parent)
-        await fixtures.ownership(partner)
         const order = await fixtures.create(kind, body)
         const orderDetail = await fixtures.read(order)
         const refs = await fixtures.query(`open-${kind}`,
@@ -368,8 +377,13 @@ export async function runCase(context, dependencies = {}) {
       fact(caseRecord, '生产 BOM 专属母子件引用真实存在',
         refs.length === 1 && refs[0][1] === parent.id && refs[0][2] === 'PRODUCTION' &&
         refs[0][3] === component.id, refs)
-      await fixtures.reject(parent, 'parented', '材料或 BOM 结构能力')
-      await fixtures.reject(component, 'isMaterial', '材料或 BOM 结构能力')
+      await fixtures.api.postBusiness(`/mes/wmsAssemble/publish?id=${encodeURIComponent(bom.id)}`)
+      const published = await fixtures.read(bom)
+      fact(caseRecord, '生产 BOM 发布后研发状态为已启用',
+        Number(published?.devStatus) === 2,
+        { bomId: bom.id, devStatus: published?.devStatus })
+      await fixtures.reject(parent, 'isMaterial', '材料能力')
+      await fixtures.reject(component, 'isMaterial', '材料能力')
     })
     await attempt([3], async () => {
       if (!bom) throw new Error('BLOCKED: owned production BOM not created')

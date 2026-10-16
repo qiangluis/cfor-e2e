@@ -20,10 +20,17 @@ const definitions = new Map(catalog.suites.flatMap((suite) =>
 ))
 
 test('implemented read-only cases are executable but retain incomplete acceptance', () => {
+  const explicitlyComplete = new Set([
+    'PB033-001',
+    'QUALITY-BASE-004',
+    'QUALITY-BASE-005'
+  ])
   for (const id of [...DESIGNED_INIT_ENABLE_CASES, ...DESIGNED_MES_BASE_ENABLE_CASES,
     ...crmReadOnlyCases, ...procurementPartialReadOnlyCases, ...iotFoundationReadonlyCases]) {
     if (ownedInitCases.includes(id)) {
       assert.ok(['PARTIAL', 'READY'].includes(definitions.get(id)?.status), id)
+    } else if (explicitlyComplete.has(id)) {
+      assert.equal(definitions.get(id)?.status, 'READY', id)
     } else {
       assert.equal(definitions.get(id)?.status, 'PARTIAL', id)
     }
@@ -32,8 +39,10 @@ test('implemented read-only cases are executable but retain incomplete acceptanc
 
 test('IoT foundation integration exposes telemetry and capacity as read-only partial cases', () => {
   const source = fs.readFileSync(new URL('../suites/iot.mjs', import.meta.url), 'utf8')
-  assert.match(source, /if \(caseId === 'IOT-001'\) \{\s+return await runIotFoundationReadonlyCase\(/)
-  assert.match(source, /if \(caseId === 'IOT-002' \|\| caseId === 'IOT-003'\) \{\s+return await runIotReadonlyCase\(/)
+  assert.match(source, /if \(caseId === 'IOT-001'\) \{\s+const helpers = \{/)
+  assert.match(source, /return await runFoundationReadonlyCase\(\s+\{ caseId, page, record, caseRecord, outputDir \},\s+helpers\s+\)/)
+  assert.match(source, /if \(caseId === 'IOT-002'\) \{\s+return await runIotWriteCase\(/)
+  assert.match(source, /if \(caseId === 'IOT-003'\) \{\s+return await runIotReadonlyCase\(/)
   for (const id of ['IOT-002', 'IOT-003']) assert.equal(definitions.get(id)?.status, 'PARTIAL', id)
 })
 
@@ -56,7 +65,10 @@ test('only registered local owned initialization fixtures are executable without
     'PB004-001', 'PB005-001', 'PB007-001', 'PB008-001', 'PB008-002'
   ])
   const source = fs.readFileSync(new URL('../suites/init.mjs', import.meta.url), 'utf8')
-  assert.match(source, /if \(ownedInitCases\.includes\(caseId\)\) return runOwnedInitCase/)
+  assert.match(
+    source,
+    /if \(ownedInitCases\.includes\(caseId\)[\s\S]*?return runOwnedInitCase\(context, dependencies\)/
+  )
   for (const id of ownedInitCases) {
     assert.ok(['PARTIAL', 'READY'].includes(definitions.get(id)?.status), id)
     assert.ok(definitions.get(id)?.assertions?.length > 0, id)

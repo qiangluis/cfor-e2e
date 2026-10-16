@@ -41,7 +41,7 @@ export const PROCUREMENT_SOURCE_GATE_CHECKS = Object.freeze({
   purchaseInvoiceUnconfirmed: 'PROC-004 未确认采购对账来源创建采购发票被拒绝',
   purchaseInvoiceSource: 'PROC-004 已确认采购对账来源创建发票并保留来源快照',
   saleInvoiceUnconfirmed: 'PROC-004 销售对账启用后未确认应收不能创建销售发票',
-  saleInvoiceSource: 'PROC-004 已确认应收来源创建销售发票并保留来源快照'
+  saleInvoiceSource: 'PROC-004 已确认销售对账来源创建销售发票并保留来源快照'
 })
 
 const check = (caseRecord, name, passed, details = '') => {
@@ -385,16 +385,20 @@ export async function runProcurementSourceGates ({
         ? await createSaleInvoiceEvidence({ privilegedApi, caseRecord })
         : null)
     if (!actualSaleInvoiceEvidence?.invoice || !actualSaleInvoiceEvidence?.receivableId ||
-        !actualSaleInvoiceEvidence?.version) {
+        !actualSaleInvoiceEvidence?.version ||
+        !Array.isArray(actualSaleInvoiceEvidence?.entryIds) ||
+        actualSaleInvoiceEvidence.entryIds.length === 0) {
       gap(caseRecord, PROCUREMENT_SOURCE_GATE_CHECKS.saleInvoiceSource,
-        '缺少通过专属销售订单正规生成并确认的应收及销售发票详情；本 helper 不手工创建应收或伪造确认')
+        '缺少通过专属销售订单正规完成销售对账并生成销售发票的详情；本 helper 不手工创建应收或伪造确认')
     } else {
       const sourceIds = String(actualSaleInvoiceEvidence.invoice.reconciliationSourceIds || '')
       const sourceVersions = String(actualSaleInvoiceEvidence.invoice.reconciliationSourceVersions || '')
       const passed = actualSaleInvoiceEvidence.invoice.reconciliationSourceType === 'FIN_RECEIVABLE' &&
-        sourceIds.split(',').includes(String(actualSaleInvoiceEvidence.receivableId)) &&
+        actualSaleInvoiceEvidence.entryIds.every((entryId) =>
+          sourceIds.split(',').includes(String(entryId))) &&
         sourceVersions.includes(String(actualSaleInvoiceEvidence.version))
       check(caseRecord, PROCUREMENT_SOURCE_GATE_CHECKS.saleInvoiceSource, passed,
+        `entryIds=${actualSaleInvoiceEvidence.entryIds.join(',')}; ` +
         `receivableId=${actualSaleInvoiceEvidence.receivableId}; version=${actualSaleInvoiceEvidence.version}`)
       if (!passed) throw new Error('PROC-004 销售发票未保存确认应收来源快照')
     }

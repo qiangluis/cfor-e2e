@@ -9,10 +9,15 @@ const cwd = fileURLToPath(new URL('../../../', import.meta.url))
 const probe = (overrides = {}) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('CFOR_')))
   const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
-    import { config } from './scripts/e2e/config/index.mjs'
+    import { config, environmentSummary } from './scripts/e2e/config/index.mjs'
     console.log(JSON.stringify({
       target: config.target, web: config.webBase, api: config.apiBase,
-      request: config.requestTimeoutMs, browser: config.browserTimeoutMs
+      request: config.requestTimeoutMs, browser: config.browserTimeoutMs,
+      hrmUsername: config.hrmApproverUsername,
+      hrmPasswordConfigured: Boolean(config.hrmApproverPassword),
+      hrmPasswordMatchesTest: config.hrmApproverPassword === 'hrm-unit-test-only',
+      summaryHrmUsername: environmentSummary().hrmApproverUsername,
+      summaryIncludesPassword: Object.keys(environmentSummary()).some((key) => /password/i.test(key))
     }))
   `], { cwd, env: { ...env, ...overrides }, encoding: 'utf8' })
   return JSON.parse(output)
@@ -48,6 +53,25 @@ test('missing, zero, negative and invalid timeout values use bounded defaults', 
     assert.equal(result.browser, 60000)
   }
   assert.equal(probe({ CFOR_E2E_BROWSER_TIMEOUT_MS: '15000' }).browser, 15000)
+})
+
+test('optional HRM approval credentials require an explicit password and keep it out of summaries', () => {
+  const absent = probe({
+    CFOR_HRM_APPROVER_USERNAME: 'hrmgr01', CFOR_HRM_APPROVER_PASSWORD: '',
+    CFOR_PASSWORD: 'hrm-unit-test-only', CFOR_FINANCE_APPROVER_PASSWORD: 'hrm-unit-test-only'
+  })
+  assert.equal(absent.hrmUsername, 'hrmgr01')
+  assert.equal(absent.hrmPasswordConfigured, false)
+  assert.equal(absent.hrmPasswordMatchesTest, false)
+  assert.equal(absent.summaryIncludesPassword, false)
+  const configured = probe({
+    CFOR_HRM_APPROVER_USERNAME: 'hrm-test', CFOR_HRM_APPROVER_PASSWORD: 'hrm-unit-test-only'
+  })
+  assert.equal(configured.hrmUsername, 'hrm-test')
+  assert.equal(configured.hrmPasswordConfigured, true)
+  assert.equal(configured.hrmPasswordMatchesTest, true)
+  assert.equal(configured.summaryHrmUsername, 'hrm-test')
+  assert.equal(configured.summaryIncludesPassword, false)
 })
 
 test('empty, incomplete and skipped-only reports never pass', () => {

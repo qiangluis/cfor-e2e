@@ -34,3 +34,30 @@ test('ignores only aborted media requests caused by expected page teardown', () 
     false
   )
 })
+
+test('ignores the exact local root fetch cancelled while warming dynamic routes', () => {
+  assert.equal(
+    isExpectedRequestFailure({
+      resourceType: 'fetch',
+      error: 'net::ERR_ABORTED',
+      url: 'http://127.0.0.1:9151/'
+    }),
+    true
+  )
+  assert.equal(
+    isExpectedRequestFailure({
+      resourceType: 'fetch',
+      error: 'net::ERR_ABORTED',
+      url: 'http://127.0.0.1:9151/admin-api/mes/monitor/workplaces'
+    }),
+    false
+  )
+  assert.equal(
+    isExpectedRequestFailure({
+      resourceType: 'fetch',
+      error: 'net::ERR_ABORTED',
+      url: 'http://example.com/'
+    }),
+    false
+  )
+})

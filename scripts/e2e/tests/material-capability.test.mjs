@@ -140,7 +140,12 @@ test('finally cleans a material already created before the next prerequisite fai
       removed = true
       return success(true)
     },
-    get: async () => ({ code: 500, success: false, message: '未找到对应数据' })
+    get: async (_pathname, options) => {
+      assert.deepEqual(options, { expectedBusinessRejection: {
+        code: 500, message: '未找到对应数据', allowServiceCode: true
+      } })
+      return { code: 500, success: false, message: '未找到对应数据' }
+    }
   }
   const result = await runCase({ caseId: cases[0], caseRecord, record: { environment: {} } }, {
     config: local, assertLocalWriteSafety: async () => {},

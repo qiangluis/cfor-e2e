@@ -119,7 +119,8 @@ async function procurementWriteHarness ({ target = 'local', database = true, saf
         events.push('safety')
         if (safetyError) throw safetyError
       },
-      runReadOnlySql: async () => assert.fail('wrapper must not execute a real SQL command')
+      runReadOnlySql: async () => assert.fail('wrapper must not execute a real SQL command'),
+      runLocalFixtureSql: async () => assert.fail('wrapper must not execute a fixture SQL mutation')
     },
     '../fixtures/procurement-settle-rule-write.mjs': {
       createSettleRuleWriteFixture: async () => {
@@ -375,6 +376,15 @@ test('PROC-006 same-code version list cannot contain two enabled rules', async (
     '/erp/settle-method-rule/list-by-code?settleMethodCode=BANK':
       ok([row, { ...row, id: 99, version: 1 }])
   }), /至多一条启用规则/)
+})
+
+test('PROC-006 write branch records fixture completion and matches the permission rejection contract', () => {
+  const source = fs.readFileSync(new URL('../suites/procurement.mjs', import.meta.url), 'utf8')
+  const branch = source.slice(source.indexOf("if (caseId === 'PROC-006')"))
+  assert.match(branch, /write\.fixture\.status = 'verified'/)
+  assert.match(branch, /retainedOrderIds/)
+  assert.match(branch, /expectedBusinessRejection:\s*\{[\s\S]*code:\s*403[\s\S]*message:\s*'没有该操作权限'/)
+  assert.doesNotMatch(branch, /code:\s*['"]throw['"]/)
 })
 
 test('PROC-008 rejects wrong document type reference and non-PURCHASE type', async () => {

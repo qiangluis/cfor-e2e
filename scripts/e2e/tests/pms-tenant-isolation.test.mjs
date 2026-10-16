@@ -33,11 +33,71 @@ test('PMS isolation package keeps only enabled 111 menu parent chains', () => {
   assert.ok(plan.excluded.some((row) => row.sourceId === '10' && /不可分配|停用/.test(row.reason)))
 })
 
-test('PMS isolation package blocks forced menus outside the 111 authorization boundary', () => {
-  assert.throws(() => buildPmsIsolationPackage({
+test('PMS isolation package leaves bootstrap base menus to the backend without expanding package 111', () => {
+  const plan = buildPmsIsolationPackage({
     standardPackage: { menuIds: rows.filter((row) => row.id !== 2).map((row) => row.id) }, menus: rows,
     assignableMenus: rows
-  }), /强制菜单越过111授权/)
+  })
+  assert.ok(plan.baseMenuIds.includes('2'))
+  assert.ok(!plan.menuIds.includes(2))
+})
+
+test('PMS isolation package ignores disabled bootstrap descendants and retains enabled aliases', () => {
+  const menus = [...rows,
+    { id: 11, parentId: 7, status: 1, permission: 'system:onboarding:update' },
+    { id: 12, parentId: 1, status: 0, component: 'system/dept/index', permission: '' },
+    { id: 13, parentId: 11, status: 0, permission: 'system:onboarding:query' }
+  ]
+  const plan = buildPmsIsolationPackage({
+    standardPackage: { menuIds: rows.map((row) => row.id) },
+    menus,
+    assignableMenus: menus.filter((row) => ![9, 10, 11, 12, 13].includes(row.id))
+  })
+  assert.ok(plan.baseMenuIds.includes('12'))
+  assert.ok(!plan.menuIds.includes(12))
+  assert.ok(!plan.menuIds.includes(11))
+  assert.ok(!plan.menuIds.includes(13))
+})
+
+test('PMS isolation package blocks enabled bootstrap menus not assignable to the caller', () => {
+  assert.throws(() => buildPmsIsolationPackage({
+    standardPackage: { menuIds: rows.map((row) => row.id) },
+    menus: rows, assignableMenus: rows.filter((row) => row.id !== 2)
+  }), /强制菜单或父链已停用：2/)
+})
+
+test('PMS isolation package still rejects a business query permission outside package 111', () => {
+  assert.throws(() => buildPmsIsolationPackage({
+    standardPackage: { menuIds: rows.filter((row) => row.id !== 8).map((row) => row.id) },
+    menus: rows, assignableMenus: rows
+  }), /专属套餐缺少 pms:pm:project:query/)
+})
+
+test('PMS isolation package excludes cyclic parent chains without including their permissions', () => {
+  const menus = [...rows,
+    { id: 11, parentId: 12, status: 0, permission: 'cyclic:query' },
+    { id: 12, parentId: 11, status: 0, permission: 'cyclic:update' },
+    { id: 13, parentId: 13, status: 0, permission: 'self:query' }
+  ]
+  const plan = buildPmsIsolationPackage({
+    standardPackage: { menuIds: menus.map((row) => row.id) },
+    menus,
+    assignableMenus: menus
+  })
+  for (const id of [11, 12, 13]) {
+    assert.ok(!plan.menuIds.includes(id))
+    assert.ok(plan.excluded.some((row) => row.sourceId === String(id) && /循环/.test(row.reason)))
+  }
+  assert.ok(plan.menuIds.includes(8))
+})
+
+test('PMS isolation package rejects a required business menu with a cyclic parent chain', () => {
+  const menus = rows.map((row) => row.id === 8 ? { ...row, parentId: 8 } : row)
+  assert.throws(() => buildPmsIsolationPackage({
+    standardPackage: { menuIds: menus.map((row) => row.id) },
+    menus,
+    assignableMenus: menus
+  }), /专属套餐缺少 pms:pm:project:query/)
 })
 
 test('PMS isolation tenant uses dedicated package and retires tenant before package', async () => {

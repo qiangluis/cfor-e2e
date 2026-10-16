@@ -610,6 +610,16 @@ try {
     })
   })
 
+  await page.goto(`${webBase}/login`, { waitUntil: 'domcontentloaded' })
+  await page.getByPlaceholder('请输入采购方提供的数字租户编号，例如 1').fill('ZC-1010-供应商002')
+  await page.getByPlaceholder('请输入供应商账号').fill('supplier01')
+  await page.getByPlaceholder('请输入密码').fill('supplier-pass-123')
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await page
+    .getByText('企业编号必须是数字租户编号，不能填写供应商名称或供应商编码')
+    .waitFor({ state: 'visible' })
+  assert.equal(requests.length, 0)
+
   await page.goto(`${webBase}/accept-invite?tenantId=1001&token=invite-token`, {
     waitUntil: 'domcontentloaded'
   })

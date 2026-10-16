@@ -27,7 +27,10 @@ export const OWNED_CATALOG_ASSERTIONS = Object.freeze({
 export const WORKBENCH_FIXTURE_DEPENDENCIES = Object.freeze({
   'WBF-004': Object.freeze({
     catalogNeedsProject: false,
-    projectDependentEnhancements: ['日报非空、日报状态及跨用户日报数据权限反例'],
+    projectDependentEnhancements: [
+      '日报非空、日报状态及跨用户日报数据权限反例',
+      'PMS 日报保存/读取须先确认项目成员、填报人归属及数据权限校验，不能只凭 projectId/reporterId 写入'
+    ],
     independent: ['三类页签/门户路由', 'CRM 周/月专属草稿回读与展示']
   }),
   'WBF-005': Object.freeze({
@@ -37,7 +40,10 @@ export const WORKBENCH_FIXTURE_DEPENDENCIES = Object.freeze({
   }),
   'WBF-008': Object.freeze({
     catalogNeedsProject: false,
-    projectDependentEnhancements: ['日报已填及日报非零待审批提醒反例'],
+    projectDependentEnhancements: [
+      '日报已填及日报非零待审批提醒反例',
+      'PMS 日报保存/读取须先确认项目成员、填报人归属及数据权限校验，不能只凭 projectId/reporterId 写入'
+    ],
     independent: ['三类提醒负例与 CRM 草稿正例', '用户偏好 UI 保存/DB 回读/刷新/隔离/还原']
   }),
   'WBF-009': Object.freeze({
@@ -47,7 +53,10 @@ export const WORKBENCH_FIXTURE_DEPENDENCIES = Object.freeze({
   }),
   'WBF-012': Object.freeze({
     catalogNeedsProject: false,
-    projectDependentEnhancements: ['日报非空跨周期/状态统计'],
+    projectDependentEnhancements: [
+      '日报非空跨周期/状态统计',
+      'PMS 日报保存/读取须先确认项目成员、填报人归属及数据权限校验，不能只凭 projectId/reporterId 写入'
+    ],
     independent: ['CRM 草稿非空本人跨周期统计', '统计入口/关闭'],
     nonProjectBlockers: ['CRM 团队查询固定本人', 'PMS 团队数据权限过滤未确认']
   })
@@ -62,7 +71,7 @@ export function recordCatalogAssertion (caseRecord, caseId, index, status, detai
   const existing = caseRecord.catalogAssertions.find((row) =>
     row.caseId === caseId && row.assertion === assertion)
   if (existing) throw new Error('工作台原断言重复登记')
-  caseRecord.catalogAssertions.push({ caseId, assertion, status, details })
+  caseRecord.catalogAssertions.push({ caseId, index, assertion, status, details, evidence: details })
   if (status === 'FAILED') {
     caseRecord.checks.push({ name: assertion, passed: false, details })
   }
@@ -83,4 +92,23 @@ export function ownedCaseConclusion (caseId, caseRecord, gaps = []) {
   return remaining.length
     ? { partial: true, catalogComplete: caseRecord.catalogComplete, note: remaining.join('；') }
     : { catalogComplete: true, note: '所有 catalog 原断言均有本轮证据；最终状态还需 runner 核对真实客户端错误' }
+}
+
+export function dailyGapConclusion (caseId, caseRecord, observation) {
+  const dependencies = WORKBENCH_FIXTURE_DEPENDENCIES[caseId]
+  if (!dependencies?.projectDependentEnhancements.length) throw new Error('非日报缺口案例')
+  for (const [index] of OWNED_CATALOG_ASSERTIONS[caseId].entries()) {
+    recordCatalogAssertion(caseRecord, caseId, index, 'UNVERIFIED',
+      '本轮仅日报缺口定向取证，不重复或升级既有 UI/周月/偏好验收；既有证据见 referencedEvidence')
+  }
+  const gaps = [
+    ...dependencies.projectDependentEnhancements,
+    ...(dependencies.nonProjectBlockers || []),
+    `日报写侧未执行：成员/填报人/审核及团队可见范围策略未确认，不分派角色、不增加 update/review 权限；本项目 DAILY=${observation.pages.adminDaily.total}`,
+    `query-only 非 PM 成员可见专属项目他人 WEEKLY=${observation.foreignReportsVisible.length}；仅记录实际读取，不自行判定团队授权策略`
+  ]
+  caseRecord.acceptanceGapAssertions = gaps.map((assertion) => ({
+    assertion, status: 'GAP', details: '真实只读证据不能替代非空日报、提交/审核或合法团队权限反例'
+  }))
+  return ownedCaseConclusion(caseId, caseRecord, gaps)
 }

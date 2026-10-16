@@ -1,5 +1,6 @@
 import { config } from '../config/index.mjs'
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 
 export const RDM_CASES = new Set([
@@ -12,6 +13,180 @@ export const RDM_CASES = new Set([
 ])
 
 export const RDM_PREFIX = 'E2E-RDM'
+
+export const RDM_RELEASE_CONTENT_GAP = '发布包 checksum 仅由调用方提交，备份无持久化内容摘要，artifactHash 只覆盖元数据；本轮 synthetic FILE 备份校验不能替代真实业务备份或回滚，发布停留 PENDING_RELEASE。'
+
+const RDM_RESUME_KINDS = ['null', 'empty', 'blank']
+const rdmResumeCheckNames = (kind) => [
+  `RDM002 BLOCKED 解除条件为 ${kind} 时精确拒绝恢复`,
+  `RDM002 ${kind} 恢复拒绝前后完整 API 和 SQL 状态不变`
+]
+
+export const RDM_COMPATIBLE_STATUSES = {
+  DRAFT: ['DRAFT', 'NEW', '草稿'],
+  INITIATED: ['INITIATED', 'INITIATION', 'INIT', '立项'],
+  RUNNING: ['RUNNING', 'EXECUTING', 'IN_PROGRESS', '执行中'],
+  PAUSED: ['PAUSED', 'PAUSE', 'SUSPENDED', 'STOPPED', '暂停'],
+  CLOSED: ['CLOSED', 'DONE', 'FINISHED', 'COMPLETED', 'ARCHIVED', '结项', '完工'],
+  CANCELLED: ['CANCELLED', 'CANCELED', 'TERMINATED', '取消']
+}
+export const RDM_LEGACY_STAGES = ['REVIEW', 'APPROVING', 'PILOT', 'MASS']
+export const RDM_ALLOWED_TRANSITIONS = {
+  DRAFT: ['DRAFT', 'INITIATED', 'CANCELLED'],
+  INITIATED: ['INITIATED', 'RUNNING', 'PAUSED', 'CANCELLED'],
+  RUNNING: ['RUNNING', 'PAUSED', 'CLOSED', 'CANCELLED'],
+  PAUSED: ['PAUSED', 'RUNNING', 'CLOSED', 'CANCELLED'],
+  CLOSED: ['CLOSED'],
+  CANCELLED: ['CANCELLED']
+}
+
+// Exact catalog text and exact check names keep weak or unrelated evidence from completing acceptance.
+export const RDM_ASSERTION_BINDINGS = {
+  'RDM-001': [
+    ['GET /pm/requirement/page 返回分页结构且 pageSize 不超过 100', ['需求分页结构有效且 pageSize 不超过 100']],
+    ['需求响应包含 reviewConclusion/reviewReason 字段定义', ['需求分页包含本轮专属记录和 catalog 字段']],
+    ['评审结论仅允许采纳/退回/暂缓/拒绝并必填理由', [
+      '不属于四种结论的评审拒绝写入',
+      ...['需求采纳', '需求退回', '需求暂缓', '需求拒绝'].flatMap((label) => [
+        `${label}缺少评审理由时拒绝写入`, `需求${label}状态和评审结论落库`
+      ])
+    ]]
+  ],
+  'RDM-002': [
+    ['GET /pm/task/page 返回分页结构且 pageSize 不超过 100', ['阻塞任务分页结构有效且 pageSize 不超过 100']],
+    ['阻塞任务响应包含 releaseCondition 字段', ['阻塞任务分页包含本轮专属记录和 catalog 字段', '任务进入 BLOCKED 并写入原因、责任方和解除条件']],
+    ['阻塞任务必须填写解除条件后才可恢复', [
+      '任务阻塞缺少解除条件时拒绝写入', '任务恢复后清空三个阻塞字段', '非 BLOCKED 任务重复恢复时拒绝写入',
+      ...RDM_RESUME_KINDS.flatMap(rdmResumeCheckNames)
+    ], '缺少阻塞写入条件的反例不能替代已阻塞且缺解除条件时恢复被拒绝的反例；未伪造历史任务。']
+  ],
+  'RDM-003': [
+    ['GET /plm/rdm/project/ledger/page 返回分页结构且 pageSize 不超过 100', ['研发项目分页结构有效且 pageSize 不超过 100', '研发项目分页包含本轮专属记录和 catalog 字段']],
+    ['研发项目 status 为草稿/立项/执行中/暂停/结项/取消六状态', [
+      '研发项目真实创建为 DRAFT',
+      ...['INITIATED', 'RUNNING', 'PAUSED', 'CLOSED'].map((status) => `研发项目合法状态流转到 ${status}`),
+      '第六种研发项目状态 CANCELLED 真实流转'
+    ]],
+    ['历史阶段类状态保持兼容，不因状态机上线中断既有项目', [
+      'RDM003 所有历史兼容状态均可读取',
+      'RDM003 历史兼容状态转换反例均有明确结果',
+      'RDM003 六状态完整转换矩阵有真实正反例'
+    ]]
+  ],
+  'RDM-004': [
+    ['GET /pm/change/page 返回分页结构且 pageSize 不超过 100', ['版本范围变更分页结构有效且 pageSize 不超过 100']],
+    ['版本范围变更关联 iterationId 并返回 targetScopeJson', ['版本范围变更分页包含本轮专属记录和 catalog 字段', '版本范围变更创建后保留迭代、四类影响和目标范围']],
+    ['版本范围变更包含测试、物料、交付和成本四类影响评估', [
+      '版本范围变更创建后保留迭代、四类影响和目标范围',
+      ...['impactTest', 'impactMaterial', 'impactDelivery', 'impactCost'].map((field) => `版本范围变更缺少 ${field} 时拒绝创建`)
+    ]],
+    ['审批通过后写入 approvedSnapshotId，历史范围快照不覆盖', [
+      '变更审批通过新增 LOCKED 范围快照且历史快照未覆盖',
+      '历史 LOCKED 快照拒绝覆盖', 'pm_project_change 与 pm_iteration_scope_snapshot 数据库证据完整'
+    ]]
+  ],
+  'RDM-005': [
+    ['GET /plm/core/ebom/page 行返回 approvalStatus/effectiveDate/expiryDate 结构化字段', [
+      'EBOM版本分页结构有效且 pageSize 不超过 100', 'EBOM版本分页包含本轮专属记录和 catalog 字段',
+      'EBOM 树行创建后返回待审批、生效和失效字段'
+    ]],
+    ['GET /plm/rdm/record/page?bizTypes=APPROVAL 返回 planId/runId 试制批次关联字段', [
+      '试制领料分页包含本轮专属记录和 catalog 字段', '试制领料记录通过 API 关联同一 planId/runId',
+      '实验计划创建后由 plm_rdm_experiment_run 返回真实批次ID', 'RDM005 三张事实表数据库证据关联一致'
+    ]],
+    ['未审批通过或未生效的 BOM 行在转生产 BOM 预览中进入阻塞项', [
+      '未审批 EBOM 行在生产 BOM 预览中形成阻塞项', '已审批但尚未生效的 EBOM 行形成生效阻塞',
+      '专属物料映射且行审批生效后生产 BOM 预览放行'
+    ], '仅验证正式 dry-run 预览，未执行正式生产 BOM 转换及 MES/WMS 领料库存闭环；因此该原断言不登记完整 VERIFIED。']
+  ],
+  'RDM-006': [
+    ['GET /pm/release/gate 返回需求覆盖率、未关闭关键缺陷数、验证结论和冻结标识', ['发布初始门禁返回真实阻塞原因数组和四类字段']],
+    ['放行时需求覆盖不完整、关键缺陷未关闭或缺验证结论都会返回阻塞原因', [
+      '需求未完成及验证结论缺失各自返回明确门禁原因', '需求未完成和验证结论缺失时正式放行拒绝',
+      '需求完成后覆盖率100但关键缺陷未关闭时门禁仍阻塞', '需求100且关键缺陷为0后仍独立阻塞缺验证结论'
+    ]],
+    ['通过放行后写入发布资料指纹并禁止继续修改发布包、备份和回退方案', [
+      '发布放行写入冻结标识和非空指纹', '冻结后拒绝修改发布包', '冻结后拒绝修改已验证备份',
+      '冻结后拒绝修改回退方案', '四类修改被拒绝后发布资料指纹保持一致',
+      '正式上传资料下载字节与本轮 SHA-256 一致', '冻结后发布资料 API、SQL 和下载内容对账一致'
+    ], RDM_RELEASE_CONTENT_GAP],
+    ['缺陷延期状态必须填写风险说明，恢复处理或关闭后清空当前延期说明', [
+      '关键缺陷延期缺少风险说明时拒绝', '缺陷延期写入风险说明且恢复处理后清空当前延期说明',
+      '关键缺陷完成 FIXED -> VERIFIED -> CLOSED 闭环'
+    ]]
+  ],
+  'RDM-007': [
+    ['报表页面展示需求平均周期、任务完成率、版本准时率、缺陷密度和研发工时五类指标及项目维度筛选', [
+      '研发进度与效率报表页面展示五类指标和项目维度筛选',
+      'RDM007 浏览器正式项目筛选与五指标真值一致',
+      'RDM007 切换对照项目不泄漏目标项目统计'
+    ]],
+    ['GET /pm/report/progress-efficiency 返回统计口径版本和需求平均周期、任务完成率、版本准时率、缺陷密度、研发工时五类指标', [
+      '研发进度与效率报表返回口径版本、五类指标、过滤条件和数据提示',
+      'RDM007 正式项目和日期筛选五指标与独立SQL真值一致',
+      'RDM007 日期过滤排除本轮事实且保留映射零工时'
+    ]],
+    ['报表返回实际过滤条件和工时映射提示，未配置 PMS 项目映射时不拼接同名项目', [
+      '研发进度与效率报表返回口径版本、五类指标、过滤条件和数据提示',
+      'RDM007 同名 PMS 真实工时不拼接且显式映射后计入'
+    ]],
+    ['GET /pm/report/metric-definitions 返回与报表一致的口径版本和指标定义', [
+      '研发统计口径定义与报表使用同一版本并返回五类指标',
+      'RDM007 五指标定义公式与正式口径一致'
+    ]]
+  ]
+}
+
+export function initializeRdmAssertions (caseRecord, caseId) {
+  const bindings = RDM_ASSERTION_BINDINGS[caseId]
+  if (!bindings) throw new Error(`Unsupported RDM case: ${caseId}`)
+  caseRecord.catalogAssertions = bindings.map(([assertion, names, gap], index) => ({
+    index, assertion, status: 'GAP', evidenceChecks: [...names],
+    details: gap || '尚未执行本轮检查'
+  }))
+  caseRecord.acceptanceGaps = []
+  caseRecord.rdmCheckStart = caseRecord.checks.length
+  if (caseId === 'RDM-002') delete caseRecord.rdm002ResumeNegatives
+}
+
+export function finalizeRdmAssertions (caseRecord, caseId, { readOnly = false } = {}) {
+  const checks = caseRecord.checks.slice(caseRecord.rdmCheckStart)
+  for (const [index, [, names, gap]] of RDM_ASSERTION_BINDINGS[caseId].entries()) {
+    const row = caseRecord.catalogAssertions[index]
+    const missing = names.filter((name) => !checks.some((check) => check.name === name))
+    const failed = checks.filter((check) => names.includes(check.name) && check.passed !== true)
+    const negatives = caseRecord.rdm002ResumeNegatives
+    const resumeComplete = caseId === 'RDM-002' && index === 2 &&
+      negatives?.complete === true && negatives.samples?.length === RDM_RESUME_KINDS.length &&
+      RDM_RESUME_KINDS.every((kind) => negatives.samples.some((sample) =>
+        sample.kind === kind && sample.rejected === true &&
+        sample.apiUnchanged === true && sample.sqlUnchanged === true))
+    row.details = (resumeComplete ? '' : gap) || (readOnly ? '仅只读契约检查，未执行本轮专属写侧证据。' : '')
+    if (missing.length || failed.length) {
+      row.details = [row.details, `缺失或失败检查：${[...missing, ...failed.map((check) => check.name)].join('；')}`]
+        .filter(Boolean).join('；')
+    }
+    row.status = names.length > 0 && !row.details ? 'VERIFIED' : 'GAP'
+  }
+  caseRecord.acceptanceGaps = []
+  caseRecord.remainingAssertions = [
+    ...caseRecord.catalogAssertions.filter((row) => row.status !== 'VERIFIED').map((row) => row.assertion),
+    ...caseRecord.acceptanceGaps.map((row) => row.details)
+  ]
+  caseRecord.catalogComplete = caseRecord.remainingAssertions.length === 0
+  for (const row of [...caseRecord.catalogAssertions, ...caseRecord.acceptanceGaps]) {
+    if (row.status === 'GAP') {
+      const note = `${caseId} GAP：${row.assertion || '扩展验收边界'}：${row.details}`
+      if (!caseRecord.notes.includes(note)) caseRecord.notes.push(note)
+    }
+  }
+  return {
+    partial: !caseRecord.catalogComplete,
+    acceptanceComplete: caseRecord.catalogComplete && checks.length > 0 &&
+      checks.every((check) => check.passed === true),
+    note: caseRecord.notes.join('；')
+  }
+}
 
 const businessSuccess = (payload) =>
   payload?.code === 0 ||
@@ -172,6 +347,338 @@ export function assertRdmLocalTarget (target = config) {
   }
 }
 
+const releaseContentHash = (bytes) => createHash('sha256').update(bytes).digest('hex')
+const releaseSqlText = (text) => `CONVERT(0x${Buffer.from(text).toString('hex')} USING utf8mb4)`
+
+export function rdmSyntheticReleaseContents (tag) {
+  if (!/^E2E-RDM-RDM006-[A-Za-z0-9-]+$/.test(tag)) {
+    throw new Error('BLOCKED: 发布资料必须使用本轮 RDM006 专属目录')
+  }
+  const bytes = Buffer.from(`${JSON.stringify({ fixture: tag, synthetic: true, files: [{ name: 'example.txt', text: `${tag}\n` }] })}\n`)
+  const backupBytes = Buffer.from(`${JSON.stringify({ fixture: tag, synthetic: true, encoding: 'base64', content: bytes.toString('base64') })}\n`)
+  return {
+    package: { name: `${tag}-package.json`, bytes, sha256: releaseContentHash(bytes) },
+    backup: { name: `${tag}-backup.json`, bytes: backupBytes, sha256: releaseContentHash(backupBytes) },
+    rollbackPlan: `Restore only the synthetic ${tag}-package.json from the registered FILE backup.\nDecode its base64 content and compare the exact original bytes. No deployment or database restore is authorized.`,
+    detail: `${tag}: synthetic file restoration plan only; no rollback has been executed.`
+  }
+}
+
+function rdmLocalFileUrl (value, target, configId, tag) {
+  const url = new URL(value)
+  const prefix = `/admin-api/infra/file/${asNumberId(configId, '文件配置')}/get/`
+  const filePath = decodeURIComponent(url.pathname.slice(prefix.length))
+  if (!['http:', 'https:'].includes(url.protocol) || url.origin !== new URL(target.apiBase).origin ||
+    url.username || url.password || url.search || url.hash || !url.pathname.startsWith(prefix) ||
+    !filePath.startsWith(`${tag}/`) || filePath.split('/').some((part) => part === '..' || part === '.') ||
+    filePath.includes('\\')) {
+    throw new Error('BLOCKED: 发布资料下载仅允许本地正式文件接口及本轮专属路径')
+  }
+  return { url: url.href, filePath }
+}
+
+async function rdmContentSql (caseRecord, sqlReader, stage, sql) {
+  const snapshot = await sqlReader(sql)
+  addDatabase(caseRecord, stage, snapshot)
+  if (!snapshot.available) throw new Error(`BLOCKED: ${snapshot.reason || '发布资料 SQL 不可读'}`)
+  return snapshot.rows
+}
+
+async function verifyRdmFileBytes (file, fetchFile, timeoutMs) {
+  // Public file GETs carry no admin token and must never follow a redirect.
+  const response = await fetchFile(file.url, {
+    redirect: 'error', credentials: 'omit', signal: AbortSignal.timeout(timeoutMs)
+  })
+  if (!response.ok || response.redirected) throw new Error('发布资料下载失败或发生重定向')
+  const bytes = Buffer.from(await response.arrayBuffer())
+  if (!bytes.equals(file.bytes) || releaseContentHash(bytes) !== file.sha256) {
+    throw new Error('发布资料下载内容与本轮真实字节 SHA-256 不一致')
+  }
+  return bytes
+}
+
+export async function prepareRdmReleaseArtifacts ({
+  api, fixture, releaseId, caseRecord, target = config,
+  sqlReader = runReadOnlySql, fetchFile = globalThis.fetch,
+  writeSafety = assertLocalWriteSafety
+}) {
+  assertRdmLocalTarget(target)
+  if (process.env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+    throw new Error('BLOCKED: 发布资料上传要求 CFOR_E2E_WRITE_FIXTURES=true')
+  }
+  await writeSafety(caseRecord)
+  const contents = rdmSyntheticReleaseContents(fixture.tag)
+  const rows = await rdmContentSql(caseRecord, sqlReader, 'RDM006 local file storage preflight', `
+    SELECT CAST(id AS CHAR),CAST(storage AS CHAR)
+    FROM infra_file_config WHERE deleted=0 AND master=1
+  `)
+  if (rows.length !== 1 || !['1', '10'].includes(String(rows[0][1]))) {
+    throw new Error('BLOCKED: 正式文件上传仅允许 DB/LOCAL 主存储；不修改共享文件配置')
+  }
+  const configId = asNumberId(rows[0][0], '文件配置')
+  for (const file of [contents.package, contents.backup]) {
+    const form = new FormData()
+    form.set('directory', fixture.tag)
+    form.set('file', new Blob([file.bytes], { type: 'application/json' }), file.name)
+    const payload = await api.uploadBusiness('/infra/file/upload', form)
+    if (!businessSuccess(payload) || typeof payload.data !== 'string') {
+      throw new Error('正式文件上传未返回成功业务结果和 URL')
+    }
+    Object.assign(file, rdmLocalFileUrl(payload.data, target, configId, fixture.tag))
+    file.configId = configId
+    const stored = await rdmContentSql(caseRecord, sqlReader, 'RDM006 uploaded file identity', `
+      SELECT CAST(id AS CHAR),CAST(config_id AS CHAR),name,path,url,CAST(size AS CHAR)
+      FROM infra_file WHERE deleted=0 AND name=${releaseSqlText(file.name)} AND url=${releaseSqlText(file.url)}
+    `)
+    if (stored.length !== 1 || String(stored[0][1]) !== configId ||
+      stored[0][2] !== file.name || stored[0][3] !== file.filePath ||
+      stored[0][4] !== file.url || Number(stored[0][5]) !== file.bytes.length) {
+      throw new Error('正式上传文件 SQL 身份、目录或大小对账失败')
+    }
+    file.fileId = asNumberId(stored[0][0], '上传文件')
+    await verifyRdmFileBytes(file, fetchFile, target.requestTimeoutMs || 30000)
+  }
+  const restored = JSON.parse(contents.backup.bytes.toString('utf8'))
+  if (restored.fixture !== fixture.tag || restored.synthetic !== true ||
+    restored.encoding !== 'base64' || !Buffer.from(restored.content, 'base64').equals(contents.package.bytes)) {
+    throw new Error('synthetic FILE 备份无法还原原始资料字节')
+  }
+  addCheck(caseRecord, '正式上传资料下载字节与本轮 SHA-256 一致', true,
+    JSON.stringify({ packageSha256: contents.package.sha256, backupSha256: contents.backup.sha256, scope: 'synthetic FILE only' }))
+  const packageId = asNumberId(await postBusiness(api, '/pm/release/package/save', {
+    releaseId, packageName: contents.package.name, packageUri: contents.package.url,
+    checksum: contents.package.sha256, packageType: 'TEST'
+  }), '发布包')
+  const backupId = asNumberId(await postBusiness(api, '/pm/release/backup/save', {
+    releaseId, backupType: 'FILE', backupUri: contents.backup.url,
+    verified: true, verifiedBy: fixture.ownerId
+  }), '发布备份')
+  const rollbackId = asNumberId(await postBusiness(api, '/pm/release/rollback/save', {
+    releaseId, rollbackPlan: contents.rollbackPlan, detail: contents.detail, executed: false
+  }), '回退方案')
+  caseRecord.releaseArtifactContents = {
+    scope: 'synthetic FILE only', serverContentBindingVerified: false,
+    package: { fileId: contents.package.fileId, url: contents.package.url, sha256: contents.package.sha256 },
+    backup: { fileId: contents.backup.fileId, url: contents.backup.url, sha256: contents.backup.sha256 },
+    rollbackPlanSha256: releaseContentHash(contents.rollbackPlan), rollbackExecuted: false,
+    gap: RDM_RELEASE_CONTENT_GAP
+  }
+  caseRecord.notes.push(RDM_RELEASE_CONTENT_GAP)
+  return { ...contents, releaseId, packageId, backupId, rollbackId, ownerId: fixture.ownerId }
+}
+
+export async function verifyRdmReleaseArtifacts ({
+  api, artifacts, frozenHash, caseRecord, target = config,
+  sqlReader = runReadOnlySql, fetchFile = globalThis.fetch
+}) {
+  assertRdmLocalTarget(target)
+  if (!/^[a-f0-9]{64}$/.test(frozenHash || '')) throw new Error('发布冻结指纹不是 SHA-256')
+  const { releaseId, packageId, backupId, rollbackId, ownerId } = artifacts
+  const lists = []
+  for (const kind of ['package', 'backup', 'rollback']) {
+    const list = await getBusiness(api, `/pm/release/${kind}/list?releaseId=${asNumberId(releaseId)}`)
+    if (!Array.isArray(list) || list.length !== 1 || String(list[0].releaseId) !== releaseId) {
+      throw new Error('发布资料 API 未返回本轮专属资料')
+    }
+    lists.push(list[0])
+  }
+  const [pkg, backup, rollback] = lists
+  if (String(pkg.id) !== packageId || pkg.packageName !== artifacts.package.name ||
+    pkg.packageUri !== artifacts.package.url || pkg.checksum !== artifacts.package.sha256 || pkg.packageType !== 'TEST' ||
+    String(backup.id) !== backupId || backup.backupType !== 'FILE' ||
+    backup.backupUri !== artifacts.backup.url || backup.verified !== true || String(backup.verifiedBy) !== ownerId ||
+    String(rollback.id) !== rollbackId || rollback.rollbackPlan !== artifacts.rollbackPlan ||
+    rollback.detail !== artifacts.detail || rollback.executed !== false) {
+    throw new Error('发布资料 API 内容与上传、备份校验或未执行回退计划不一致')
+  }
+  const rows = await rdmContentSql(caseRecord, sqlReader, 'RDM006 frozen artifact contents', `
+    SELECT 'package',CAST(id AS CHAR),CAST(release_id AS CHAR),package_name,package_uri,checksum,package_type
+    FROM pm_release_package WHERE tenant_id=1 AND deleted=0 AND release_id=${asNumberId(releaseId)} AND id=${asNumberId(packageId)};
+    SELECT 'backup',CAST(id AS CHAR),CAST(release_id AS CHAR),backup_type,backup_uri,CAST(verified AS UNSIGNED),CAST(verified_by AS CHAR)
+    FROM pm_release_backup WHERE tenant_id=1 AND deleted=0 AND release_id=${asNumberId(releaseId)} AND id=${asNumberId(backupId)};
+    SELECT 'rollback',CAST(id AS CHAR),CAST(release_id AS CHAR),SHA2(rollback_plan,256),SHA2(detail,256),CAST(executed AS UNSIGNED)
+    FROM pm_release_rollback WHERE tenant_id=1 AND deleted=0 AND release_id=${asNumberId(releaseId)} AND id=${asNumberId(rollbackId)};
+    SELECT 'release',CAST(id AS CHAR),artifact_hash,CAST(artifact_frozen AS UNSIGNED),status
+    FROM pm_release WHERE tenant_id=1 AND deleted=0 AND id=${asNumberId(releaseId)}
+  `)
+  const expected = [
+    ['package', packageId, releaseId, pkg.packageName, pkg.packageUri, pkg.checksum, pkg.packageType],
+    ['backup', backupId, releaseId, backup.backupType, backup.backupUri, '1', ownerId],
+    ['rollback', rollbackId, releaseId, releaseContentHash(rollback.rollbackPlan), releaseContentHash(rollback.detail), '0'],
+    ['release', releaseId, frozenHash, '1', 'PENDING_RELEASE']
+  ]
+  if (!isDeepStrictEqual(rows, expected)) throw new Error('冻结资料 API/SQL 原值及内联内容 SHA-256 对账失败')
+  for (const file of [artifacts.package, artifacts.backup]) {
+    rdmLocalFileUrl(file.url, target, file.configId, file.filePath.split('/')[0])
+    await verifyRdmFileBytes(file, fetchFile, target.requestTimeoutMs || 30000)
+  }
+  addCheck(caseRecord, '冻结后发布资料 API、SQL 和下载内容对账一致', true,
+    JSON.stringify({ artifactHash: frozenHash, rollbackPlanSha256: expected[2][3], serverContentBindingVerified: false }))
+}
+
+// Mirror Java 17 String.isBlank, which differs from JavaScript trim for NBSP/BOM.
+const rdmReleaseKind = (value) => value === null ? 'null' : value === '' ? 'empty'
+  : typeof value === 'string' && /^[\u0009-\u000d\u001c-\u0020\u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u205f\u3000]+$/u.test(value)
+    ? 'blank' : null
+
+const rdmResumeSampleSql = (ownerId, taskId) => `
+  SELECT JSON_OBJECT(
+    'id',CAST(t.id AS CHAR),'projectId',CAST(t.project_id AS CHAR),
+    'ownerId',CAST(t.owner_id AS CHAR),'tenantId',CAST(t.tenant_id AS CHAR),
+    'taskName',t.task_name,'taskContent',t.task_content,'status',t.status,
+    'blockReason',t.block_reason,'blockParty',t.block_party,'releaseCondition',t.release_condition,
+    'actualStartTime',t.actual_start_time,'actualEndTime',t.actual_end_time,
+    'completedTime',t.completed_time,'updateTime',t.update_time,
+    'projectName',p.project_name,'projectStatus',p.status,'customerNameSnapshot',p.customer_name_snapshot,
+    'projectManagerId',CAST(p.project_manager_id AS CHAR),
+    'handoverId',CAST(h.id AS CHAR),'handoverProjectId',CAST(h.project_id AS CHAR),
+    'handoverProjectName',h.project_name,'sourceType',h.source_type,
+    'sourceBusinessNo',JSON_UNQUOTE(JSON_EXTRACT(h.source_snapshot_json,'$.sourceBusinessNo'))
+  )
+  FROM pm_project_task t
+  JOIN pm_project p ON p.id=t.project_id AND p.tenant_id=1 AND p.deleted=0
+  JOIN pm_project_handover h ON h.id=p.handover_id AND h.project_id=p.id AND h.tenant_id=1 AND h.deleted=0
+  WHERE t.tenant_id=1 AND t.deleted=0 AND t.owner_id=${ownerId}
+    AND p.project_manager_id=${ownerId}
+    AND t.task_content REGEXP '^E2E-RDM-RDM002-[0-9]+-[a-z0-9]+$'
+    AND BINARY t.task_name=BINARY CONCAT(t.task_content,'-task')
+    AND BINARY h.project_name=BINARY CONCAT(t.task_content,'-PM')
+    AND BINARY p.customer_name_snapshot=BINARY t.task_content
+    AND h.source_type='MANUAL'
+    AND BINARY JSON_UNQUOTE(JSON_EXTRACT(h.source_snapshot_json,'$.sourceBusinessNo'))=BINARY t.task_content
+    ${taskId ? `AND t.id=${taskId}` : "AND t.status='BLOCKED'"}
+  ORDER BY t.id LIMIT 100
+`
+
+async function readRdmResumeSamples (caseRecord, stage, sql, readSql) {
+  const result = await readSql(sql)
+  addDatabase(caseRecord, stage, result)
+  if (!result.available) throw new Error(`BLOCKED: ${result.reason || 'RDM002 缺少只读 SQL 证据'}`)
+  if (!Array.isArray(result.rows)) throw new Error('RDM002 SQL 未返回有效样本数组')
+  return result.rows.map((row) => {
+    if (row.length !== 1) throw new Error('RDM002 SQL 样本必须保留完整 JSON 字段')
+    const sample = JSON.parse(row[0])
+    if (!sample || typeof sample !== 'object' || Array.isArray(sample)) {
+      throw new Error('RDM002 SQL 样本不是对象')
+    }
+    return sample
+  })
+}
+
+function assertRdmResumeSample (sample, ownerId) {
+  const tag = sample.taskContent
+  if (!/^E2E-RDM-RDM002-\d+-[a-z0-9]+$/.test(tag || '') ||
+      sample.tenantId !== '1' || sample.ownerId !== ownerId ||
+      sample.projectManagerId !== ownerId || sample.taskName !== `${tag}-task` ||
+      !sample.projectName || sample.customerNameSnapshot !== tag ||
+      sample.handoverProjectId !== sample.projectId || sample.handoverProjectName !== `${tag}-PM` ||
+      sample.sourceType !== 'MANUAL' ||
+      sample.sourceBusinessNo !== tag || sample.status !== 'BLOCKED' ||
+      !sample.projectStatus || ['CLOSED', 'TERMINATED'].includes(sample.projectStatus) ||
+      !rdmReleaseKind(sample.releaseCondition)) {
+    throw new Error('BLOCKED: RDM002 历史样本租户、所有权、状态或空解除条件不匹配')
+  }
+  for (const key of ['id', 'projectId', 'handoverId']) asNumberId(sample[key], `RDM002 ${key}`)
+  for (const key of ['blockReason', 'blockParty', 'actualStartTime', 'actualEndTime', 'completedTime', 'updateTime']) {
+    if (!Object.hasOwn(sample, key)) throw new Error(`BLOCKED: RDM002 SQL 样本缺少 ${key}`)
+  }
+}
+
+async function readRdmResumeState ({ api, sample, ownerId, caseRecord, readSql, stage, validate = true }) {
+  const rows = await readRdmResumeSamples(caseRecord, stage,
+    rdmResumeSampleSql(ownerId, sample.id), readSql)
+  const task = await getBusiness(api, `/pm/task/get?id=${sample.id}`)
+  const project = await getBusiness(api, `/pm/project/get?id=${sample.projectId}`)
+  const sql = rows.length === 1 ? rows[0] : null
+  if (!validate) return structuredClone({ task, project, sql, rowCount: rows.length })
+  if (!sql) throw new Error('BLOCKED: RDM002 专属样本 SQL 回读不唯一或已不属于夹具')
+  assertRdmResumeSample(sql, ownerId)
+  if (sql.id !== sample.id || sql.projectId !== sample.projectId ||
+      sql.taskContent !== sample.taskContent || sql.releaseCondition !== sample.releaseCondition ||
+      ['id', 'projectId', 'ownerId'].some((key) => String(task?.[key]) !== sql[key]) ||
+      ['taskName', 'taskContent', 'status', 'blockReason', 'blockParty', 'releaseCondition']
+        .some((key) => !Object.hasOwn(task || {}, key) || task[key] !== sql[key]) ||
+      ['actualStartTime', 'actualEndTime', 'completedTime', 'updateTime']
+        .some((key) => !Object.hasOwn(task || {}, key)) ||
+      String(project?.id) !== sql.projectId || String(project?.handoverId) !== sql.handoverId ||
+      String(project?.projectManagerId) !== ownerId ||
+      project?.projectName !== sql.projectName || project?.status !== sql.projectStatus ||
+      project?.customerNameSnapshot !== sql.customerNameSnapshot) {
+    throw new Error('BLOCKED: RDM002 专属样本 API/SQL 身份、状态或字段不一致')
+  }
+  return structuredClone({ task, project, sql, rowCount: rows.length })
+}
+
+export async function verifyRdmBlockedResumeNegatives ({
+  api, fixture, caseRecord, expectedPaths = new Set(), readSql = runReadOnlySql,
+  writeSafety = assertLocalWriteSafety
+}) {
+  assertRdmLocalTarget()
+  if (process.env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+    throw new Error('BLOCKED: RDM002 恢复负例要求 CFOR_E2E_WRITE_FIXTURES=true')
+  }
+  const evidence = { complete: false, samples: [], missing: [...RDM_RESUME_KINDS] }
+  caseRecord.rdm002ResumeNegatives = evidence
+  await writeSafety(caseRecord)
+  const ownerId = asNumberId(fixture.ownerId, 'RDM002 执行人')
+  const user = await getBusiness(api, '/system/user/profile/get')
+  if (String(user?.id) !== ownerId) throw new Error('BLOCKED: RDM002 实际登录执行人不匹配')
+  const candidates = await readRdmResumeSamples(caseRecord, 'RDM002 owned historical BLOCKED candidates',
+    rdmResumeSampleSql(ownerId), readSql)
+  for (const kind of RDM_RESUME_KINDS) {
+    const sample = candidates.find((row) => rdmReleaseKind(row.releaseCondition) === kind)
+    if (!sample) continue
+    assertRdmResumeSample(sample, ownerId)
+    const options = { api, sample, ownerId, caseRecord, readSql }
+    const before = await readRdmResumeState({ ...options, stage: `RDM002 ${kind} before resume` })
+    const [rejectionName, unchangedName] = rdmResumeCheckNames(kind)
+    const entry = { kind, taskId: sample.id, before, rejected: false, apiUnchanged: false, sqlUnchanged: false }
+    evidence.samples.push(entry)
+    let failure
+    try {
+      // resume only accepts id; the invalid condition must already exist in storage.
+      const payload = await api.request('PUT', `/pm/task/resume?id=${sample.id}`, undefined, {
+        expectedBusinessRejection: { code: 1055006016, message: '项目任务阻塞必须填写解除条件' }
+      })
+      entry.response = payload
+      entry.rejected = payload?.code === 1055006016 &&
+        payload?.msg === '项目任务阻塞必须填写解除条件' &&
+        payload?.success !== true && payload?.ok !== true
+      addCheck(caseRecord, rejectionName, entry.rejected, JSON.stringify(payload))
+      if (!entry.rejected) failure = new Error(`RDM002 ${kind} 恢复未精确拒绝：${summaryOf(payload)}`)
+    } catch (error) {
+      failure = error
+      addCheck(caseRecord, rejectionName, false, String(error.message || error))
+    } finally {
+      try {
+        entry.after = await readRdmResumeState({ ...options, stage: `RDM002 ${kind} after resume`, validate: false })
+        entry.apiUnchanged = isDeepStrictEqual(before.task, entry.after.task) &&
+          isDeepStrictEqual(before.project, entry.after.project)
+        entry.sqlUnchanged = isDeepStrictEqual(before.sql, entry.after.sql)
+        addCheck(caseRecord, unchangedName, entry.apiUnchanged && entry.sqlUnchanged,
+          JSON.stringify({ taskId: sample.id, apiUnchanged: entry.apiUnchanged, sqlUnchanged: entry.sqlUnchanged }))
+        if (!entry.apiUnchanged || !entry.sqlUnchanged) {
+          failure = new Error(`RDM002 ${kind} 恢复拒绝前后 API/SQL 发生变化`)
+        }
+      } catch (error) {
+        addCheck(caseRecord, unchangedName, false, String(error.message || error))
+        failure ||= error
+      }
+    }
+    if (failure) throw failure
+    expectedPaths.add('/pm/task/resume')
+    evidence.missing = evidence.missing.filter((value) => value !== kind)
+  }
+  evidence.complete = evidence.missing.length === 0
+  if (!evidence.complete) {
+    caseRecord.notes.push(`RDM002 GAP：缺少合法专属历史 BLOCKED 样本：${evidence.missing.join('/')}；` +
+      '正式 block API 已拒绝空条件，resume 仅接收 id；未 SQL 造数、未将请求体空值当作存储负例。')
+  } else {
+    addEvidence(caseRecord, 'RDM002：三类已有专属 BLOCKED 空条件通过正式 resume 精确拒绝，完整 API 与 SQL 状态前后不变')
+  }
+  return evidence
+}
+
 export async function assertRdmPage ({ api, caseRecord, path, label, id, fields = [] }) {
   const data = await getBusiness(api, path)
   const rows = Array.isArray(data?.list) ? data.list : Array.isArray(data?.records) ? data.records : null
@@ -221,7 +728,9 @@ export async function createRdmFixture ({
   const user = await currentUser(api, caseRecord)
   const projectTypeCode = await resolveRdmProjectType(api, caseRecord)
   const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-  const tag = `${RDM_PREFIX}-${caseId.replace('-', '')}-${stamp}`
+  const tag = `${RDM_PREFIX}-${caseId.replace('-', '')}-${
+    caseId === 'RDM-007' ? createHash('sha256').update(stamp).digest('hex').slice(0, 12) : stamp
+  }`
   caseRecord.fixtures = {
     prefix: RDM_PREFIX,
     caseId,
@@ -278,6 +787,195 @@ export async function createPmProject ({ api, fixture, caseRecord }) {
   }
   projectId = asNumberId(projectId, 'PM项目')
   return { handoverId: handover, projectId }
+}
+
+export async function createSameNamePmsProject ({ api, fixture }) {
+  const id = idOf(await api.postBusiness('/pms/pm/project/create', {
+    name: `${fixture.tag}-PM`,
+    type: 1,
+    level: 3,
+    description: `${fixture.tag}-same-name`,
+    openStatus: false,
+    icon: 'ep:folder',
+    memberUserIds: [fixture.ownerId]
+  }))
+  return asNumberId(id, '同名 PMS 项目')
+}
+
+export const RDM_METRIC_FORMULAS = {
+  requirementAverageCycleDays: 'AVG(completed_time - create_time)',
+  taskCompletionRate: 'COMPLETED / (ALL - CANCELLED)',
+  versionOnTimeRate: 'ON_TIME_COMPLETED / COMPLETED_WITH_PLAN',
+  defectDensity: 'VALID_BUG / (CONFIRMED+IN_PROGRESS+IMPLEMENTED+ACCEPTED)',
+  rdWorkHours: 'SUM(pms_work_item_work_log.actual_hours)'
+}
+
+export function rdmMetricTruth (rows, mapped) {
+  const byType = (type) => rows.filter((row) => row[0] === type)
+  const requirements = byType('requirement')
+  const cycles = requirements.filter((row) => row[4] && Number(row[4]) >= Number(row[3]))
+    .map((row) => Math.floor((Number(row[4]) - Number(row[3])) / 60))
+  const tasks = byType('task').filter((row) => row[2] !== 'CANCELLED')
+  const versions = byType('iteration').filter((row) => row[2] === 'COMPLETED' && row[3] && row[4])
+  const ratio = (count, denominator, multiplier = 1) =>
+    denominator ? Math.round(count * multiplier / denominator * 100) / 100 : null
+  return {
+    requirementAverageCycleDays: ratio(cycles.reduce((sum, minutes) => sum + minutes, 0), cycles.length * 1440),
+    taskCompletionRate: ratio(tasks.filter((row) => row[2] === 'COMPLETED').length, tasks.length, 100),
+    versionOnTimeRate: ratio(versions.filter((row) => row[4] <= row[3]).length, versions.length, 100),
+    defectDensity: ratio(byType('bug').length, requirements.filter((row) =>
+      ['CONFIRMED', 'IN_PROGRESS', 'IMPLEMENTED', 'ACCEPTED'].includes(row[2])).length),
+    rdWorkHours: mapped ? byType('worklog').reduce((sum, row) => sum + Number(row[2]), 0) : null
+  }
+}
+
+export function matchesRdmMetricTruth (report, truth) {
+  return Object.keys(RDM_METRIC_FORMULAS).every((key) =>
+    Object.hasOwn(report || {}, key) && (truth[key] === null
+      ? report[key] === null
+      : typeof report[key] === 'number' && Math.abs(report[key] - truth[key]) < 0.000001))
+}
+
+async function readRdmMetricFacts ({ caseRecord, projectId, pmsProjectId, startDate, endDate }) {
+  const period = `AND create_time >= '${startDate} 00:00:00' AND create_time < DATE_ADD('${endDate}', INTERVAL 1 DAY)`
+  return readDatabase(caseRecord, `RDM007 metric facts ${projectId} ${startDate}..${endDate}`, `
+    SELECT 'requirement',id,status,UNIX_TIMESTAMP(create_time),COALESCE(UNIX_TIMESTAMP(completed_time),'')
+    FROM pm_requirement WHERE tenant_id=1 AND deleted=0 AND project_id=${asNumberId(projectId)} ${period};
+    SELECT 'task',id,status,'unused','unused'
+    FROM pm_project_task WHERE tenant_id=1 AND deleted=0 AND project_id=${asNumberId(projectId)} ${period};
+    SELECT 'iteration',id,status,COALESCE(planned_end_date,''),COALESCE(DATE(completed_time),'')
+    FROM pm_iteration WHERE tenant_id=1 AND deleted=0 AND project_id=${asNumberId(projectId)} ${period};
+    SELECT 'bug',id,status,'unused','unused'
+    FROM pm_project_bug WHERE tenant_id=1 AND deleted=0 AND project_id=${asNumberId(projectId)} ${period};
+    SELECT 'worklog',id,actual_hours,work_item_id,project_id
+    FROM pms_work_item_work_log WHERE tenant_id=1 AND deleted=0 AND project_id=${asNumberId(pmsProjectId)} ${period}
+  `)
+}
+
+export async function createRdmReportFixture ({ api, caseRecord }) {
+  const fixture = await createRdmFixture({ api, caseRecord, caseId: 'RDM-007' })
+  const { projectId } = await createPmProject({ api, fixture, caseRecord })
+  caseRecord.fixtures.projectId = projectId
+  const { projectId: controlProjectId } = await createPmProject({
+    api, fixture: { ...fixture, tag: `${fixture.tag}-CTRL` }, caseRecord
+  })
+  caseRecord.fixtures.controlProjectId = controlProjectId
+  const pm = await getBusiness(api, `/pm/project/get?id=${projectId}`)
+  if (String(pm?.id) !== projectId || !pm?.projectName?.includes(fixture.tag)) {
+    throw new Error('BLOCKED: 专属项目所有权未回读')
+  }
+  await putBusiness(api, '/pm/project/update', {
+    id: projectId, projectName: `${fixture.tag}-PM`, projectType: pm.projectType,
+    projectManagerId: pm.projectManagerId
+  })
+  const renamed = await getBusiness(api, `/pm/project/get?id=${projectId}`)
+  const control = await getBusiness(api, `/pm/project/get?id=${controlProjectId}`)
+  const pmsProjectId = await createSameNamePmsProject({ api, fixture })
+  caseRecord.fixtures.pmsProjectId = pmsProjectId
+  const pms = await getBusiness(api, `/pms/pm/project/get?id=${pmsProjectId}`)
+  addCheck(caseRecord, 'RDM007 PM/PMS 专属项目确为同名且未显式映射',
+    renamed?.projectName === pms?.name && renamed?.projectName === `${fixture.tag}-PM` &&
+      renamed?.pmsProjectId == null && pms?.description === `${fixture.tag}-same-name`,
+    JSON.stringify({ projectId, pmsProjectId, projectName: renamed?.projectName, mappedId: renamed?.pmsProjectId }))
+  const workItemId = asNumberId(await postBusiness(api, '/pms/pm/work-item/create', {
+    projectId: pmsProjectId, type: 3, name: `${fixture.tag}-work`,
+    description: fixture.tag, priority: 2, progress: 0, assigneeUserId: fixture.ownerId
+  }), '专属工时工作项')
+  caseRecord.fixtures.workItemId = workItemId
+  const workLogId = asNumberId(await postBusiness(api, '/pms/pm/work-item-work-log/create', {
+    workItemId, actualHours: 7, remainingHours: 0, description: fixture.tag
+  }), '专属工时')
+  caseRecord.fixtures.workLogId = workLogId
+  const workLog = await getBusiness(api, `/pms/pm/work-item-work-log/get?id=${workLogId}`)
+  const workLogRows = await readDatabase(caseRecord, 'RDM007 work log ownership', `
+    SELECT id,work_item_id,project_id,actual_hours
+    FROM pms_work_item_work_log
+    WHERE tenant_id=1 AND deleted=0 AND id=${asNumberId(workLogId)}
+  `)
+  addCheck(caseRecord, 'RDM007 同名 PMS 项目有7小时真实工时',
+    workLog?.actualHours === 7 && workLog?.description === fixture.tag &&
+      workLogRows.length === 1 && String(workLogRows[0][2]) === pmsProjectId &&
+      Number(workLogRows[0][3]) === 7,
+    JSON.stringify({ workLogId, projectId: workLogRows[0]?.[2] ?? null, actualHours: workLog?.actualHours }))
+  for (let index = 0; index < 2; index++) {
+    const id = await createRequirement({ api, fixture, projectId, title: `${fixture.tag}-req-${index}` })
+    await completeRequirement({ api, id })
+    await reviewRequirement({ api, id, status: 'ACCEPTED' })
+    await postBusiness(api, '/pm/bug/save', {
+      projectId, title: `${fixture.tag}-bug-${index}`, description: fixture.tag,
+      severity: 'LOW', priority: 2, reporterId: fixture.ownerId,
+      reporterName: fixture.ownerName, assigneeId: fixture.ownerId, sourceType: RDM_PREFIX
+    })
+  }
+  const { iterationId } = await createIteration({ api, fixture, projectId, caseRecord })
+  for (const status of ['EXECUTING', 'PENDING_ACCEPTANCE', 'COMPLETED']) {
+    await putBusiness(api, '/pm/iteration/status', { id: iterationId, status })
+  }
+  const workingDate = await findWorkingDate(api, today())
+  await postBusiness(api, '/pm/task/create-administrative', {
+    projectId, taskName: `${fixture.tag}-task`, taskContent: fixture.tag,
+    ownerId: fixture.ownerId, ownerName: fixture.ownerName, acceptanceOwnerId: fixture.ownerId,
+    plannedStartDate: workingDate, plannedEndDate: workingDate, standardHours: 1, plannedHours: 1,
+    requiredOutput: fixture.tag, acceptanceCriteria: fixture.tag
+  })
+  Object.assign(fixture, { projectId, pmsProjectId, controlProjectId, projectName: renamed.projectName,
+    controlProjectName: control.projectName, startDate: today(-1), endDate: today(1) })
+  Object.assign(caseRecord.fixtures, fixture)
+  return fixture
+}
+
+export async function verifyRdmReportFixture ({ api, caseRecord, fixture }) {
+  const { projectId, pmsProjectId, startDate, endDate } = fixture
+  const query = new URLSearchParams({ projectId, startDate, endDate })
+  const facts = await readRdmMetricFacts({ caseRecord, projectId, pmsProjectId, startDate, endDate })
+  const report = await getBusiness(api, `/pm/report/progress-efficiency?${query}`)
+  const truth = rdmMetricTruth(facts, false)
+  addCheck(caseRecord, 'RDM007 正式项目和日期筛选五指标与独立SQL真值一致',
+    report?.projectCount === 1 && String(report?.appliedFilters?.projectId) === projectId &&
+      report?.appliedFilters?.startDate === startDate && report?.appliedFilters?.endDate === endDate &&
+      facts.some((row) => row[0] === 'requirement' && row[2] === 'ACCEPTED') &&
+      facts.some((row) => row[0] === 'iteration' && row[2] === 'COMPLETED') &&
+      facts.some((row) => row[0] === 'task') && facts.some((row) => row[0] === 'bug') &&
+      matchesRdmMetricTruth(report, truth),
+    JSON.stringify({ query: Object.fromEntries(query), truth, report }))
+  const pm = await getBusiness(api, `/pm/project/get?id=${projectId}`)
+  if (pm?.projectName !== fixture.projectName || pm?.pmsProjectId != null) {
+    throw new Error('BLOCKED: 专属 PM 项目名称或映射已变化')
+  }
+  await putBusiness(api, '/pm/project/update', {
+    id: projectId, projectName: pm.projectName, projectType: pm.projectType,
+    projectManagerId: pm.projectManagerId, pmsProjectId
+  })
+  const mapped = await getBusiness(api, `/pm/report/progress-efficiency?${query}`)
+  const mappedTruth = rdmMetricTruth(facts, true)
+  const mappingRows = await readDatabase(caseRecord, 'RDM007 owned explicit mapping', `
+    SELECT id,project_name,pms_project_id FROM pm_project WHERE tenant_id=1 AND id=${asNumberId(projectId)};
+    SELECT id,name,description FROM pms_project WHERE tenant_id=1 AND id=${asNumberId(pmsProjectId)}
+  `)
+  addCheck(caseRecord, 'RDM007 同名 PMS 真实工时不拼接且显式映射后计入',
+    report?.mappedRdWorkProjectCount === 0 && report?.unmappedRdWorkProjectCount === 1 &&
+      report?.rdWorkHours === null &&
+      report?.warnings?.some((warning) => /未配置 PMS 协作项目映射/.test(warning)) &&
+      mapped?.mappedRdWorkProjectCount === 1 && mapped?.unmappedRdWorkProjectCount === 0 &&
+      mapped?.rdWorkHours === 7 && mappedTruth.rdWorkHours === 7 &&
+      mappingRows.some((row) => row[0] === projectId && row[2] === pmsProjectId) &&
+      matchesRdmMetricTruth(mapped, mappedTruth),
+    JSON.stringify({ unmapped: report, mapped, mappedTruth, mappingRows }))
+  const excludedQuery = new URLSearchParams({ projectId, startDate: today(-3), endDate: today(-2) })
+  const excluded = await getBusiness(api, `/pm/report/progress-efficiency?${excludedQuery}`)
+  addCheck(caseRecord, 'RDM007 日期过滤排除本轮事实且保留映射零工时',
+    matchesRdmMetricTruth(excluded, {
+      requirementAverageCycleDays: null, taskCompletionRate: null,
+      versionOnTimeRate: null, defectDensity: null, rdWorkHours: 0
+    }) && excluded?.appliedFilters?.endDate === today(-2),
+    JSON.stringify({ query: Object.fromEntries(excludedQuery), excluded }))
+  fixture.metricTruth = mappedTruth
+  fixture.metricVersion = mapped.metricVersion
+  const controlFacts = await readRdmMetricFacts({
+    caseRecord, projectId: fixture.controlProjectId, pmsProjectId, startDate, endDate
+  })
+  fixture.controlTruth = rdmMetricTruth(controlFacts, false)
+  return { report: mapped, truth: mappedTruth }
 }
 
 export async function createIteration ({ api, fixture, projectId, caseRecord }) {
@@ -436,7 +1134,20 @@ export async function transitionPlmProject ({ api, id, status, fixture }) {
   return getBusiness(api, `/plm/rdm/project/ledger/get?id=${id}`)
 }
 
-export async function runRdmWriteCase ({
+export async function runRdmWriteCase (options) {
+  const { caseId, caseRecord } = options
+  initializeRdmAssertions(caseRecord, caseId)
+  let result
+  let acceptance
+  try {
+    result = await executeRdmWriteCase(options)
+  } finally {
+    acceptance = finalizeRdmAssertions(caseRecord, caseId)
+  }
+  return { ...result, ...acceptance }
+}
+
+async function executeRdmWriteCase ({
   caseId,
   api,
   caseRecord,
@@ -577,6 +1288,17 @@ export async function runRdmWriteCase ({
       expectedMessage: /must not be blank|不能为空/i,
       name: '任务阻塞缺少解除条件时拒绝写入'
     })
+    await expectBusinessFailure({
+      api, method: 'PUT', path: '/pm/task/block',
+      body: { taskId, reason: fixture.tag, responsibleParty: fixture.tag, releaseCondition: '   ' },
+      caseRecord, expectedPaths, expectedCode: 400,
+      expectedMessage: /must not be blank|不能为空/i,
+      name: 'RDM002 空白解除条件拒绝且不产生阻塞样本'
+    })
+    const afterInvalidBlock = await getBusiness(api, `/pm/task/get?id=${taskId}`)
+    addCheck(caseRecord, 'RDM002 缺少解除条件拒绝后任务仍为 IN_PROGRESS',
+      afterInvalidBlock?.status === 'IN_PROGRESS',
+      JSON.stringify({ taskId, status: afterInvalidBlock?.status }))
     await putBusiness(api, '/pm/task/block', {
       taskId,
       reason: `${fixture.tag}-blocked`,
@@ -629,6 +1351,8 @@ export async function runRdmWriteCase ({
       body: undefined,
       caseRecord,
       expectedPaths,
+      expectedCode: 1055006002,
+      expectedMessage: /项目任务状态不允许当前操作：IN_PROGRESS/,
       name: '非 BLOCKED 任务重复恢复时拒绝写入'
     })
     const rows = await readDatabase(caseRecord, 'RDM-002 task', `
@@ -642,6 +1366,7 @@ export async function runRdmWriteCase ({
       [firstRow(rows)[2], firstRow(rows)[3], firstRow(rows)[4]].every((value) => value === '0'),
     JSON.stringify({ rows: rows.length }))
     addEvidence(caseRecord, 'RDM002：任务创建、阻塞必填、恢复清空、重复恢复拒绝、API+SQL')
+    await verifyRdmBlockedResumeNegatives({ api, fixture, caseRecord, expectedPaths })
     return { allowRuntimeErrors: { api: ({ url }) => [...expectedPaths].some((path) => url.includes(path)) } }
   }
 
@@ -662,24 +1387,85 @@ export async function runRdmWriteCase ({
     const cancelledId = await createPlmProject({ api, fixture: { ...fixture, tag: `${fixture.tag}-CANCEL` } })
     const cancelled = await transitionPlmProject({ api, id: cancelledId, status: 'CANCELLED', fixture })
     addCheck(caseRecord, '第六种研发项目状态 CANCELLED 真实流转', cancelled?.status === 'CANCELLED')
-    const legacyId = asNumberId(await postBusiness(api, '/plm/rdm/record/create', {
-      bizType: 'PROJECT',
-      bizNo: `${fixture.tag}-LEGACY`,
-      bizName: `${fixture.tag}-legacy`,
-      status: 'EXECUTING',
-      stageCode: 'PILOT',
-      stageName: 'PILOT',
-      ownerId: fixture.ownerId,
-      ownerName: fixture.ownerName,
-      remark: fixture.tag
-    }), '历史状态研发项目')
-    const legacy = await getBusiness(api, `/plm/rdm/project/ledger/get?id=${legacyId}`)
+    const legacyStatuses = [...Object.values(RDM_COMPATIBLE_STATUSES).flat(), ...RDM_LEGACY_STAGES]
+    const legacyIds = {}
+    for (const status of legacyStatuses) {
+      legacyIds[status] = asNumberId(await postBusiness(api, '/plm/rdm/record/create', {
+        bizType: 'PROJECT',
+        bizNo: `${fixture.tag}-LEGACY-${status}`,
+        bizName: `${fixture.tag}-legacy-${status}`,
+        status,
+        stageCode: status,
+        stageName: status,
+        ownerId: fixture.ownerId,
+        ownerName: fixture.ownerName,
+        remark: fixture.tag
+      }), `历史状态研发项目 ${status}`)
+    }
+    const legacyRows = []
+    for (const status of legacyStatuses) {
+      const legacy = await getBusiness(api, `/plm/rdm/project/ledger/get?id=${legacyIds[status]}`)
+      legacyRows.push({ status, actual: legacy?.status })
+    }
     addCheck(
       caseRecord,
-      '历史 EXECUTING 状态项目仍可读取且不被新状态机破坏',
-      legacy?.status === 'EXECUTING',
-      JSON.stringify({ status: legacy?.status })
+      'RDM003 所有历史兼容状态均可读取',
+      legacyRows.every((row) => row.actual === row.status),
+      JSON.stringify({ statuses: legacyRows })
     )
+    const transitionResults = []
+    for (const status of legacyStatuses) {
+      const canonical = Object.entries(RDM_COMPATIBLE_STATUSES).find(([, aliases]) => aliases.includes(status))?.[0]
+      const allowed = !canonical || RDM_ALLOWED_TRANSITIONS[canonical].includes('RUNNING')
+      if (allowed) {
+        await postBusiness(api, '/plm/rdm/project/ledger/transition-status', {
+          projectId: legacyIds[status], targetStatus: 'RUNNING', remark: fixture.tag
+        })
+      } else {
+        await expectBusinessFailure({
+          api, method: 'POST', path: '/plm/rdm/project/ledger/transition-status',
+          body: { projectId: legacyIds[status], targetStatus: 'RUNNING', remark: fixture.tag },
+          caseRecord, expectedPaths, expectedCode: 2003005006,
+          name: `RDM003 兼容状态 ${status} 禁止非法转换到 RUNNING`
+        })
+      }
+      const detail = await getBusiness(api, `/plm/rdm/project/ledger/get?id=${legacyIds[status]}`)
+      transitionResults.push({ status, allowed, actual: detail?.status, expected: allowed ? 'RUNNING' : status })
+    }
+    addCheck(
+      caseRecord,
+      'RDM003 历史兼容状态转换反例均有明确结果',
+      transitionResults.every((row) => row.actual === row.expected),
+      JSON.stringify({ results: transitionResults })
+    )
+    const matrix = []
+    for (const from of Object.keys(RDM_ALLOWED_TRANSITIONS)) {
+      for (const to of Object.keys(RDM_ALLOWED_TRANSITIONS)) {
+        const id = asNumberId(await postBusiness(api, '/plm/rdm/record/create', {
+          bizType: 'PROJECT', bizNo: `${fixture.tag}-${from}-${to}`,
+          bizName: `${fixture.tag}-${from}-${to}`, status: from,
+          ownerId: fixture.ownerId, ownerName: fixture.ownerName, remark: fixture.tag
+        }), '转换矩阵专属项目')
+        const allowed = RDM_ALLOWED_TRANSITIONS[from].includes(to)
+        if (allowed) {
+          await postBusiness(api, '/plm/rdm/project/ledger/transition-status', {
+            projectId: id, targetStatus: to, remark: fixture.tag
+          })
+        } else {
+          await expectBusinessFailure({
+            api, method: 'POST', path: '/plm/rdm/project/ledger/transition-status',
+            body: { projectId: id, targetStatus: to, remark: fixture.tag },
+            caseRecord, expectedPaths, expectedCode: 2003005006,
+            name: `RDM003 非法转换 ${from}->${to} 被拒绝`
+          })
+        }
+        const detail = await getBusiness(api, `/plm/rdm/project/ledger/get?id=${id}`)
+        matrix.push({ from, to, allowed, actual: detail?.status, expected: allowed ? to : from })
+      }
+    }
+    addCheck(caseRecord, 'RDM003 六状态完整转换矩阵有真实正反例',
+      matrix.length === 36 && matrix.every((row) => row.actual === row.expected),
+      JSON.stringify({ matrix }))
     await assertRdmPage({
       api, caseRecord, id: projectId, label: '研发项目',
       path: '/plm/rdm/project/ledger/page?pageNo=1&pageSize=100',
@@ -688,13 +1474,14 @@ export async function runRdmWriteCase ({
     const rows = await readDatabase(caseRecord, 'RDM-003 projects', `
       SELECT id,project_no,status,current_stage_code,current_stage_name
       FROM plm_rdm_project
-      WHERE tenant_id=1 AND id IN (${asNumberId(projectId)},${asNumberId(legacyId)},${asNumberId(cancelledId)})
+      WHERE tenant_id=1 AND id IN (${asNumberId(projectId)},${Object.values(legacyIds).map(asNumberId).join(',')},${asNumberId(cancelledId)})
       ORDER BY id
     `)
-    addCheck(caseRecord, 'plm_rdm_project 数据库证据确认两个终态和历史状态', rows.length === 3 &&
+    addCheck(caseRecord, 'plm_rdm_project 数据库证据确认两个终态和历史状态', rows.length === legacyStatuses.length + 2 &&
       rows.some((row) => row[0] === projectId && row[2] === 'CLOSED') &&
       rows.some((row) => row[0] === cancelledId && row[2] === 'CANCELLED') &&
-      rows.some((row) => row[0] === legacyId && row[2] === 'EXECUTING'),
+      transitionResults.every((result) => rows.some((row) =>
+        row[0] === legacyIds[result.status] && row[2] === result.expected)),
     JSON.stringify({ rows: rows.length }))
     for (const [id, status] of [[projectId, 'CLOSED'], [cancelledId, 'CANCELLED']]) {
       try {
@@ -713,7 +1500,7 @@ export async function runRdmWriteCase ({
     }
     await readDatabase(caseRecord, 'RDM-003 after invalid transitions', `
       SELECT id,status FROM plm_rdm_project
-      WHERE tenant_id=1 AND id IN (${projectId},${cancelledId},${legacyId})
+      WHERE tenant_id=1 AND id IN (${projectId},${cancelledId},${Object.values(legacyIds).map(asNumberId).join(',')})
       ORDER BY id
     `)
     addEvidence(caseRecord, 'RDM003：研发项目创建、六状态合法流转、终态保护、历史 EXECUTING 兼容、API+SQL')
@@ -770,8 +1557,9 @@ export async function runRdmWriteCase ({
       caseRecord,
       '版本范围变更创建后保留迭代、四类影响和目标范围',
       String(before?.iterationId) === String(iterationId) &&
-        before?.targetScopeJson &&
-        ['impactTest', 'impactMaterial', 'impactDelivery', 'impactCost'].every((key) => before?.[key]),
+        before?.targetScopeJson === baseChange.targetScopeJson &&
+        ['impactTest', 'impactMaterial', 'impactDelivery', 'impactCost']
+          .every((key) => before?.[key] === baseChange[key]),
       JSON.stringify({
         iterationId: before?.iterationId,
         hasTargetScope: Boolean(before?.targetScopeJson),
@@ -800,6 +1588,7 @@ export async function runRdmWriteCase ({
         approvedSnapshotId !== snapshotId &&
         approvedSnapshot?.status === 'LOCKED' &&
         originalSnapshot?.scopeJson === snapshot?.scopeJson &&
+        approvedSnapshot?.scopeJson === baseChange.targetScopeJson &&
         approvedSnapshot?.scopeJson !== originalSnapshot?.scopeJson,
       JSON.stringify({
         changeStatus: after?.status,
@@ -893,7 +1682,7 @@ export async function runRdmWriteCase ({
       approvalStatus: 'PENDING',
       remark: fixture.tag
     }
-    const lineId = asNumberId(await postBusiness(api, '/plm/core/ebom/save-line', lineBody), 'EBOM行')
+    let lineId = asNumberId(await postBusiness(api, '/plm/core/ebom/save-line', lineBody), 'EBOM行')
     const pendingTree = await getBusiness(api, `/plm/core/ebom/tree?ebomId=${parentRevisionId}`)
     addCheck(
       caseRecord,
@@ -942,19 +1731,29 @@ export async function runRdmWriteCase ({
     await postBusiness(api, '/plm/core/ebom/save-line', {
       ...lineBody, id: lineId, approvalStatus: 'APPROVED', effectiveDate: today(3)
     })
+    await putBusiness(api, '/plm/core/part/revision/status', {
+      id: componentRevisionId,
+      revisionStatus: 'RELEASED',
+      description: fixture.tag
+    })
     const previewFuture = await postBusiness(api, '/plm/core/ebom/preview-production-bom', {
       ebomId: parentRevisionId, dryRun: true, operatorName: fixture.tag
     })
-    addCheck(caseRecord, '已审批但尚未生效的 EBOM 行单独形成生效阻塞',
+    addCheck(caseRecord, '已审批但尚未生效的 EBOM 行形成生效阻塞',
       previewFuture?.canRelease === false &&
         previewFuture?.blocks?.some((block) => /未到生效/.test(block.reason) && String(block.objectId) === lineId),
       JSON.stringify({ reasons: previewFuture?.blocks?.map((block) => block.reason) }))
-    await postBusiness(api, '/plm/core/ebom/save-line', {
+    await api.deleteBusiness(`/plm/core/ebom/delete-line?id=${encodeURIComponent(lineId)}`)
+    lineId = asNumberId(await postBusiness(api, '/plm/core/ebom/save-line', {
       ...lineBody,
-      id: lineId,
       approvalStatus: 'APPROVED',
       effectiveDate: today(-1),
       approvedBy: fixture.ownerName
+    }), 'EBOM已生效行')
+    await putBusiness(api, '/plm/core/part/revision/status', {
+      id: parentRevisionId,
+      revisionStatus: 'RELEASED',
+      description: fixture.tag
     })
     const approvedTree = await getBusiness(api, `/plm/core/ebom/tree?ebomId=${parentRevisionId}`)
     addCheck(
@@ -1131,25 +1930,8 @@ export async function runRdmWriteCase ({
         blockedRelease?.artifactFrozen !== true && !blockedRelease?.artifactHash)
     await putBusiness(api, '/pm/release/status', { id: releaseId, status: 'REJECTED', opinion: fixture.tag })
     await putBusiness(api, '/pm/release/status', { id: releaseId, status: 'DRAFT', opinion: fixture.tag })
-    const packageId = asNumberId(await postBusiness(api, '/pm/release/package/save', {
-      releaseId,
-      packageName: `${fixture.tag}.zip`,
-      packageUri: `e2e://${fixture.tag}/package`,
-      checksum: `${fixture.tag}-checksum`,
-      packageType: 'TEST'
-    }), '发布包')
-    const backupId = asNumberId(await postBusiness(api, '/pm/release/backup/save', {
-      releaseId,
-      backupType: 'DATABASE',
-      backupUri: `e2e://${fixture.tag}/backup`,
-      verified: true,
-      verifiedBy: fixture.ownerId
-    }), '发布备份')
-    const rollbackId = asNumberId(await postBusiness(api, '/pm/release/rollback/save', {
-      releaseId,
-      rollbackPlan: `${fixture.tag}-rollback`,
-      detail: fixture.tag
-    }), '回退方案')
+    const releaseArtifacts = await prepareRdmReleaseArtifacts({ api, fixture, releaseId, caseRecord })
+    const { packageId, backupId, rollbackId } = releaseArtifacts
     await postBusiness(api, '/pm/release/cutover-record/save', {
       releaseId,
       environment: 'TEST',
@@ -1313,7 +2095,7 @@ export async function runRdmWriteCase ({
       api,
       method: 'POST',
       path: '/pm/release/package/save',
-      body: { id: packageId, releaseId, packageName: `${fixture.tag}-changed.zip`, packageUri: `e2e://${fixture.tag}/changed` },
+      body: { id: packageId, releaseId, packageName: `${fixture.tag}-changed.json`, packageUri: releaseArtifacts.package.url },
       caseRecord,
       expectedPaths,
       name: '冻结后拒绝修改发布包'
@@ -1322,7 +2104,7 @@ export async function runRdmWriteCase ({
       api,
       method: 'POST',
       path: '/pm/release/backup/save',
-      body: { id: backupId, releaseId, backupType: 'DATABASE', backupUri: `e2e://${fixture.tag}/changed`, verified: true, verifiedBy: fixture.ownerId },
+      body: { id: backupId, releaseId, backupType: 'FILE', backupUri: `${releaseArtifacts.backup.url}?changed=true`, verified: true, verifiedBy: fixture.ownerId },
       caseRecord,
       expectedPaths,
       name: '冻结后拒绝修改已验证备份'
@@ -1342,6 +2124,9 @@ export async function runRdmWriteCase ({
       immutable?.artifactHash === frozen?.artifactHash &&
         immutable?.artifactFrozen === true &&
         immutableGate?.artifactHash === frozen?.artifactHash)
+    await verifyRdmReleaseArtifacts({
+      api, artifacts: releaseArtifacts, frozenHash: frozen?.artifactHash, caseRecord
+    })
     const rows = await readDatabase(caseRecord, 'RDM-006 release and bug', `
       SELECT id,status,requirement_coverage,critical_bug_open_count,verification_conclusion,artifact_frozen,artifact_hash
       FROM pm_release
@@ -1356,7 +2141,7 @@ export async function runRdmWriteCase ({
         isTruthyBit(row[5]) && row[6]) &&
       rows.some((row) => row[0] === bugId && row[1] === 'CLOSED' && (row[2] === '' || row[2] === null)),
     JSON.stringify({ rows: rows.length }))
-    addEvidence(caseRecord, 'RDM006：真实发布门禁阻塞/放行、关键缺陷延期闭环、冻结指纹、冻结后四类修改拒绝、API+SQL')
+    addEvidence(caseRecord, 'RDM006：正式上传 synthetic 文件及下载字节 SHA-256、FILE 备份还原字节、未执行回退计划原文、冻结后 API+SQL 对账；不代表服务端内容绑定或真实部署回滚')
     return { allowRuntimeErrors: { api: ({ url }) => [...expectedPaths].some((path) => url.includes(path)) } }
   }
 

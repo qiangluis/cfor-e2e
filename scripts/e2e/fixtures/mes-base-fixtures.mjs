@@ -1,4 +1,4 @@
-import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { asList, assertBusinessSuccess } from '../lib/assertions.mjs'
 import { runReadOnlySql } from '../lib/db.mjs'
 
 // Dedicated write-side fixtures for the mes-base suite (MES-BASE/PB038/PB039/PB102).
@@ -91,9 +91,20 @@ export const createProductionTypeFixture = async (api, marker) => {
 // 选择一条已启用、已配置生产 BOM 的存货作为只读引用；订单本身仍是专属新单据。
 export const pickBomMaterial = async (api) => {
   const rows = await queryRows(
-    `SELECT id, unit_id, default_prod_bom FROM mes_bas_material
-     WHERE tenant_id=1 AND deleted=0 AND is_enabled=1
-     AND default_prod_bom IS NOT NULL AND default_prod_bom<>'' LIMIT 5`)
+    `SELECT material.id, material.unit_id, material.default_prod_bom
+     FROM mes_bas_material material
+     JOIN mes_wms_assemble bom ON bom.id=material.default_prod_bom
+       AND bom.tenant_id=1 AND bom.deleted=0
+       AND bom.stock_id=material.id AND bom.dev_status=2
+       AND bom.bom_usage='PRODUCTION'
+     WHERE material.tenant_id=1 AND material.deleted=0 AND material.is_enabled=1
+       AND material.inventory_nature='STOCK'
+       AND material.default_prod_bom IS NOT NULL AND material.default_prod_bom<>''
+       AND EXISTS (
+         SELECT 1 FROM mes_wms_assemble_sub sub
+         WHERE sub.tenant_id=1 AND sub.deleted=0 AND sub.parent_id=bom.id
+       )
+     ORDER BY bom.update_time DESC, bom.id DESC LIMIT 5`)
   const hit = rows.find((row) => /^[1-9]\d*$/.test(String(row[0] ?? '')) &&
     /^[1-9]\d*$/.test(String(row[1] ?? '')) && /^[1-9]\d*$/.test(String(row[2] ?? '')))
   if (!hit) throw new Error('BLOCKED: 缺少已配置生产 BOM 的启用存货，无法创建专属生产订单')
@@ -117,6 +128,64 @@ export const createProdOrderWithType = async (api, marker, { documentTypeId, mat
     }]
   }))
   return { orderId: String(orderId), billNo }
+}
+
+// ---------------------------------------------------------------------------
+// MES-BASE-002 委外业务类型规则 + 委外单快照
+// ---------------------------------------------------------------------------
+
+export const createOutsourceTypeRuleFixture = async (
+  api, marker, { coreType = 'WORK', status = 1 } = {}
+) => {
+  const token = marker.replace(/[^A-Z0-9]/g, '').slice(-12)
+  const documentTypeCode = `E2EOS-${token}`
+  const documentTypeId = unwrap(await api.postBusiness('/system/document/type/create', {
+    code: documentTypeCode,
+    name: documentTypeCode,
+    isOpen: true,
+    sort: 972
+  }))
+  const payload = {
+    documentTypeId: String(documentTypeId),
+    coreType,
+    effectiveFrom: '2026-01-01',
+    status,
+    remark: marker
+  }
+  const ruleId = unwrap(await api.postBusiness('/mes/outsource-type-rule/create', payload))
+  const rule = unwrap(await api.getBusiness(
+    `/mes/outsource-type-rule/get?id=${encodeURIComponent(ruleId)}`))
+  return {
+    documentTypeId: String(documentTypeId),
+    documentTypeCode,
+    ruleId: String(ruleId),
+    payload,
+    rule
+  }
+}
+
+export const createOutsourceBillWithType = async (
+  api, marker, rule, { material, unitId } = {}
+) => {
+  const reference = material || await pickBomMaterial(api)
+  const billNo = `${marker}-OS`.slice(0, 60)
+  const payload = {
+    billDate: new Date().toISOString().slice(0, 10),
+    billNo,
+    subject: `${marker}-委外`,
+    remark: marker,
+    sourceType: 'WORK',
+    outsourceTypeCode: rule.documentTypeCode,
+    materialId: String(reference.id),
+    unitId: String(unitId || reference.unitId),
+    planQty: 1,
+    status: 0,
+    items: []
+  }
+  const billId = unwrap(await api.postBusiness('/mes/prodOutsource/add', payload))
+  const detail = unwrap(await api.getBusiness(
+    `/mes/prodOutsource/queryById?id=${encodeURIComponent(billId)}`))
+  return { billId: String(billId), billNo, payload, detail }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +255,51 @@ export const createRouteCapacityFixture = async (api, marker, options = {}) => {
   return { procedureId, routeId, routeSubId: String(routeSubId), marker }
 }
 
-export const bindDeviceCapacity = async (api, fixture, { deviceId, lineId, unitId }) => {
+export const capacityProductPayload = (marker, unitId, suffix) => {
+  const code = `${marker}-${suffix}`
+  return {
+    code,
+    name: code,
+    auxName: code,
+    unitId: String(unitId),
+    inventoryNature: 'STOCK',
+    isMaterial: 'N',
+    isEnabled: 1,
+    purchased: 'N',
+    saled: 'Y',
+    produced: 'Y',
+    parented: 'Y',
+    source: 'manufacture',
+    leadTime: 1,
+    bufferTime: 1,
+    refCost: 10,
+    refPrice: 20,
+    batchManaged: 'N',
+    oneBarcode: 'N',
+    periodManaged: 'N',
+    gradeManaged: 'N',
+    colorManaged: 'N',
+    brandManaged: 'N',
+    backflush: 'N',
+    remark: marker
+  }
+}
+
+export const createCapacityProductFixture = async (api, marker, unitId, suffix) => {
+  const code = `${marker}-${suffix}`
+  const body = capacityProductPayload(marker, unitId, suffix)
+  const id = String(unwrap(await api.postBusiness('/mes/basMaterial/add', body)))
+  if (!/^[1-9]\d*$/.test(id)) throw new Error(`专属产品${suffix}未返回合法ID`)
+  const detail = (await api.getBusiness(
+    `/mes/basMaterial/queryById?id=${encodeURIComponent(id)}`))?.data
+  if (!detail || String(detail.id) !== id || String(detail.code) !== code ||
+      !String(detail.remark || '').includes(marker)) {
+    throw new Error(`专属产品${suffix}归属回读失败：${id}`)
+  }
+  return { id, code, body, detail }
+}
+
+export const bindDeviceCapacity = async (api, fixture, { deviceId, lineId }) => {
   await api.postBusiness('/mes/wmsTechRoute/saveprocedureEquipmentRelation', [{
     productionLineId: String(lineId),
     procedureId: String(fixture.procedureId),
@@ -197,23 +310,164 @@ export const bindDeviceCapacity = async (api, fixture, { deviceId, lineId, unitI
     standardCapacityPerHour: 10,
     remark: fixture.marker
   }])
-  const capacityId = unwrap(await api.postBusiness('/mes/wmsTechRoute/capacity/save', {
-    routeSubId: fixture.routeSubId,
+  return { deviceId: String(deviceId), lineId: String(lineId) }
+}
+
+export const capacitySavePayload = (fixture, {
+  id, deviceId, unitId, productId, standardOutput = 88, standardDuration = 60,
+  changeoverMinutes = 15, suffix = ''
+}) => ({
+  ...(id == null ? {} : { id: String(id) }),
+  routeSubId: fixture.routeSubId,
+  procedureId: String(fixture.procedureId),
+  equipmentId: String(deviceId),
+  productId: String(productId),
+  unitId: String(unitId),
+  standardOutput,
+  standardDuration,
+  changeoverMinutes,
+  calendarCode: 'INIT-CALENDAR',
+  effectiveFrom: '2026-01-01',
+  remark: `${fixture.marker}${suffix ? `-${suffix}` : ''}`
+})
+
+export const saveDeviceCapacity = async (api, fixture, options) => {
+  const capacityId = unwrap(await api.postBusiness('/mes/wmsTechRoute/capacity/save',
+    capacitySavePayload(fixture, options)))
+  return String(capacityId)
+}
+
+export const readRouteCapacityDetail = async (api, fixture) =>
+  unwrap(await api.getBusiness(
+    `/mes/wmsTechRoute/getRouteCapacityDetail?routeId=${fixture.routeId}`))
+
+export const capacityProductScope = (row) =>
+  row?.productId == null || String(row.productId).trim() === '' ? null : String(row.productId)
+
+export const capacityRowsForProduct = (detail, productId) => {
+  const expectedProductId = productId == null ? null : String(productId)
+  return (detail?.procedureList || []).flatMap((procedure) => procedure.deviceList || [])
+    .filter((row) => capacityProductScope(row) === expectedProductId)
+}
+
+export const capacityMinimum = (rows) => {
+  const values = rows.map((row) => Number(row.mockCapacity)).filter(Number.isFinite)
+  return values.length ? Math.min(...values) : null
+}
+
+export const cleanupRouteCapacityFixture = async (api, fixture) => {
+  const errors = []
+  const actions = []
+  const retainedCapacityIds = []
+  const retainedProductIds = new Set()
+  const manifest = {
+    status: 'RETAINED_AUDIT',
+    cleaned: false,
+    routeId: String(fixture.routeId),
     procedureId: String(fixture.procedureId),
-    equipmentId: String(deviceId),
-    productId: null,
-    unitId: String(unitId),
-    standardOutput: 88,
-    standardDuration: 60,
-    changeoverMinutes: 15,
-    calendarCode: 'INIT-CALENDAR',
-    effectiveFrom: '2026-01-01',
-    remark: fixture.marker
-  }))
+    reason: '产能历史必须保留关联产品、工艺路线和工序主档，避免悬空审计'
+  }
+
+  let detail = null
+  try {
+    detail = await readRouteCapacityDetail(api, fixture)
+  } catch (error) {
+    errors.push(`专属产能详情回读: ${error.message}`)
+  }
+  const capacityRows = (detail?.procedureList || [])
+    .flatMap((procedure) => procedure.deviceList || [])
+    .filter((row) => row?.id != null)
+  for (const row of capacityRows) {
+    const capacityId = String(row.id)
+    retainedCapacityIds.push(capacityId)
+    if (row.productId != null && String(row.productId).trim() !== '') {
+      retainedProductIds.add(String(row.productId))
+    }
+    if (Number(row.publishStatus) !== 1) continue
+    try {
+      await api.postBusiness(
+        `/mes/wmsTechRoute/capacity/disable?capacityId=${encodeURIComponent(capacityId)}`)
+      actions.push({ action: 'disableCapacity', capacityId, status: 'APPLIED' })
+    } catch (error) {
+      errors.push(`专属产能${capacityId}停用: ${error.message}`)
+    }
+  }
+
+  let route = null
+  try {
+    route = (await api.getBusiness(
+      `/mes/wmsTechRoute/queryById?id=${encodeURIComponent(fixture.routeId)}`))?.data
+    if (Number(route?.devStatus) === 2) {
+      await api.postBusiness(`/mes/wmsTechRoute/unpublish?id=${encodeURIComponent(fixture.routeId)}`)
+      actions.push({ action: 'unpublishRoute', routeId: String(fixture.routeId), status: 'APPLIED' })
+    } else {
+      actions.push({
+        action: 'unpublishRoute', routeId: String(fixture.routeId),
+        status: Number(route?.devStatus) === 3 ? 'ALREADY_DISABLED' : 'NOT_PUBLISHED'
+      })
+    }
+  } catch (error) {
+    errors.push(`专属工艺路线停用: ${error.message}`)
+  }
+
+  let finalDetail = null
+  try {
+    finalDetail = await readRouteCapacityDetail(api, fixture)
+  } catch (error) {
+    errors.push(`专属产能停用后回读: ${error.message}`)
+  }
+  const finalCapacityRows = (finalDetail?.procedureList || [])
+    .flatMap((procedure) => procedure.deviceList || [])
+    .filter((row) => retainedCapacityIds.includes(String(row.id)))
+  const missingCapacityIds = retainedCapacityIds.filter((id) =>
+    !finalCapacityRows.some((row) => String(row.id) === id))
+  if (missingCapacityIds.length > 0) {
+    errors.push(`专属产能历史回读缺失: ${missingCapacityIds.join(',')}`)
+  }
+  const stillPublishedIds = finalCapacityRows
+    .filter((row) => Number(row.publishStatus) === 1)
+    .map((row) => String(row.id))
+  if (stillPublishedIds.length > 0) {
+    errors.push(`专属产能停用后仍为已发布: ${stillPublishedIds.join(',')}`)
+  }
+  const disabledPublishedIds = finalCapacityRows
+    .filter((row) => Number(row.publishStatus) === 2)
+    .map((row) => String(row.id))
+
+  let routeAfter = null
+  try {
+    routeAfter = (await api.getBusiness(
+      `/mes/wmsTechRoute/queryById?id=${encodeURIComponent(fixture.routeId)}`))?.data
+    if (Number(routeAfter?.devStatus) === 2) {
+      errors.push(`专属工艺路线停用后仍为已发布: ${fixture.routeId}`)
+    }
+  } catch (error) {
+    errors.push(`专属工艺路线停用后回读: ${error.message}`)
+  }
+  if (!routeAfter || String(routeAfter.id) !== String(fixture.routeId)) {
+    errors.push(`专属工艺路线停用后无法回读主档: ${fixture.routeId}`)
+  }
+
   return {
-    capacityId: String(capacityId),
-    detail: unwrap(await api.getBusiness(
-      `/mes/wmsTechRoute/getRouteCapacityDetail?routeId=${fixture.routeId}`))
+    manifest: 'RETAINED_AUDIT',
+    status: 'RETAINED_AUDIT',
+    cleaned: false,
+    errors,
+    actions,
+    retained: {
+      productIds: [...retainedProductIds],
+      routeId: String(fixture.routeId),
+      procedureId: String(fixture.procedureId),
+      capacityIds: retainedCapacityIds
+    },
+    verification: {
+      routeStatusBefore: route?.devStatus ?? null,
+      routeStatusAfter: routeAfter?.devStatus ?? null,
+      disabledPublishedCapacityIds: disabledPublishedIds,
+      allKnownCapacityRowsDisabled: finalCapacityRows
+        .filter((row) => Number(row.publishStatus) !== 0)
+        .every((row) => Number(row.publishStatus) === 2)
+    }
   }
 }
 
@@ -322,27 +576,42 @@ export const restoreMaterialGrade = async (api, original) => {
 
 export const deleteGrade = async (api, gradeId) => {
   if (!gradeId) return
-  await api.deleteBusiness(`/base/material-grade/delete?id=${encodeURIComponent(gradeId)}`).catch(() => {})
+  await api.request(
+    'DELETE',
+    `/base/material-grade/delete?id=${encodeURIComponent(gradeId)}`,
+    undefined,
+    {
+      expectedBusinessRejection: {
+        code: 500,
+        message: /品级已被引用，只能停用，不能删除/,
+        allowServiceCode: true
+      }
+    }
+  ).catch(() => {})
 }
 
 // ---------------------------------------------------------------------------
 // MES-BASE-004 生产日历发布/排产快照
 // ---------------------------------------------------------------------------
 
-export const createWorkCalendarFixture = async (api, marker, { workModeId, startDate, endDate }) => {
+export const workCalendarPayload = (marker, { workModeId, startDate, endDate }) => ({
+  calendarCode: `${marker}-CAL`,
+  calendarName: `${marker}-日历`,
+  startDate,
+  endDate,
+  workday: '1,2,3,4,5,6,0',
+  // Snowflake IDs must remain strings until the JSON boundary.
+  workModeId: String(workModeId),
+  priority: 900,
+  isEnabled: true,
+  remark: marker,
+  resourceScopes: []
+})
+
+export const createWorkCalendarFixture = async (api, marker, options) => {
+  const payload = workCalendarPayload(marker, options)
   const calendarCode = `${marker}-CAL`
-  await api.postBusiness('/mes/workCalendar/create', {
-    calendarCode,
-    calendarName: `${marker}-日历`,
-    startDate,
-    endDate,
-    workday: '1,2,3,4,5,6,0',
-    workModeId: Number(workModeId),
-    priority: 900,
-    isEnabled: true,
-    remark: marker,
-    resourceScopes: []
-  })
+  await api.postBusiness('/mes/workCalendar/create', payload)
   const rows = await queryRows(
     `SELECT id, version, publish_status FROM aps_work_calendar
      WHERE calendar_code='${escapeSql(calendarCode)}' AND deleted=0 ORDER BY id`)
@@ -396,20 +665,124 @@ export const readSchedulingVersionDb = async (versionId) => {
   }
 }
 
+export const createSchedulingSnapshotFixture = async (
+  api, caseRecord, marker, {
+    workOrderId, workOrderNo, routeId, routeName, procedureId, productId,
+    unitId, deviceId, lineId, calendarCode, calendarVersion, startDate
+  }
+) => {
+  const versionId = unwrap(await api.postBusiness('/mes/aps/scheduling/create', {
+    schedulingVersionName: `${marker}-正式排产`,
+    schedulingStartDate: startDate,
+    calendarCode: String(calendarCode),
+    calendarVersion: Number(calendarVersion),
+    schedulingDayCount: 1,
+    capacityLimitType: 'equipment',
+    workOrderIds: String(workOrderId)
+  }))
+  const subPage = await api.getBusiness(
+    `/mes/wmsTechRoute/listMesWmsTechRouteSubByMainId?parentId=${encodeURIComponent(routeId)}` +
+    '&pageNo=1&pageSize=50'
+  )
+  const routeSub = asList(subPage?.data).find((row) => String(row?.procedureId) === String(procedureId))
+  if (!routeSub?.id) {
+    return {
+      versionId: String(versionId),
+      snapshotReady: false,
+      reason: `专属工艺路线 ${routeId} 未回读到工序 ${procedureId} 的节点`
+    }
+  }
+  await api.postBusiness('/mes/wmsTechRoute/saveprocedureEquipmentRelation', [{
+    productionLineId: String(lineId),
+    procedureId: String(procedureId),
+    equipmentId: String(deviceId),
+    sortOrder: 1,
+    bindType: 'primary',
+    status: '1',
+    standardCapacityPerHour: 10,
+    remark: marker
+  }])
+  const capacityId = String(unwrap(await api.postBusiness('/mes/wmsTechRoute/capacity/save', {
+    routeSubId: String(routeSub.id),
+    procedureId: String(procedureId),
+    equipmentId: String(deviceId),
+    productId: String(productId),
+    unitId: String(unitId),
+    standardOutput: 88,
+    standardDuration: 60,
+    changeoverMinutes: 0,
+    calendarCode: String(calendarCode),
+    effectiveFrom: startDate,
+    remark: marker
+  })))
+  await api.postBusiness(
+    `/mes/wmsTechRoute/capacity/publish?capacityId=${encodeURIComponent(capacityId)}`)
+  const calculateResponse = await api.postBusiness('/mes/aps/scheduling/calculate', {
+    versionId,
+    forceSchedule: true,
+    compareAlgorithms: false,
+    algorithmType: 'GREEDY_LOCAL',
+    workOrders: [{
+      workOrderId: String(workOrderId),
+      sortOrder: 1,
+      processId: String(routeId),
+      processName: String(routeName)
+    }]
+  })
+  const result = calculateResponse?.data ?? calculateResponse
+  const resultRows = Array.isArray(result?.results)
+    ? result.results
+    : Object.values(result?.workOrderResults || {}).flat()
+  if (result?.success !== true || resultRows.length === 0) {
+    return {
+      versionId: String(versionId),
+      capacityId,
+      snapshotReady: false,
+      reason: `正式排产计算未产生结果：${JSON.stringify(result).slice(0, 500)}`
+    }
+  }
+  await api.postBusiness('/mes/aps/scheduling/publish', {
+    versionId,
+    overrideExisting: true,
+    viewType: 'equipment',
+    overrideCanReportNum: true
+  })
+  const snapshot = await readSchedulingVersionDb(String(versionId))
+  const capacityRows = await queryRows(
+    `SELECT id, publish_status FROM aps_tech_route_procedure_device_capacity
+     WHERE tenant_id=1 AND deleted=0 AND id='${escapeSql(capacityId)}'`)
+  caseRecord.evidence.push(
+    `正式排产快照 version=${versionId}, calendar=${snapshot.calendarCode}@${snapshot.calendarVersion}, ` +
+    `capacity=${capacityId}, capacityPublish=${capacityRows[0]?.[1]}`
+  )
+  return {
+    versionId: String(versionId),
+    capacityId,
+    snapshotReady: true,
+    routeSubId: String(routeSub.id),
+    snapshot,
+    expectedCalendarCode: String(calendarCode),
+    expectedCalendarVersion: Number(calendarVersion)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MES-BASE-005 班组交接
 // ---------------------------------------------------------------------------
 
-export const createTeamHandoverFixture = async (api, marker, { outTeamId, inTeamId }) => {
-  const handoverNo = `${marker}-TH`
-  const id = unwrap(await api.postBusiness('/mes/team-handover/create', {
-    handoverNo,
-    outTeamId: String(outTeamId),
-    inTeamId: String(inTeamId),
-    handoverTime: '2026-01-01 08:00:00',
-    handoverContent: marker,
-    remark: marker
-  }))
+export const teamHandoverPayload = (marker, { outTeamId, inTeamId }) => ({
+  handoverNo: `${marker}-TH`,
+  outTeamId: String(outTeamId),
+  inTeamId: String(inTeamId),
+  handoverTime: '2026-01-01T08:00:00',
+  handoverContent: marker,
+  remark: marker
+})
+
+export const createTeamHandoverFixture = async (api, marker, options) => {
+  const payload = teamHandoverPayload(marker, options)
+  const { handoverNo } = payload
+  const id = unwrap(await api.postBusiness('/mes/team-handover/create', payload))
   const detail = unwrap(await api.getBusiness(
     `/mes/team-handover/get?id=${encodeURIComponent(id)}`))
   return { handoverId: String(id), handoverNo, detail }
@@ -419,13 +792,27 @@ export const createTeamHandoverFixture = async (api, marker, { outTeamId, inTeam
 // PB038-003 品级库存拆分
 // ---------------------------------------------------------------------------
 
-export const readInventoryByGrade = async (materialId, gradeId, batchNo) => {
+export const readInventoryByGrade = async (materialId, gradeId, batchNo, dimensions = {}) => {
+  const filters = [
+    `material_id='${escapeSql(materialId)}'`,
+    `grade_id='${escapeSql(gradeId)}'`,
+    `batch_no='${escapeSql(batchNo)}'`
+  ]
+  for (const [column, value] of [
+    ['warehouse_id', dimensions.warehouseId],
+    ['ware_area_id', dimensions.wareAreaId],
+    ['ware_location_id', dimensions.wareLocationId]
+  ]) {
+    if (value != null && String(value) !== '') filters.push(`${column}='${escapeSql(value)}'`)
+  }
+  if (!dimensions.includeDeleted) filters.push('deleted=0')
   const rows = await queryRows(
-    `SELECT id, material_id, grade_id, batch_no, qty, available_qty,
-            in_qty, out_qty, warehouse_id, ware_area_id, ware_location_id
+    `SELECT id, material_id, grade_id, batch_no, qty, available_qty, cost,
+            in_qty, out_qty, warehouse_id, ware_area_id, ware_location_id,
+            CASE WHEN deleted = 1 THEN 1 WHEN deleted = 0 THEN 0 ELSE NULL END AS deleted,
+            is_closed
      FROM mes_stk_inventory
-     WHERE tenant_id=1 AND deleted=0 AND material_id='${escapeSql(materialId)}'
-       AND grade_id='${escapeSql(gradeId)}' AND batch_no='${escapeSql(batchNo)}'`)
+     WHERE tenant_id=1 AND ${filters.join(' AND ')}`)
   return rows.map((row) => ({
     id: String(row[0]),
     materialId: String(row[1]),
@@ -433,11 +820,14 @@ export const readInventoryByGrade = async (materialId, gradeId, batchNo) => {
     batchNo: row[3],
     qty: row[4] == null ? 0 : Number(row[4]),
     availableQty: row[5] == null ? 0 : Number(row[5]),
-    inQty: row[6] == null ? 0 : Number(row[6]),
-    outQty: row[7] == null ? 0 : Number(row[7]),
-    warehouseId: row[8] == null ? null : String(row[8]),
-    wareAreaId: row[9] == null ? null : String(row[9]),
-    wareLocationId: row[10] == null ? null : String(row[10])
+    cost: row[6] == null ? null : Number(row[6]),
+    inQty: row[7] == null ? 0 : Number(row[7]),
+    outQty: row[8] == null ? 0 : Number(row[8]),
+    warehouseId: row[9] == null ? null : String(row[9]),
+    wareAreaId: row[10] == null ? null : String(row[10]),
+    wareLocationId: row[11] == null ? null : String(row[11]),
+    deleted: row[12] == null ? null : Number(row[12]),
+    isClosed: row[13] == null ? 0 : Number(row[13])
   }))
 }
 

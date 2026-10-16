@@ -2,12 +2,15 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import test from 'node:test'
 import {
+  QUALITY_BASE_004_CATALOG_ASSERTIONS,
   QUALITY_METRIC_DETAIL_PAGE_SIZE,
   QUALITY_METRIC_FIXTURE_INSPECTION_COUNT,
   QUALITY_METRIC_OVERSIZED_PAGE_SIZE,
   assertQualityMetricFixtureScope,
   assertQualityMetricWritePreflight,
-  evaluateMetricPageClamp
+  evaluateMetricPageClamp,
+  isSqlTrue,
+  normalizeQualityDate
 } from '../suites/mes-quality.mjs'
 
 const local = {
@@ -107,6 +110,29 @@ test('quality metric page evidence rejects HTTP-only success, empty rows and bus
       expectedTotal: QUALITY_METRIC_FIXTURE_INSPECTION_COUNT
     }).passed, false)
   }
+})
+
+test('quality material scope accepts LocalDate arrays and records the expected service rejection', () => {
+  assert.equal(normalizeQualityDate([2026, 10, 7]), '2026-10-07')
+  assert.equal(normalizeQualityDate('2026-10-07T00:00:00'), '2026-10-07')
+  assert.equal(normalizeQualityDate(null), '')
+})
+
+test('quality material SQL BIT flags accept mysql raw binary output', () => {
+  assert.equal(isSqlTrue(1), true)
+  assert.equal(isSqlTrue('\u0001'), true)
+  assert.equal(isSqlTrue('1'), true)
+  assert.equal(isSqlTrue('0'), false)
+  assert.equal(isSqlTrue(null), false)
+})
+
+test('quality material scope catalog assertions remain aligned with the catalog', () => {
+  assert.deepEqual(QUALITY_BASE_004_CATALOG_ASSERTIONS, [
+    '绑定维度包含租户、存货、核心类型、适用组织、业务子类型、生效期和方案版本',
+    '同一存货、核心类型、适用范围只能有一个有效默认方案',
+    '更具体规则优先于通用规则',
+    '已被正式记录引用的绑定只能停用'
+  ])
 })
 
 test('quality metric case creates an owned legal fixture before aggregating and cleans it afterwards', () => {

@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createProcurementSettlementFixture, procurementSettlementFixturePayload } from '../fixtures/procurement-settlement.mjs'
+import {
+  PROCUREMENT_DIRECT_CREATE_PERMISSION,
+  PROCUREMENT_SUPER_PERMISSION
+} from '../fixtures/procurement-direct-create-gate.mjs'
 
 test('PROC-005 settlement fixture uses an isolated method and snapshot order payload', () => {
   const payload = procurementSettlementFixturePayload(
@@ -30,7 +34,7 @@ test('PROC-005 settlement fixture uses an isolated method and snapshot order pay
   assert.match(payload.order.directCreateReason, /PROC-005 isolated/)
 })
 
-const fixtureApi = (record, failAt) => {
+const fixtureApi = (record, failAt, permission) => {
   const ids = ['4101', '5101', '6101', '7101', '8101']
   const fields = ['supplierId', 'dictionaryId', 'ruleId', 'orderId', 'saleOrderId']
   let created = 0
@@ -43,8 +47,11 @@ const fixtureApi = (record, failAt) => {
   let dictionaryStatus = 0
   const success = (data) => ({ code: 0, data })
   return {
+    getPermissionInfo: async () => success({ permissions: [permission] }),
     async getBusiness (path) {
-      if (path.startsWith('/system/config/get')) return success(null)
+      if (path.startsWith('/system/config/get')) {
+        return success(permission ? { configData: 'true' } : null)
+      }
       if (path.startsWith('/mes/basMaterial/')) {
         return success({ records: [{ id: '2101', unitId: '3101' }] })
       }
@@ -88,6 +95,8 @@ const fixtureApi = (record, failAt) => {
       if (path === '/base/partner/create') supplierName = payload.name
       if (path === '/erp/purchase-order/create') {
         code = payload.settleMethodCode
+        assert.equal(payload.directCreate, 1)
+        assert.match(payload.directCreateReason, /PROC-005 isolated/)
         assert.equal(payload.totalCount, 1)
         assert.equal(payload.totalProductPrice, 88.8)
         assert.equal(payload.totalTaxPrice, 0)
@@ -154,6 +163,20 @@ test('PROC-005 verifies snapshot versions and retains all created IDs', async ()
   assert.equal(result.rejectedSale.code, 1030102016)
   assert.equal(result.rejectedPurchase.code, 1030102016)
 })
+
+for (const permission of [PROCUREMENT_DIRECT_CREATE_PERMISSION, PROCUREMENT_SUPER_PERMISSION]) {
+  test(`PROC-005 completes settlement snapshots with requisition enabled and ${permission}`, async () => {
+    const record = { evidence: [], fixtures: [] }
+    const result = await createProcurementSettlementFixture(fixtureApi(record, undefined, permission), record)
+    assert.equal(result.fixture.status, 'verified')
+    assert.equal(result.fixture.requisitionEnabled, true)
+    assert.equal(result.fixture.directCreatePermission, permission)
+    assert.equal(result.afterDictionaryDisable.purchase.settleMethodRuleVersion, 1)
+    assert.equal(result.afterDictionaryDisable.sale.settleMethodRuleVersion, 2)
+    assert.equal(result.rejectedPurchase.code, 1030102016)
+    assert.equal(result.rejectedSale.code, 1030102016)
+  })
+}
 
 test('PROC-005 fixture source contains only the approved procurement write endpoints', async () => {
   const source = await import('../fixtures/procurement-settlement.mjs')

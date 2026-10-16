@@ -1,20 +1,10 @@
 import { randomBytes } from 'node:crypto'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
+import { assertProcurementDirectCreateGate } from './procurement-direct-create-gate.mjs'
 
 const dataOf = (payload, label) => assertBusinessSuccess(payload, label).data
 const stableId = (value) => /^[1-9]\d*$/.test(String(value ?? ''))
 const localDateTime = () => new Date().toISOString().slice(0, 19)
-
-const enabledConfig = (raw) => {
-  if (typeof raw !== 'string' || !raw.trim()) return false
-  if (['true', '1'].includes(raw.trim().toLowerCase())) return true
-  try {
-    const value = JSON.parse(raw)
-    return value && [true, 'true', 1, '1'].includes(value.enabled)
-  } catch {
-    return false
-  }
-}
 
 /**
  * PB settings real write side for the 结算方式规则 page (PROC-006).
@@ -27,16 +17,7 @@ const enabledConfig = (raw) => {
  */
 export async function createSettleRuleWriteFixture (api, caseRecord) {
   const tag = `${Date.now().toString(36).toUpperCase()}_${randomBytes(2).toString('hex')}`
-
-  const option = dataOf(
-    await api.getBusiness('/system/config/get?category=purchase&tag=requisition'),
-    'PROC-006 请购开关'
-  )
-  if (option && enabledConfig(option.configData)) {
-    throw new Error(
-      'BLOCKED: PROC-006 请购开关已开启；专属直采订单需要独立 direct-create 权限或有效请购来源，未切换共享策略'
-    )
-  }
+  const directCreateGate = await assertProcurementDirectCreateGate(api, 'PROC-006')
 
   const materialPage = dataOf(
     await api.getBusiness(
@@ -52,6 +33,8 @@ export async function createSettleRuleWriteFixture (api, caseRecord) {
     tag,
     status: 'creating',
     retained: true,
+    requisitionEnabled: directCreateGate.requisitionEnabled,
+    directCreatePermission: directCreateGate.directCreatePermission,
     reason: '专属结算方式与规则逐步登记；结束后停用规则不删除平台模板'
   }
   caseRecord.fixtures = [...(caseRecord.fixtures || []), fixture]

@@ -81,11 +81,15 @@ test('PLM missing version and dryRun success never become formal release evidenc
   assert.equal(facts.partial, true)
 })
 
-test('PLM target suite does not call mutating release APIs', () => {
+test('PLM suite delegates owned writes without shared baseline fallback or body-only UI checks', () => {
   const source = fs.readFileSync(new URL('../suites/plm.mjs', import.meta.url), 'utf8')
-  assert.doesNotMatch(source, /\/(create|update|status|freeze|release|release-to-mes|mbom-release|save-line|delete-line)/)
-  assert.doesNotMatch(source, /api\.(post|put|delete)/)
+  assert.match(source, /runPlmWriteClosure/)
+  assert.match(source, /returnContext: true/)
+  assert.match(source, /assertPlmLocalTarget/)
+  assert.match(source, /createPlmKnowledgeApi/)
   assert.doesNotMatch(source, /getBusiness\([^)]*route-context/)
   assert.doesNotMatch(source, /readySelector: 'body'/)
-  assert.match(source, /partial: true/)
+  assert.match(source, /展示本轮专属样本/)
+  assert.match(source, /result\.acceptanceComplete === true && uiComplete/)
+  assert.doesNotMatch(source, /baselines\.find|仅读取当前租户建模样本/)
 })

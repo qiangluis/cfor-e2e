@@ -10,6 +10,8 @@ import {
   saveScreenshot as saveScreenshotDefault
 } from '../lib/browser.mjs'
 import { createWarehouseFixture } from '../lib/wms-fixtures.mjs'
+import { ExecutionWorkflowFixture } from '../fixtures/mes-execution-write.mjs'
+import { runMesRouteVersionClosure, verifyMesRouteVersionPage } from '../fixtures/mes-route-version-closure.mjs'
 import {
   hasWriteApi,
   newMarker,
@@ -21,9 +23,17 @@ import {
   createProductionTypeFixture,
   pickBomMaterial,
   createProdOrderWithType,
+  createOutsourceTypeRuleFixture,
+  createOutsourceBillWithType,
   createRouteCapacityFixture,
+  createCapacityProductFixture,
   bindDeviceCapacity,
+  saveDeviceCapacity,
+  readRouteCapacityDetail,
+  cleanupRouteCapacityFixture,
   listCapacities,
+  capacityRowsForProduct,
+  capacityMinimum,
   createGrade,
   createGradeMaterial,
   materialEditBody,
@@ -35,10 +45,12 @@ import {
   createWorkCalendarFixture,
   readWorkCalendarDb,
   createSchedulingVersionFixture,
+  createSchedulingSnapshotFixture,
   readSchedulingVersionDb,
   createTeamHandoverFixture,
   readInventoryByGrade
 } from '../fixtures/mes-base-fixtures.mjs'
+import { matchesExpectedBusinessRejection } from '../lib/api.mjs'
 
 export const cases = [
   'MES-BASE-001',
@@ -92,6 +104,19 @@ export const mesBaseDetail = (result, id, label) => {
   return data
 }
 
+export const matchesTeamHandoverCancellation = (detail, rows, expected) => {
+  const { handoverId, outTeamId, inTeamId, marker, reason } = expected
+  const remark = `${marker}；取消原因：${reason}`
+  return String(detail?.id) === handoverId && Number(detail?.status) === 0 &&
+    detail?.outConfirmBy === null && detail?.inConfirmBy === null &&
+    String(detail?.outTeamId) === outTeamId && String(detail?.inTeamId) === inTeamId &&
+    detail?.remark === remark &&
+    Array.isArray(rows) && rows.length === 1 &&
+    JSON.stringify(rows[0]) === JSON.stringify([
+      handoverId, '0', 'NULL', 'NULL', remark, '1', '0', outTeamId, inTeamId
+    ])
+}
+
 export const isPb038002Fixture = (material) =>
   /^(?:E2E|AUTOTEST)_PB038_002(?:_|$)/.test(material?.code || '') &&
   material?.mark === 'PB038-002 dedicated e2e fixture' &&
@@ -102,6 +127,153 @@ export const pb038GradePayload = (material, gradeFields) => {
     throw new Error('PB038-002 禁止编辑非本案例专用测试夹具')
   }
   return { ...material, ...gradeFields }
+}
+
+export const matchesGradeInventoryReportRow = (row, expected) =>
+  String(row?.materialId) === String(expected.materialId) &&
+  String(row?.materialCode) === String(expected.materialCode) &&
+  String(row?.warehouseId) === String(expected.warehouseId) &&
+  String(row?.wareAreaId) === String(expected.wareAreaId) &&
+  String(row?.wareLocationId) === String(expected.wareLocationId) &&
+  String(row?.gradeId) === String(expected.gradeId) &&
+  Number(row?.qty) === Number(expected.qty) &&
+  Number(row?.availableQty) === Number(expected.qty)
+
+export const matchesPb038ReportUiRows = (rows, materialCode, expectedQty = [1, 2]) => {
+  if (!Array.isArray(rows) || rows.length !== 2) return false
+  const quantities = rows.map((row) => Number(row?.qty)).sort((a, b) => a - b)
+  const expected = expectedQty.map(Number).sort((a, b) => a - b)
+  return rows.every((row) => String(row?.materialCode) === String(materialCode) &&
+    Number(row?.availableQty) === Number(row?.qty)) &&
+    JSON.stringify(quantities) === JSON.stringify(expected)
+}
+
+const readPb038ReportUiRows = async (page) => {
+  const wrappers = page.locator('.table-panel .vxe-table--body-wrapper:visible')
+  return wrappers.evaluateAll((bodyWrappers) => {
+    const rowsById = new Map()
+    for (const bodyWrapper of bodyWrappers) {
+      const scope = bodyWrapper.parentElement
+      const headers = [...(scope?.querySelectorAll('.vxe-table--header-wrapper .vxe-header--column') || [])]
+        .map((header) => ({
+          id: header.getAttribute('colid') || header.getAttribute('data-colid'),
+          text: String(header.textContent || '').replace(/\s+/g, ' ').trim()
+        }))
+      const fieldByColumnId = new Map(headers.filter((header) => header.id).map((header) => {
+        const field = header.text.includes('存货编码') ? 'materialCode'
+          : header.text.includes('现存量') ? 'qty'
+            : header.text.includes('可用量') ? 'availableQty' : null
+        return [header.id, field]
+      }))
+      for (const [index, row] of [...bodyWrapper.querySelectorAll('.vxe-body--row')].entries()) {
+        const key = row.getAttribute('rowid') || row.getAttribute('data-rowid') || String(index)
+        const current = rowsById.get(key) || {}
+        for (const cell of row.querySelectorAll('.vxe-body--column')) {
+          const field = fieldByColumnId.get(cell.getAttribute('colid') || cell.getAttribute('data-colid'))
+          if (!field) continue
+          current[field] = String(cell.textContent || '').replace(/\s+/g, ' ').trim()
+        }
+        rowsById.set(key, current)
+      }
+    }
+    return [...rowsById.values()]
+  })
+}
+
+async function verifyPb038ReportPage ({ api, page, openRoute, materialCode, warehouse, area, location, expectedQty }) {
+  const reportRoute = await openPermissionRoute(api, page, openRoute,
+    ['wms/stock/reportForms/standingStock/index',
+      'mes/reportForms/standingStock/index',
+      'erp/wireSideWarehouse/reportForms/standingStock/index',
+      'wms/stock/report/inventory'], {
+      readySelector: 'input[placeholder="请输入存货编码"]'
+    })
+  const selectOption = async (label, optionLabel) => {
+    const exactLabel = new RegExp(`^${String(label).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)
+    const field = page.locator('.el-form-item').filter({
+      has: page.locator('.el-form-item__label').filter({ hasText: exactLabel })
+    }).first()
+    await field.locator('.el-select').click()
+    await page.locator('.el-select-dropdown:visible').last()
+      .getByRole('option', { name: optionLabel, exact: true }).click()
+  }
+  const warehouseLabel = warehouse.name || warehouse.code
+  const areaLabel = [warehouseLabel, area.areaName || area.areaCode].filter(Boolean).join(' / ')
+  const locationLabel = [area.areaName || area.areaCode, location.locationName || location.locationCode]
+    .filter(Boolean).join(' / ')
+  await selectOption('仓库', warehouseLabel)
+  await selectOption('库区', areaLabel)
+  await selectOption('库位', locationLabel)
+  const input = page.locator('input[placeholder="请输入存货编码"]').first()
+  await input.fill(materialCode)
+  const response = page.waitForResponse((response) => {
+    if (response.request().method() !== 'GET' || !response.url().includes('/mes/stkIo/queryStockQty')) {
+      return false
+    }
+    const params = new URL(response.url()).searchParams
+    return params.get('materialCode') === String(materialCode) &&
+      params.get('warehouseId') === String(warehouse.id) &&
+      params.get('wareAreaId') === String(area.id) &&
+      params.get('wareLocationId') === String(location.id)
+  }, { timeout: 30000 })
+  await page.getByRole('button', { name: '搜索', exact: true }).first().click()
+  await response
+  await page.locator('.table-panel .vxe-table--main-wrapper').first().scrollIntoViewIfNeeded()
+  try {
+    await page.waitForFunction(({ code, expected }) => {
+      const wrappers = [...document.querySelectorAll('.table-panel .vxe-table--body-wrapper')]
+        .filter((wrapper) => {
+          const style = window.getComputedStyle(wrapper)
+          return style.display !== 'none' && style.visibility !== 'hidden' &&
+            (wrapper.offsetWidth > 0 || wrapper.offsetHeight > 0 || wrapper.getClientRects().length > 0)
+        })
+      const rowsById = new Map()
+      const normalize = (value) => String(value || '').replace(/,/g, '').replace(/\s+/g, ' ').trim()
+      for (const bodyWrapper of wrappers) {
+        const scope = bodyWrapper.parentElement
+        const headers = [...(scope?.querySelectorAll('.vxe-table--header-wrapper .vxe-header--column') || [])]
+          .map((header) => ({
+            id: header.getAttribute('colid') || header.getAttribute('data-colid'),
+            text: normalize(header.textContent)
+          }))
+        const fieldByColumnId = new Map(headers.filter((header) => header.id).map((header) => {
+          const field = header.text.includes('存货编码') ? 'materialCode'
+            : header.text.includes('现存量') ? 'qty'
+              : header.text.includes('可用量') ? 'availableQty' : null
+          return [header.id, field]
+        }))
+        for (const [index, row] of [...bodyWrapper.querySelectorAll('.vxe-body--row')].entries()) {
+          const key = row.getAttribute('rowid') || row.getAttribute('data-rowid') || String(index)
+          const current = rowsById.get(key) || {}
+          for (const cell of row.querySelectorAll('.vxe-body--column')) {
+            const field = fieldByColumnId.get(cell.getAttribute('colid') || cell.getAttribute('data-colid'))
+            if (field) current[field] = normalize(cell.textContent)
+          }
+          rowsById.set(key, current)
+        }
+      }
+      const rows = [...rowsById.values()]
+      const quantities = rows.map((row) => Number(row.qty)).sort((a, b) => a - b)
+      const expectedQuantities = expected.map(Number).sort((a, b) => a - b)
+      return !document.querySelector('.table-panel .vxe-table.is--loading') &&
+        rows.length === 2 &&
+        rows.every((row) => row.materialCode === code &&
+          Number(row.availableQty) === Number(row.qty)) &&
+        JSON.stringify(quantities) === JSON.stringify(expectedQuantities)
+    }, { code: String(materialCode), expected: expectedQty }, { timeout: 30000 })
+  } catch (error) {
+    // Keep the final readback as the business assertion evidence when the settled
+    // table is wrong, instead of converting a quantity mismatch into a harness error.
+  }
+  const rows = await readPb038ReportUiRows(page)
+  const quantities = rows.map((row) => Number(row.qty)).sort((a, b) => a - b)
+  return {
+    passed: rows.length === 2 &&
+      rows.every((row) => row.materialCode === materialCode &&
+        Number(row.availableQty) === Number(row.qty)) &&
+      JSON.stringify(quantities) === JSON.stringify(expectedQty),
+    details: JSON.stringify({ reportRoute, materialCode, expectedQty, rows })
+  }
 }
 
 export const isLegacyInitializedRoute = (row) =>
@@ -119,14 +291,22 @@ const SEED = Object.freeze({
   deviceQuality: '2106401100798558209'
 })
 
-const today = () => new Date().toISOString().slice(0, 10)
+const today = () => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+}).format(new Date())
 
 const findComponentRoute = (menus, component) => {
+  const normalize = (value) => String(value || '').split('?')[0]
+    .replace(/^\/?(?:src\/)?views\//, '').replace(/^\/+/, '')
+    .replace(/\.vue$/, '').replace(/\/index$/, '')
   const find = (rows, parent = '') => {
     for (const row of rows || []) {
       const route = row.path?.startsWith('/') ? row.path : `${parent}/${row.path || ''}`
-      const value = String(row.component || '').replace(/^\/?views\//, '').replace(/\.vue$/, '')
-      if (value === component) return route
+      const value = normalize(row.component)
+      if (value === normalize(component)) return route
       const child = find(row.children || [], route)
       if (child) return child
     }
@@ -135,12 +315,74 @@ const findComponentRoute = (menus, component) => {
   return find(menus)
 }
 
+const openPermissionRoute = async (api, page, openRoute, components, options) => {
+  const permission = await api.getBusiness('/system/auth/get-permission-info')
+  const route = components.map((component) => findComponentRoute(permission?.data?.menus, component))
+    .find(Boolean)
+  if (!route) {
+    throw new Error(`BLOCKED: 权限菜单未注册专属页面组件：${components.join(', ')}`)
+  }
+  await openRoute(page, route, options)
+  return route
+}
+
+const catalogDefinition = (caseId) => {
+  const catalog = JSON.parse(fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../cases/catalog.json'), 'utf8'))
+  return (catalog.suites || []).flatMap((suite) => suite.cases || [])
+    .find((item) => item.id === caseId)
+}
+
+const initializeCatalogAssertions = (caseRecord, caseId) => {
+  const assertions = catalogDefinition(caseId)?.assertions || []
+  caseRecord.catalogAssertions = assertions.map((assertion, index) => ({
+    index, assertion, status: 'GAP', evidenceChecks: [], details: '本轮尚未执行该原断言'
+  }))
+  caseRecord.remainingAssertions = [...assertions]
+  caseRecord.catalogComplete = false
+  return caseRecord.catalogAssertions
+}
+
+const markCatalogAssertion = (caseRecord, index, evidenceChecks, gap = '') => {
+  const row = caseRecord.catalogAssertions?.[index]
+  if (!row) return
+  const names = [...(evidenceChecks || [])]
+  const checks = names.map((name) => caseRecord.checks.find((check) => check.name === name))
+  const missing = names.filter((name, position) => !checks[position])
+  const failed = checks.find((check) => check && check.passed !== true)
+  row.evidenceChecks = names
+  row.status = !gap && names.length > 0 && missing.length === 0 && !failed ? 'VERIFIED' : 'GAP'
+  row.details = [gap, ...checks.map((check, position) => check
+    ? `${check.name}: ${check.details}` : `缺证: ${names[position]}`)].filter(Boolean).join('; ')
+  caseRecord.remainingAssertions = (caseRecord.catalogAssertions || [])
+    .filter((item) => item.status !== 'VERIFIED').map((item) => item.assertion)
+  caseRecord.catalogComplete = caseRecord.remainingAssertions.length === 0
+}
+
 const expectBusinessFailure = (result, { code, includes }, label) => {
   const message = String(result?.msg ?? result?.message ?? '')
   const passed = (code == null || Number(result?.code) === Number(code)) &&
     (!includes || message.includes(includes))
   if (!passed) {
     throw new Error(`${label} 未被后端按预期拒绝：${JSON.stringify(result).slice(0, 300)}`)
+  }
+  return true
+}
+
+export const isMesBaseSuccess = (result) => isBusinessSuccess(result)
+
+export const expectedMesBaseDomainRejection = (code, message) => ({
+  code,
+  message,
+  allowServiceCode: true
+})
+
+const requestExpectedDomainRejection = (api, method, pathname, body, contract) =>
+  api.request(method, pathname, body, { expectedBusinessRejection: contract })
+
+const assertMesBaseDomainRejection = (result, contract, label) => {
+  if (!matchesExpectedBusinessRejection(result, contract)) {
+    throw new Error(`${label} 未被后端按明确业务拒绝契约返回：${JSON.stringify(result).slice(0, 300)}`)
   }
   return true
 }
@@ -695,6 +937,106 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
     return { api }
   }
 
+  if (caseId === 'MES-BASE-002') {
+    await assertLocalWriteSafety(caseRecord)
+    initializeCatalogAssertions(caseRecord, caseId)
+    const marker = newMarker('MESB002')
+    let bill = null
+    let workRule = null
+    let processRule = null
+    try {
+      workRule = await createOutsourceTypeRuleFixture(api, marker, { coreType: 'WORK' })
+      processRule = await createOutsourceTypeRuleFixture(api, `${marker}P`, { coreType: 'PROCESS' })
+      const invalidCore = await api.request('POST', '/mes/outsource-type-rule/create', {
+        documentTypeId: workRule.documentTypeId,
+        coreType: 'INVALID_CORE',
+        effectiveFrom: '2026-01-01',
+        status: 1,
+        remark: `${marker}-BAD`
+      })
+      expectBusinessFailure(invalidCore, { code: 2010951002 }, '非法委外核心类型')
+      check('委外核心类型白名单只接受 PROCESS 与 WORK',
+        ['WORK', 'PROCESS'].includes(workRule.rule.coreType) &&
+        processRule.rule.coreType === 'PROCESS' && Number(invalidCore?.code) === 2010951002,
+        `work=${workRule.rule.coreType}, process=${processRule.rule.coreType}, ` +
+        `invalid=${JSON.stringify(invalidCore).slice(0, 160)}`)
+
+      check('企业业务类型规则映射唯一核心类型并保存稳定编码与版本',
+        nonBlank(workRule.documentTypeCode) &&
+        String(workRule.rule.documentTypeId) === workRule.documentTypeId &&
+        workRule.rule.coreType === 'WORK' && Number(workRule.rule.version) === 1 &&
+        Number(workRule.rule.status) === 1,
+        `code=${workRule.documentTypeCode}, rule=${workRule.ruleId}, ` +
+        `coreType=${workRule.rule.coreType}, version=${workRule.rule.version}`)
+
+      bill = await createOutsourceBillWithType(api, marker, workRule)
+      const dbRows = await queryRows(
+        `SELECT outsource_type, outsource_type_code, outsource_type_rule_version
+         FROM mes_prod_outsource WHERE tenant_id=1 AND id='${bill.billId}'`)
+      check('委外单保存业务类型编码和规则版本快照',
+        bill.detail.outsourceTypeCode === workRule.documentTypeCode &&
+        Number(bill.detail.outsourceTypeRuleVersion) === 1 &&
+        bill.detail.outsourceType === 'WORK' &&
+        dbRows.length === 1 && dbRows[0][1] === workRule.documentTypeCode &&
+        Number(dbRows[0][2]) === 1,
+        `detailCode=${bill.detail.outsourceTypeCode}, ` +
+        `detailVersion=${bill.detail.outsourceTypeRuleVersion}, db=${JSON.stringify(dbRows[0] || [])}`)
+
+      const blocked = await api.request('DELETE',
+        `/mes/outsource-type-rule/delete?id=${workRule.ruleId}`)
+      expectBusinessFailure(blocked, { code: 2010951003, includes: '不能删除' }, '被委外单引用的规则删除')
+      check('被委外单引用的规则禁止删除',
+        Number(blocked?.code) === 2010951003, JSON.stringify(blocked))
+
+      await api.putBusiness('/mes/outsource-type-rule/update', {
+        id: workRule.ruleId,
+        documentTypeId: workRule.documentTypeId,
+        coreType: 'WORK',
+        effectiveFrom: '2026-01-01',
+        status: 0,
+        remark: marker
+      })
+      const afterDisable = unwrap(await api.getBusiness(
+        `/mes/prodOutsource/queryById?id=${encodeURIComponent(bill.billId)}`))
+      check('规则停用升版后历史委外单快照不被追溯改写',
+        Number(afterDisable.outsourceTypeRuleVersion) === 1,
+        `orderVersion=${afterDisable.outsourceTypeRuleVersion}`)
+
+      markCatalogAssertion(caseRecord, 0, ['委外核心类型白名单只接受 PROCESS 与 WORK'])
+      markCatalogAssertion(caseRecord, 1, ['企业业务类型规则映射唯一核心类型并保存稳定编码与版本'])
+      markCatalogAssertion(caseRecord, 2, ['委外单保存业务类型编码和规则版本快照'])
+      markCatalogAssertion(caseRecord, 3, ['被委外单引用的规则禁止删除'])
+      caseRecord.evidence.push(
+        `专属委外业务类型规则 rule=${workRule.ruleId}(code=${workRule.documentTypeCode})、` +
+        `委外单 bill=${bill.billId}(no=${bill.billNo})；历史快照版本=${afterDisable.outsourceTypeRuleVersion}`)
+    } finally {
+      if (bill?.billId) {
+        await api.deleteBusiness(
+          `/mes/prodOutsource/delete?id=${encodeURIComponent(bill.billId)}`).catch(() => {})
+      }
+      for (const rule of [workRule, processRule]) {
+        if (rule?.ruleId) {
+          await api.deleteBusiness(
+            `/mes/outsource-type-rule/delete?id=${rule.ruleId}`).catch(() => {})
+        }
+        if (rule?.documentTypeId) {
+          await api.deleteBusiness(
+            `/system/document/type/delete?id=${rule.documentTypeId}`).catch(() => {})
+        }
+      }
+    }
+    const failed = caseRecord.checks.filter((row) => !row.passed)
+    const gaps = (caseRecord.catalogAssertions || []).filter((row) => row.status !== 'VERIFIED')
+    return failed.length || gaps.length
+      ? {
+          api, partial: true,
+          note: '委外业务类型规则真实写侧已执行，失败项：' +
+            [...failed.map((row) => `${row.name}=${row.details}`),
+              ...gaps.map((row) => `原断言GAP=${row.assertion}: ${row.details}`)].join('；')
+        }
+      : { api }
+  }
+
   if (caseId === 'MES-BASE-003') {
     await assertLocalWriteSafety(caseRecord)
     const objects = mesBaseRows(await api.getBusiness('/erp/barcode/catalog/object-types'), '条码对象目录')
@@ -771,6 +1113,7 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
 
   if (caseId === 'MES-BASE-004') {
     await assertLocalWriteSafety(caseRecord)
+    initializeCatalogAssertions(caseRecord, caseId)
     const marker = newMarker('MESB004')
     const modes = mesBaseRows(await api.getBusiness('/mes/workMode/list'), '工作模式')
     const mode = modes.find((row) => row?.id && (row.enabled === true || row.enabled === 1))
@@ -800,11 +1143,23 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
       published?.publishStatus === 1 && published?.version >= 1,
       `id=${calendar.firstId}, status=${published?.publishStatus}, version=${published?.version}`)
 
-    const publishedDelete = await api.request('DELETE',
-      `/mes/workCalendar/delete?id=${encodeURIComponent(calendar.firstId)}`)
+    const publishedPage = mesBaseRows(await api.getBusiness(
+      `/mes/workCalendar/page?pageNo=1&pageSize=100&calendarCode=${encodeURIComponent(calendar.calendarCode)}`),
+    '已发布生产日历')
+      .find((row) => String(row.id) === calendar.firstId)
+    check('生产日历响应 VO 暴露发布状态与版本号',
+      publishedPage != null && Number(publishedPage.publishStatus) === 1 &&
+      Number(publishedPage.version) >= 1,
+      JSON.stringify({ id: publishedPage?.id, publishStatus: publishedPage?.publishStatus, version: publishedPage?.version }))
+
+    const publishedDeleteContract = expectedMesBaseDomainRejection(
+      500, /日历已发布，只能停用或新建版本，不能删除/
+    )
+    const publishedDelete = await requestExpectedDomainRejection(api, 'DELETE',
+      `/mes/workCalendar/delete?id=${encodeURIComponent(calendar.firstId)}`,
+      undefined, publishedDeleteContract)
     check('已发布生产日历禁止物理删除，只能停用或新建版本',
-      Number(publishedDelete?.code) !== 0 &&
-      String(publishedDelete?.msg ?? publishedDelete?.message ?? '').includes('已发布'),
+      assertMesBaseDomainRejection(publishedDelete, publishedDeleteContract, '已发布生产日历删除'),
       JSON.stringify(publishedDelete))
 
     const scheduling = await createSchedulingVersionFixture(api, marker, startDate)
@@ -824,18 +1179,53 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
         .every((name) => versionColumnNames.includes(name)),
       versionColumnNames.join(','))
 
-    // 触发正式排产快照写入需要完整排产结果与发布门禁；本案例专用版本没有正式工单，
-    // 因此读取层只做契约检查，真实写侧快照证据以发布门禁响应为准。
-    const gate = await api.getBusiness(
-      `/mes/aps/scheduling/publish-gate?versionId=${scheduling.versionId}`)
-    check('排产发布门禁在缺少正式排产结果时明确阻断而不是伪造快照',
-      gate?.data && gate.data.passed === false,
-      JSON.stringify(gate?.data).slice(0, 300))
+    // 触发正式排产快照写入需要完整正式工单/工艺/产能链路与发布门禁；本案例构建专属
+    // AUTOTEST 工单 + 产能，正式计算并发布，取得 calendar_code/calendar_version/capacity_snapshot 快照。
+    const context = await resolveWriteContext(api)
+    let fixture = null
+    let snapshot = null
+    try {
+      fixture = new ExecutionWorkflowFixture(api, record, 'MES-BASE-004', {
+        schedule: false,
+        reuseEnabledBom: true
+      })
+      await fixture.setup(caseRecord)
+      snapshot = await createSchedulingSnapshotFixture(api, caseRecord, marker, {
+        workOrderId: fixture.works[0].id,
+        workOrderNo: fixture.works[0].workTicketNo,
+        routeId: fixture.route.id,
+        routeName: fixture.route.identity,
+        procedureId: fixture.procedure.id,
+        productId: fixture.material.id,
+        unitId: fixture.unit.id,
+        deviceId: context.deviceId,
+        lineId: fixture.lineId,
+        calendarCode: calendar.calendarCode,
+        calendarVersion: published.version,
+        startDate
+      })
+    } catch (error) {
+      caseRecord.notes.push(`正式排产快照夹具执行失败：${error.message}`)
+    } finally {
+      if (fixture) {
+        await fixture.cleanup(caseRecord).catch(() => {})
+      }
+    }
 
-    const versionRow = await readSchedulingVersionDb(scheduling.versionId)
-    caseRecord.evidence.push(
-      `排产版本库内快照 calendarCode=${versionRow.calendarCode}, calendarVersion=${versionRow.calendarVersion}, ` +
-      `status=${versionRow.status}, schemeStatus=${versionRow.schemeStatus}`)
+    check('正式排产版本保存日历编码、日历版本与产能快照',
+      snapshot?.snapshotReady === true &&
+      snapshot.snapshot.calendarCode === calendar.calendarCode &&
+      Number(snapshot.snapshot.calendarVersion) === Number(published.version) &&
+      nonBlank(snapshot.snapshot.capacitySnapshot),
+      JSON.stringify(snapshot?.snapshot || snapshot).slice(0, 400))
+
+    // 排产引用生效后日历不能物理删除，只能停用或新建版本。
+    const referencedDelete = await requestExpectedDomainRejection(api, 'DELETE',
+      `/mes/workCalendar/delete?id=${encodeURIComponent(calendar.firstId)}`,
+      undefined, publishedDeleteContract)
+    check('被正式排产引用的已发布日历仍禁止物理删除',
+      assertMesBaseDomainRejection(referencedDelete, publishedDeleteContract, '被排产引用的日历删除'),
+      JSON.stringify(referencedDelete))
 
     await api.putBusiness(`/mes/workCalendar/disable?id=${encodeURIComponent(calendar.firstId)}`)
     const disabledRows = await readWorkCalendarDb(calendar.calendarCode)
@@ -844,21 +1234,47 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
       disabledRows.find((row) => row.id === calendar.firstId)?.version === published?.version,
       JSON.stringify(disabledRows))
 
+    if (snapshot?.snapshotReady === true) {
+      await api.putBusiness(`/mes/workCalendar/publish?id=${encodeURIComponent(calendar.firstId)}`)
+      const upgradedRows = await readWorkCalendarDb(calendar.calendarCode)
+      const upgradedVersion = upgradedRows.find((row) => row.id === calendar.firstId)?.version
+      caseRecord.evidence.push(
+        `日历升版 version=${upgradedVersion}；旧排产快照 calendarVersion=${snapshot.snapshot.calendarVersion}`)
+      check('日历升版不改写历史排产快照',
+        Number(snapshot.snapshot.calendarVersion) === Number(published.version),
+        `snapshotCalendarVersion=${snapshot.snapshot.calendarVersion}, publishedVersion=${published.version}`)
+    }
+
+    markCatalogAssertion(caseRecord, 0,
+      ['已发布生产日历禁止物理删除，只能停用或新建版本', '被正式排产引用的已发布日历仍禁止物理删除'],
+      snapshot?.snapshotReady === true ? '' : '正式排产未产生引用快照，仅验证发布态删除门禁')
+    markCatalogAssertion(caseRecord, 1,
+      ['正式排产版本保存日历编码、日历版本与产能快照'],
+      snapshot?.snapshotReady === true ? '' : `正式排产快照夹具未闭环：${snapshot?.reason || '未产出结果'}`)
+    markCatalogAssertion(caseRecord, 2,
+      ['日历升版不改写历史排产快照'],
+      snapshot?.snapshotReady === true ? '' : '缺正式排产历史快照，无法验证升版不追溯')
+
     await openRoute(page, '/settings/production/work-calendar', {
       readySelector: '.calendar-workbench .calendar-toolbar'
     }).catch(() => {})
     await saveScreenshot(page, outputDir, 'mes-base-004-calendar-publish', record).catch(() => {})
-    return {
-      api, partial: true,
-      note: `生产日历专属记录已真实创建、发布、禁止删除、停用并保留版本号（calendarCode=${calendar.calendarCode}）；` +
-        '缺口：WorkCalendarRespVO 未公开 version/publishStatus；' +
-        '排产版本记录虽具备 calendar_code/calendar_version/capacity_snapshot 字段，但正式快照写入依赖完整排产结果与发布门禁，' +
-        '本案例未构造正式工单链路，因此“排产版本保存日历编码/版本/工作模式快照”“日历升版不改写历史排产快照”仍保留 PARTIAL'
-    }
+    const failed = caseRecord.checks.filter((row) => !row.passed)
+    const gaps = (caseRecord.catalogAssertions || []).filter((row) => row.status !== 'VERIFIED')
+    return failed.length || gaps.length
+      ? {
+          api, partial: true,
+          note: `生产日历专属记录已创建、发布、禁止删除并停用（calendarCode=${calendar.calendarCode}）；` +
+            '未闭环项：' +
+            [...failed.map((row) => `${row.name}=${row.details}`),
+              ...gaps.map((row) => `原断言GAP=${row.assertion}: ${row.details}`)].join('；')
+        }
+      : { api }
   }
 
   if (caseId === 'MES-BASE-005') {
     await assertLocalWriteSafety(caseRecord)
+    initializeCatalogAssertions(caseRecord, caseId)
     const marker = newMarker('MESB005')
     const makeTeam = async (suffix) => {
       const username = `${marker}${suffix}EMP`.slice(0, 30)
@@ -899,18 +1315,24 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
       pageRows.some((row) => String(row.id) === handover.handoverId && Number(row.status) === 0),
       JSON.stringify(pageRows.slice(0, 2)))
 
-    const emptyConfirm = await api.request('PUT',
+    const bothSidesConfirmContract = expectedMesBaseDomainRejection(
+      2010954002, '班组交接必须由交出方和接入方双方确认'
+    )
+    const emptyConfirm = await requestExpectedDomainRejection(api, 'PUT',
       `/mes/team-handover/confirm?id=${handover.handoverId}` +
-      `&outConfirmBy=${encodeURIComponent(outTeam.employeeId)}&inConfirmBy=`)
+      `&outConfirmBy=${encodeURIComponent(outTeam.employeeId)}&inConfirmBy=`, undefined,
+      bothSidesConfirmContract)
     check('缺少接班确认人时拒绝确认且单据保持待确认',
-      Number(emptyConfirm?.code) !== 0, JSON.stringify(emptyConfirm))
+      assertMesBaseDomainRejection(emptyConfirm, bothSidesConfirmContract, '缺少接班确认人'),
+      JSON.stringify(emptyConfirm))
 
-    const sameConfirm = await api.request('PUT',
+    const sameConfirm = await requestExpectedDomainRejection(api, 'PUT',
       `/mes/team-handover/confirm?id=${handover.handoverId}` +
       `&outConfirmBy=${encodeURIComponent(outTeam.employeeId)}` +
-      `&inConfirmBy=${encodeURIComponent(outTeam.employeeId)}`)
+      `&inConfirmBy=${encodeURIComponent(outTeam.employeeId)}`, undefined, bothSidesConfirmContract)
     check('交班人与接班人为同一人时拒绝确认',
-      Number(sameConfirm?.code) !== 0, JSON.stringify(sameConfirm))
+      assertMesBaseDomainRejection(sameConfirm, bothSidesConfirmContract, '同一人确认'),
+      JSON.stringify(sameConfirm))
     const stillWaiting = unwrap(await api.getBusiness(
       `/mes/team-handover/get?id=${handover.handoverId}`))
     check('未确认交接不能被关闭，状态保持待确认', Number(stillWaiting.status) === 0,
@@ -928,85 +1350,77 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
       String(confirmed.inConfirmBy) === inTeam.employeeId,
       JSON.stringify(confirmed))
 
-    const repeated = await api.request('PUT',
+    const repeatedContract = expectedMesBaseDomainRejection(
+      2010954001, '班组交接当前状态不允许该操作：已确认'
+    )
+    const repeated = await requestExpectedDomainRejection(api, 'PUT',
       `/mes/team-handover/confirm?id=${handover.handoverId}` +
       `&outConfirmBy=${encodeURIComponent(outTeam.employeeId)}` +
-      `&inConfirmBy=${encodeURIComponent(inTeam.employeeId)}`)
+      `&inConfirmBy=${encodeURIComponent(inTeam.employeeId)}`, undefined, repeatedContract)
     check('已确认交接不允许重复确认',
-      Number(repeated?.code) !== 0, JSON.stringify(repeated))
+      assertMesBaseDomainRejection(repeated, repeatedContract, '重复确认交接'),
+      JSON.stringify(repeated))
 
+    const reason = `${marker}-取消复验`
+    await api.putBusiness(
+      `/mes/team-handover/cancel?id=${handover.handoverId}&reason=${encodeURIComponent(reason)}`)
+    const cancelled = unwrap(await api.getBusiness(
+      `/mes/team-handover/get?id=${handover.handoverId}`))
+    const cancelRows = await queryRows(
+      `SELECT CAST(id AS CHAR), status, out_confirm_by, in_confirm_by, remark,
+              CAST(tenant_id AS CHAR), CAST(deleted AS UNSIGNED),
+              out_team_id, in_team_id
+       FROM mes_team_handover
+       WHERE tenant_id=1 AND id='${handover.handoverId}'`)
+    caseRecord.database ||= []
+    caseRecord.database.push({ stage: 'handover-cancel', available: true, rows: cancelRows })
+    check('取消交接保留原记录和双方班组且 API/SQL 确认人均清空',
+      matchesTeamHandoverCancellation(cancelled, cancelRows, {
+        handoverId: handover.handoverId, outTeamId: outTeam.id, inTeamId: inTeam.id, marker, reason
+      }),
+      JSON.stringify({ cancelled, cancelRows }))
+    await api.putBusiness(`/mes/team-handover/cancel?id=${handover.handoverId}`)
+    const replayed = unwrap(await api.getBusiness(
+      `/mes/team-handover/get?id=${handover.handoverId}`))
+    check('待确认交接重复无原因取消保持原事实',
+      JSON.stringify(replayed) === JSON.stringify(cancelled),
+      JSON.stringify(replayed))
+    const teamsAfterCancel = await queryRows(
+      `SELECT CAST(id AS CHAR), team_id
+       FROM mes_team_manage WHERE tenant_id=1 AND deleted=0
+       AND id IN ('${outTeam.id}','${inTeam.id}') ORDER BY id`)
+    check('取消交接不删除或复制双方班组主档',
+      teamsAfterCancel.length === 2 &&
+      teamsAfterCancel.some((row) => row[0] === outTeam.id && row[1] === outTeam.teamId) &&
+      teamsAfterCancel.some((row) => row[0] === inTeam.id && row[1] === inTeam.teamId),
+      JSON.stringify(teamsAfterCancel))
+    markCatalogAssertion(caseRecord, 0,
+      ['缺少接班确认人时拒绝确认且单据保持待确认', '交班人与接班人为同一人时拒绝确认'])
+    markCatalogAssertion(caseRecord, 1,
+      ['交班与接班双方分别确认后才进入完成状态', '已确认交接不允许重复确认'])
+    markCatalogAssertion(caseRecord, 2, ['未确认交接不能被关闭，状态保持待确认'],
+      '无独立关闭或删除端点，未以状态只读代替关闭/删除请求拒绝证据')
+    markCatalogAssertion(caseRecord, 3,
+      ['交接创建后引用双方班组主键而不是复制班组主档', '取消交接不删除或复制双方班组主档'])
+    caseRecord.catalogReverseAssertions = [{
+      assertion: catalogDefinition(caseId).reverse[0],
+      status: 'VERIFIED',
+      evidenceChecks: [
+        '取消交接保留原记录和双方班组且 API/SQL 确认人均清空', '待确认交接重复无原因取消保持原事实'
+      ],
+      details: `id=${handover.handoverId}; tenant=1; status=0; deleted=0; confirmations=NULL`
+    }]
     const permission = await api.getBusiness('/system/auth/get-permission-info')
     const route = findComponentRoute(permission?.data?.menus, 'prod/teamHandover/index') ||
       findComponentRoute(permission?.data?.menus, 'teamHandover/index')
     caseRecord.evidence.push(
       `班组交接无前端菜单时不影响 API 写侧闭环；menuRoute=${route || 'NOT_FOUND'}；` +
-      '后端仅暴露 create/confirm/get/page，没有取消或删除端点，cancel 断言改为验证确认门禁与状态不可逆')
+      '已执行正式 cancel 并核对 API/SQL，不以旧“接口不存在”记录作为当前缺口')
     return {
       api, partial: true,
       note: `专属交接 handoverId=${handover.handoverId} 已真实创建并完成双方确认门禁；` +
-        '缺口（真实产品缺陷）：MesTeamHandoverController 未提供取消/删除端点，' +
-        '目录反向动作“取消交接回到待确认而不是物理删除”无法真实执行，保留 PARTIAL'
-    }
-  }
-
-  if (caseId === 'MES-BASE-006') {
-    await assertLocalWriteSafety(caseRecord)
-    const context = await resolveWriteContext(api)
-    const marker = newMarker('MESB006')
-    const fixture = await createRouteCapacityFixture(api, marker, {
-      workshopId: context.workshopId, lineId: context.lineId
-    })
-    const routeBody = (extra = {}) => ({
-      id: fixture.routeId, code: `${marker}-ROUTE`, name: `${marker}-ROUTE`,
-      version: 'V1.0', mark: marker, type: '1', designMode: 'sequential',
-      inboundType: 'FINISHED', isStrict: 'Y', ...extra,
-      wmsTechRouteSubList: [{
-        procedureId: fixture.procedureId, procedureName: `${marker}-PROC`,
-        sortOrder: 1, isFeed: 0, isQuality: 0, isFinished: 1, isVirtual: 0, mark: marker
-      }]
-    })
-    const draft = (await api.getBusiness(`/mes/wmsTechRoute/queryById?id=${fixture.routeId}`)).data
-    check('工艺路线以草稿创建', Number(draft.devStatus) === 0 && draft.version === 'V1.0',
-      `status=${draft.devStatus}, version=${draft.version}`)
-
-    await api.postBusiness('/mes/wmsTechRoute/editMain', routeBody())
-    const editedDraft = (await api.getBusiness(`/mes/wmsTechRoute/queryById?id=${fixture.routeId}`)).data
-    check('草稿可原地编辑（保持同一主键与版本）',
-      String(editedDraft.id) === fixture.routeId && editedDraft.version === 'V1.0',
-      `id=${editedDraft.id}, version=${editedDraft.version}`)
-
-    await api.postBusiness(`/mes/wmsTechRoute/publish?id=${fixture.routeId}`)
-    const published = (await api.getBusiness(`/mes/wmsTechRoute/queryById?id=${fixture.routeId}`)).data
-    check('工艺路线发布后写入发布状态与发布审计',
-      Number(published.devStatus) === 2 && nonBlank(published.publishTime) && nonBlank(published.publishBy),
-      `status=${published.devStatus}, publishTime=${published.publishTime}`)
-
-    const deleteBlocked = await api.request('DELETE', `/mes/wmsTechRoute/delete?id=${fixture.routeId}`)
-    check('已发布工艺路线禁止直接删除',
-      Number(deleteBlocked?.code) !== 0 && String(deleteBlocked?.msg || '').includes('不能直接删除'),
-      JSON.stringify(deleteBlocked))
-
-    await api.postBusiness('/mes/wmsTechRoute/editMain', routeBody())
-    const versions = asList((await api.getBusiness(
-      `/mes/wmsTechRoute/list?pageNo=1&pageSize=20&name=${encodeURIComponent(`${marker}-ROUTE`)}`)).data)
-    const newDraft = versions.find((row) => row.version === 'V1.1' && Number(row.devStatus) === 0)
-    check('已发布工艺路线编辑时自动生成更高版本草稿',
-      Boolean(newDraft) && String(newDraft.id) !== fixture.routeId, JSON.stringify(versions.map((r) => r.version)))
-
-    await api.postBusiness(`/mes/wmsTechRoute/unpublish?id=${fixture.routeId}`)
-    const disabled = (await api.getBusiness(`/mes/wmsTechRoute/queryById?id=${fixture.routeId}`)).data
-    check('反向动作是停用而不是删除已发布工艺路线', Number(disabled.devStatus) === 3,
-      `status=${disabled.devStatus}`)
-    for (const row of [fixture.routeId, newDraft?.id]) {
-      if (!row) continue
-      await api.deleteBusiness(`/mes/wmsTechRoute/delete?id=${row}`).catch(() => {})
-    }
-    await openRoute(page, '/settings/production/technique', { readySelector: '.technique-route' }).catch(() => {})
-    await saveScreenshot(page, outputDir, 'mes-base-006-route-version', record).catch(() => {})
-    return {
-      api, partial: true,
-      note: '已真实完成专属工艺路线草稿编辑、发布、发布后禁止删除、编辑升版生成草稿、停用闭环；' +
-        '缺口：未生成真实生产任务，无法断言工单任务 routeVersion 快照随主档升版不追溯改写'
+        '已取消回待确认并清空双方确认人且保留班组引用；' +
+        '未确认关闭/删除请求拒绝与独立交接页面仍无真实证据，保留 PARTIAL'
     }
   }
 
@@ -1054,60 +1468,192 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
   }
 
   if (caseId === 'PB102-001' || caseId === 'PB102-002' || caseId === 'PB102-003') {
-    await assertLocalWriteSafety(caseRecord)
-    const context = await resolveWriteContext(api)
-    const marker = newMarker(`MESB${caseId.slice(-3)}`)
-    const fixture = await createRouteCapacityFixture(api, marker, {
-      workshopId: context.workshopId, lineId: context.lineId
-    })
-    const created = await bindDeviceCapacity(api, fixture, {
-      deviceId: context.deviceId, lineId: context.lineId, unitId: context.unitId
-    })
-    const device = created.detail?.procedureList?.[0]?.deviceList?.[0]
-    check('工序设备产能草稿经专属路线节点落库并可按节点回读',
-      device && String(device.id) === created.capacityId && Number(device.publishStatus) === 0 &&
-      Number(device.capacityVersion) >= 1,
-      `capacityId=${created.capacityId}`)
-    check('产能记录承载产品、单位、基准产量/时长、换型时间与生效期字段',
-      device && ['productId', 'unitId', 'standardOutput', 'standardDuration',
-        'changeoverMinutes', 'calendarCode', 'effectiveFrom', 'capacityVersion', 'publishStatus']
-        .every((field) => Object.prototype.hasOwnProperty.call(device, field)),
-      JSON.stringify(Object.keys(device || {})))
+    let fixture = null
+    let outcome = null
+    try {
+      initializeCatalogAssertions(caseRecord, caseId)
+      await assertLocalWriteSafety(caseRecord)
+      const context = await resolveWriteContext(api)
+      const marker = newMarker(`MESB${caseId.slice(-3)}`)
+      fixture = await createRouteCapacityFixture(api, marker, {
+        workshopId: context.workshopId, lineId: context.lineId
+      })
+      const productA = await createCapacityProductFixture(api, marker, context.unitId, 'PRODUCT-A')
+      const productB = await createCapacityProductFixture(api, marker, context.unitId, 'PRODUCT-B')
+      await bindDeviceCapacity(api, fixture, { deviceId: context.deviceId, lineId: context.lineId })
 
-    await api.postBusiness(`/mes/wmsTechRoute/capacity/publish?capacityId=${created.capacityId}`)
-    const published = (await listCapacities(api, fixture, context.deviceId))
-      .find((row) => String(row.id) === created.capacityId)
-    check('产能草稿可发布为唯一有效版本',
-      Number(published?.publishStatus) === 1, `status=${published?.publishStatus}`)
+    // The official detail endpoint creates one unrestricted-product row for a newly bound
+    // device. Read it before adding product scopes so that this compatibility behavior is
+    // observed and asserted instead of being mistaken for product A or B.
+      const ensuredDetail = await readRouteCapacityDetail(api, fixture)
+      const ensuredRows = capacityRowsForProduct(ensuredDetail, null)
+      check('详情接口为新绑定设备补齐一条默认不限产品产能行',
+        ensuredRows.length === 1 && ensuredRows[0].productId == null &&
+        Number(ensuredRows[0].publishStatus ?? 0) === 0,
+        JSON.stringify(ensuredRows))
 
-    // PB-102 product-dimension versioning is blocked by the baseline unique key: it does not
-    // include product_id, so a second version/product row for the same route_sub+equipment
-    // collides. Capture that as a real, reproducible defect instead of faking a pass.
-    const secondDraft = await api.request('POST', '/mes/wmsTechRoute/capacity/save', {
-      routeSubId: fixture.routeSubId, procedureId: fixture.procedureId,
-      equipmentId: String(context.deviceId), productId: null, unitId: String(context.unitId),
-      standardOutput: 99, standardDuration: 50, changeoverMinutes: 10, remark: `${marker}-edit`
-    })
-    const uniqueKeyRows = await queryRows(
-      `SELECT INDEX_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS
-       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='aps_tech_route_procedure_device_capacity'
-       AND NON_UNIQUE=0 GROUP BY INDEX_NAME`)
+      const capacityAId = await saveDeviceCapacity(api, fixture, {
+        deviceId: context.deviceId, unitId: context.unitId, productId: productA.id,
+        standardOutput: 88, standardDuration: 60, changeoverMinutes: 15, suffix: 'A'
+      })
+      const capacityBId = await saveDeviceCapacity(api, fixture, {
+        deviceId: context.deviceId, unitId: context.unitId, productId: productB.id,
+        standardOutput: 99, standardDuration: 50, changeoverMinutes: 10, suffix: 'B'
+      })
+      let detail = await readRouteCapacityDetail(api, fixture)
+      let rowsA = capacityRowsForProduct(detail, productA.id)
+      let rowsB = capacityRowsForProduct(detail, productB.id)
+      const allRows = (detail.procedureList || []).flatMap((procedure) => procedure.deviceList || [])
+      check('同工序同设备下 A/B 使用真实产品ID形成独立产能 scope',
+      rowsA.length === 1 && rowsB.length === 1 &&
+      String(rowsA[0].id) === capacityAId && String(rowsB[0].id) === capacityBId &&
+      rowsA[0].productId !== rowsB[0].productId &&
+      String(rowsA[0].equipmentId) === String(context.deviceId) &&
+      String(rowsB[0].equipmentId) === String(context.deviceId),
+      `A=${JSON.stringify(rowsA)}, B=${JSON.stringify(rowsB)}`)
+      check('产能草稿字段与版本由正式接口回读，版本不写死为1',
+      rowsA[0].unitId === String(context.unitId) && rowsB[0].unitId === String(context.unitId) &&
+      Number(rowsA[0].standardOutput) === 88 && Number(rowsB[0].standardOutput) === 99 &&
+      Number(rowsA[0].standardDuration) === 60 && Number(rowsB[0].standardDuration) === 50 &&
+      Number(rowsA[0].capacityVersion) >= 1 && Number(rowsB[0].capacityVersion) >= 1 &&
+      Number(rowsA[0].publishStatus) === 0 && Number(rowsB[0].publishStatus) === 0,
+      `A=${JSON.stringify(rowsA[0])}, B=${JSON.stringify(rowsB[0])}`)
+      check('详情 procedureCapacity/routeCapacity 按官方全部设备行取最小值',
+      detail.procedureList.length === 1 &&
+      Number(detail.procedureList[0].procedureCapacity) === capacityMinimum(allRows) &&
+      Number(detail.routeCapacity) === capacityMinimum(allRows),
+      `procedure=${detail.procedureList[0]?.procedureCapacity}, route=${detail.routeCapacity}, rows=${JSON.stringify(allRows)}`)
 
-    await api.postBusiness(`/mes/wmsTechRoute/capacity/disable?capacityId=${created.capacityId}`)
-    const disabled = (await listCapacities(api, fixture, context.deviceId))
-      .find((row) => String(row.id) === created.capacityId)
-    check('停用产能版本保留历史行而不是物理删除',
-      Number(disabled?.publishStatus) === 2, `status=${disabled?.publishStatus}`)
-    caseRecord.evidence.push(
-      `产能唯一键=${JSON.stringify(uniqueKeyRows)}；同节点同设备再存草稿响应=${JSON.stringify(secondDraft).slice(0, 240)}`)
-    await openRoute(page, '/settings/production/technique', { readyText: '工艺路线' }).catch(() => {})
-    await saveScreenshot(page, outputDir, `pb102-${caseId.slice(-3)}-capacity`, record).catch(() => {})
-    return {
-      api, partial: true,
-      note: '已验证专属工序设备产能草稿保存、按节点+设备回读、发布、停用保留历史与字段契约；' +
-        '缺口（真实产品缺陷）：aps_tech_route_procedure_device_capacity 唯一键 uk_aps_route_device_tenant 未包含 product_id，' +
-        `同 route_sub_id+equipment_id 再存新版本/多产品行直接失败（响应 ${JSON.stringify(secondDraft).slice(0, 120)}），` +
-        '因此“已发布版本被编辑生成新草稿保留历史”“多产品逐条展开”“同范围唯一有效发布”无法闭环'
+      await api.postBusiness(`/mes/wmsTechRoute/capacity/publish?capacityId=${capacityAId}`)
+      const publishedA = (await listCapacities(api, fixture, context.deviceId))
+      .find((row) => String(row.id) === capacityAId)
+      check('A 产能草稿可正式发布且状态回读为已发布',
+      Number(publishedA?.publishStatus) === 1 && Number(publishedA.capacityVersion) >= 1,
+      JSON.stringify(publishedA))
+      const publishedASnapshot = JSON.stringify({
+        id: publishedA?.id, productId: publishedA?.productId,
+        standardOutput: publishedA?.standardOutput,
+        standardDuration: publishedA?.standardDuration,
+        changeoverMinutes: publishedA?.changeoverMinutes,
+        capacityVersion: publishedA?.capacityVersion,
+        publishStatus: publishedA?.publishStatus
+      })
+
+      const editedAId = await saveDeviceCapacity(api, fixture, {
+        id: capacityAId, deviceId: context.deviceId, unitId: context.unitId,
+        productId: productA.id, standardOutput: 77, standardDuration: 55,
+        changeoverMinutes: 12, suffix: 'A-EDIT'
+      })
+      const afterEditA = (await listCapacities(api, fixture, context.deviceId))
+      .find((row) => String(row.id) === capacityAId)
+    const editedADraft = (await listCapacities(api, fixture, context.deviceId))
+      .find((row) => String(row.id) === editedAId)
+      check('A 已发布后编辑生成新草稿且原发布历史行不可变',
+      editedAId !== capacityAId && Number(afterEditA?.publishStatus) === 1 &&
+      JSON.stringify({
+        id: afterEditA?.id, productId: afterEditA?.productId,
+        standardOutput: afterEditA?.standardOutput,
+        standardDuration: afterEditA?.standardDuration,
+        changeoverMinutes: afterEditA?.changeoverMinutes,
+        capacityVersion: afterEditA?.capacityVersion,
+        publishStatus: afterEditA?.publishStatus
+      }) === publishedASnapshot && Number(editedADraft?.publishStatus) === 0 &&
+      Number(editedADraft?.capacityVersion) > Number(afterEditA?.capacityVersion),
+      `old=${JSON.stringify(afterEditA)}, draft=${JSON.stringify(editedADraft)}`)
+
+      const duplicatePublishContract = expectedMesBaseDomainRejection(
+      400, '同一工序设备产品适用范围已存在有效发布版本，请先停用旧版本再发布'
+    )
+      const duplicatePublish = await requestExpectedDomainRejection(api, 'POST',
+      `/mes/wmsTechRoute/capacity/publish?capacityId=${editedAId}`, undefined,
+      duplicatePublishContract)
+      check('A 同产品 scope 重复发布精确返回400和完整业务消息',
+      assertMesBaseDomainRejection(duplicatePublish, duplicatePublishContract, 'A重复发布'),
+      JSON.stringify(duplicatePublish))
+
+      await api.postBusiness(`/mes/wmsTechRoute/capacity/disable?capacityId=${capacityAId}`)
+      const disabledA = (await listCapacities(api, fixture, context.deviceId))
+      .find((row) => String(row.id) === capacityAId)
+      check('停用 A 原发布版本保留历史行并回读停用状态',
+      Number(disabledA?.publishStatus) === 2 && String(disabledA.id) === capacityAId,
+      JSON.stringify(disabledA))
+      await api.postBusiness(`/mes/wmsTechRoute/capacity/publish?capacityId=${editedAId}`)
+
+      await api.postBusiness(`/mes/wmsTechRoute/capacity/publish?capacityId=${capacityBId}`)
+      const publishedB = (await listCapacities(api, fixture, context.deviceId))
+      .find((row) => String(row.id) === capacityBId)
+      check('B 独立产品 scope 可在 A 存在历史/有效版本时单独发布',
+      Number(publishedB?.publishStatus) === 1 && String(publishedB.productId) === productB.id,
+      JSON.stringify(publishedB))
+
+      detail = await readRouteCapacityDetail(api, fixture)
+      rowsA = capacityRowsForProduct(detail, productA.id)
+      rowsB = capacityRowsForProduct(detail, productB.id)
+      const capacitySortKey = (row) => [Number(row.publishStatus) === 1 ? 0 : 1, -Number(row.capacityVersion || 0)]
+      const isSorted = (rows) => rows.every((row, index) => index === 0 ||
+        capacitySortKey(rows[index - 1])[0] < capacitySortKey(row)[0] ||
+        (capacitySortKey(rows[index - 1])[0] === capacitySortKey(row)[0] &&
+          capacitySortKey(rows[index - 1])[1] <= capacitySortKey(row)[1]))
+      check('发布后官方详情仍分别返回 A/B scope 且产品ID不混淆',
+      rowsA.length === 2 && rowsB.length === 1 &&
+      rowsA.some((row) => Number(row.publishStatus) === 1) &&
+      String(rowsB[0].productId) === productB.id,
+      `A=${JSON.stringify(rowsA)}, B=${JSON.stringify(rowsB)}`)
+      check('详情设备行按已发布优先、版本号降序返回',
+        isSorted(rowsA) && isSorted(rowsB), `A=${JSON.stringify(rowsA)}, B=${JSON.stringify(rowsB)}`)
+
+      await api.postBusiness(`/mes/wmsTechRoute/capacity/disable?capacityId=${editedAId}`)
+      await api.postBusiness(`/mes/wmsTechRoute/capacity/disable?capacityId=${capacityBId}`)
+      const disabledRows = await listCapacities(api, fixture, context.deviceId)
+      check('A/B 停用后列表保留历史行并全部回读停用',
+      [editedAId, capacityBId].every((id) => {
+        const row = disabledRows.find((item) => String(item.id) === id)
+        return Number(row?.publishStatus) === 2
+      }), JSON.stringify(disabledRows))
+      caseRecord.evidence.push(
+        `PB102专属产品A=${productA.id}、B=${productB.id}；A旧=${capacityAId}、A新=${editedAId}、B=${capacityBId}；` +
+        `详情procedureCapacity=${detail.procedureList[0]?.procedureCapacity}, routeCapacity=${detail.routeCapacity}`)
+      if (caseId === 'PB102-001') {
+        markCatalogAssertion(caseRecord, 0, ['产能草稿字段与版本由正式接口回读，版本不写死为1'])
+        markCatalogAssertion(caseRecord, 1, ['产能草稿字段与版本由正式接口回读，版本不写死为1'])
+        markCatalogAssertion(caseRecord, 2, ['A 同产品 scope 重复发布精确返回400和完整业务消息'])
+        markCatalogAssertion(caseRecord, 3, ['停用 A 原发布版本保留历史行并回读停用状态'])
+      } else if (caseId === 'PB102-002') {
+        markCatalogAssertion(caseRecord, 0, ['同工序同设备下 A/B 使用真实产品ID形成独立产能 scope'])
+        markCatalogAssertion(caseRecord, 1, ['同工序同设备下 A/B 使用真实产品ID形成独立产能 scope'])
+        markCatalogAssertion(caseRecord, 2, ['产能草稿字段与版本由正式接口回读，版本不写死为1'])
+        markCatalogAssertion(caseRecord, 3, ['A 已发布后编辑生成新草稿且原发布历史行不可变'])
+      } else {
+        markCatalogAssertion(caseRecord, 0, ['发布后官方详情仍分别返回 A/B scope 且产品ID不混淆'])
+        markCatalogAssertion(caseRecord, 1, ['发布后官方详情仍分别返回 A/B scope 且产品ID不混淆'])
+        markCatalogAssertion(caseRecord, 2, ['详情设备行按已发布优先、版本号降序返回'])
+        markCatalogAssertion(caseRecord, 3, ['详情 procedureCapacity/routeCapacity 按官方全部设备行取最小值'])
+      }
+      await openPermissionRoute(api, page, openRoute,
+        ['mes/produce/technique/index', 'mes/produce/technique', 'systemModel/prod/technique-route'],
+        { readyText: '工艺路线' })
+      await saveScreenshot(page, outputDir, `pb102-${caseId.slice(-3)}-capacity`, record)
+      outcome = {
+        api,
+        note: '已真实闭环验证专属产品 A/B 产能 scope、默认不限产品行、详情最小产能语义、发布后升版、' +
+          '重复发布精确业务拒绝、独立产品发布及停用回读；页面路线按权限菜单解析；清理保留 RETAINED_AUDIT'
+      }
+      return outcome
+    } finally {
+      if (fixture) {
+        const cleanup = await cleanupRouteCapacityFixture(api, fixture)
+        caseRecord.evidence.push(`PB102专属夹具清理：${JSON.stringify(cleanup)}`)
+        const note = `专属产能夹具清理 manifest=${cleanup.manifest}，保留产品/路线/工序及产能审计；` +
+          `errors=${JSON.stringify(cleanup.errors)}`
+        caseRecord.notes.push(note)
+        if (cleanup.status !== 'RETAINED_AUDIT' || cleanup.errors.length > 0 || cleanup.cleaned === true) {
+          const failureNote = `专属产能夹具 RETAINED_AUDIT 清理动作未完整完成：${JSON.stringify(cleanup)}`
+          if (outcome) {
+            outcome.partial = true
+            outcome.note += `；${failureNote}`
+          }
+        }
+      }
     }
   }
 
@@ -1120,11 +1666,12 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
 
     const marker = newMarker('MESB038A')
     const grade = await createGrade(api, marker, 'GA')
-    const duplicate = await api.request('POST', '/base/material-grade/create', {
+    const duplicateContract = expectedMesBaseDomainRejection(500, /品级编码已存在：/)
+    const duplicate = await requestExpectedDomainRejection(api, 'POST', '/base/material-grade/create', {
       code: grade.code, name: 'dup', sort: 951, status: 1
-    })
+    }, duplicateContract)
     check('品级编码租户内唯一且创建后不可绕过',
-      Number(duplicate?.code) === 500 && String(duplicate.msg).includes('已存在'),
+      assertMesBaseDomainRejection(duplicate, duplicateContract, '重复品级编码'),
       JSON.stringify(duplicate))
 
     const material = await createGradeMaterial(api, marker, { unitId: SEED.unitId })
@@ -1140,10 +1687,11 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
         managed.allowedGradeIds.map(String).includes(grade.id),
         `materialId=${material.id}, config=${JSON.stringify(managed)}`)
 
-      const blocked = await api.request('DELETE',
-        `/base/material-grade/delete?id=${grade.id}`)
+      const blockedContract = expectedMesBaseDomainRejection(500, /品级已被引用，只能停用，不能删除/)
+      const blocked = await requestExpectedDomainRejection(api, 'DELETE',
+        `/base/material-grade/delete?id=${grade.id}`, undefined, blockedContract)
       check('被存货引用的品级只能停用不能删除',
-        Number(blocked?.code) === 500 && String(blocked.msg).includes('只能停用'),
+        assertMesBaseDomainRejection(blocked, blockedContract, '被引用品级删除'),
         JSON.stringify(blocked))
 
       await api.putBusiness(`/base/material-grade/update-status?id=${grade.id}&status=0`)
@@ -1154,9 +1702,12 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
         disabled && Number(disabled.status) === 0, JSON.stringify(disabled))
     } finally {
       if (managed) {
-        await api.putBusiness('/mes/basMaterial/edit', materialEditBody(material)).catch(() => {})
+        await requestExpectedDomainRejection(api, 'PUT', '/mes/basMaterial/edit',
+          materialEditBody(material), expectedMesBaseDomainRejection(500, /不能关闭品级管理/))
       }
-      await api.deleteBusiness(`/mes/basMaterial/delete?id=${material.id}`).catch(() => {})
+      await requestExpectedDomainRejection(api, 'DELETE',
+        `/mes/basMaterial/delete?id=${material.id}`, undefined,
+        expectedMesBaseDomainRejection(500, /被以下单据引用|库存记录/))
       await deleteGrade(api, grade.id)
     }
     const cleaned = await api.getBusiness(
@@ -1191,40 +1742,40 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
           [gA.id, gB.id].map(String).sort().join(','),
         `materialId=${material.id}, config=${JSON.stringify(managed)}`)
 
-      const outOfRangeDefault = await api.request('PUT', '/mes/basMaterial/edit',
+      const outOfRangeDefaultContract = expectedMesBaseDomainRejection(500, '默认品级必须在允许品级范围内')
+      const outOfRangeDefault = await requestExpectedDomainRejection(api, 'PUT', '/mes/basMaterial/edit',
         materialEditBody(material, {
           gradeManaged: 'Y', defaultGradeId: gC.id, allowedGradeIds: [gA.id, gB.id]
-        }))
+        }), outOfRangeDefaultContract)
       check('默认品级必须属于允许范围',
-        Number(outOfRangeDefault?.code) === 500 &&
-        String(outOfRangeDefault.msg).includes('默认品级必须在允许品级范围内'),
+        assertMesBaseDomainRejection(outOfRangeDefault, outOfRangeDefaultContract, '默认品级范围'),
         JSON.stringify(outOfRangeDefault))
 
-      const outOfRangeEntry = await api.request('POST', '/mes/stkIo/add/save',
+      const outOfRangeEntryContract = expectedMesBaseDomainRejection(500, /不在存货允许范围内/)
+      const outOfRangeEntry = await requestExpectedDomainRejection(api, 'POST', '/mes/stkIo/add/save',
         gradeStockIoBody(wms, marker, {
           materialId: material.id, unitId: SEED.unitId, gradeId: gC.id, suffix: 'OOR'
-        }))
+        }), outOfRangeEntryContract)
       check('单据选择禁止范围外品级被后端拒绝',
-        Number(outOfRangeEntry?.code) === 500 &&
-        String(outOfRangeEntry.msg ?? outOfRangeEntry.message).includes('不在存货允许范围内'),
+        assertMesBaseDomainRejection(outOfRangeEntry, outOfRangeEntryContract, '范围外品级入库'),
         JSON.stringify(outOfRangeEntry))
 
-      const noManageEntry = await api.request('POST', '/mes/stkIo/add/save',
+      const noManageEntryContract = expectedMesBaseDomainRejection(500, /未启用品级管理/)
+      const noManageEntry = await requestExpectedDomainRejection(api, 'POST', '/mes/stkIo/add/save',
         gradeStockIoBody(wms, marker, {
           materialId: plain.id, unitId: SEED.unitId, gradeId: gA.id, suffix: 'NOMANAGE'
-        }))
+        }), noManageEntryContract)
       check('未启用品级管理的存货指定品级被后端拒绝',
-        Number(noManageEntry?.code) === 500 &&
-        String(noManageEntry.msg ?? noManageEntry.message).includes('未启用品级管理'),
+        assertMesBaseDomainRejection(noManageEntry, noManageEntryContract, '未启用品级管理入库'),
         JSON.stringify(noManageEntry))
 
-      const missingGradeEntry = await api.request('POST', '/mes/stkIo/add/save',
+      const missingGradeEntryContract = expectedMesBaseDomainRejection(500, /必须选择品级/)
+      const missingGradeEntry = await requestExpectedDomainRejection(api, 'POST', '/mes/stkIo/add/save',
         gradeStockIoBody(wms, marker, {
           materialId: material.id, unitId: SEED.unitId, gradeId: null, suffix: 'MISS'
-        }))
+        }), missingGradeEntryContract)
       check('已启用品级管理的存货未选品级被后端拒绝',
-        Number(missingGradeEntry?.code) === 500 &&
-        String(missingGradeEntry.msg ?? missingGradeEntry.message).includes('必须选择品级'),
+        assertMesBaseDomainRejection(missingGradeEntry, missingGradeEntryContract, '缺少品级入库'),
         JSON.stringify(missingGradeEntry))
 
       // reverse：存在未完成（草稿）入库单时必须拒绝关闭品级管理，而不是直接放行。
@@ -1235,21 +1786,26 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
       draftId = singleId(await queryRows(
         `SELECT id FROM mes_stk_io WHERE tenant_id=1 AND deleted=0
          AND bill_no='${draftBody.billNo}'`), '品级准入草稿入库单')
-      const closeBlocked = await api.request('PUT', '/mes/basMaterial/edit',
-        materialEditBody(material))
+      const closeBlockedContract = expectedMesBaseDomainRejection(500, /不能关闭品级管理/)
+      const closeBlocked = await requestExpectedDomainRejection(api, 'PUT', '/mes/basMaterial/edit',
+        materialEditBody(material), closeBlockedContract)
       check('存在未完成库存单据时禁止关闭品级管理（反向门禁）',
-        Number(closeBlocked?.code) === 500 &&
-        String(closeBlocked.msg ?? closeBlocked.message).includes('不能关闭品级管理'),
+        assertMesBaseDomainRejection(closeBlocked, closeBlockedContract, '未完成库存单据关闭品级管理'),
         `draftId=${draftId}, response=${JSON.stringify(closeBlocked).slice(0, 200)}`)
     } finally {
       if (draftId) {
-        await api.deleteBusiness(`/mes/stkIo/delete?id=${draftId}`).catch(() => {})
+        await api.deleteBusiness(`/mes/stkIo/delete?id=${draftId}`)
       }
       if (managed) {
-        await api.putBusiness('/mes/basMaterial/edit', materialEditBody(material)).catch(() => {})
+        await requestExpectedDomainRejection(api, 'PUT', '/mes/basMaterial/edit',
+          materialEditBody(material), expectedMesBaseDomainRejection(500, /不能关闭品级管理/))
       }
-      await api.deleteBusiness(`/mes/basMaterial/delete?id=${material.id}`).catch(() => {})
-      await api.deleteBusiness(`/mes/basMaterial/delete?id=${plain.id}`).catch(() => {})
+      await requestExpectedDomainRejection(api, 'DELETE',
+        `/mes/basMaterial/delete?id=${material.id}`, undefined,
+        expectedMesBaseDomainRejection(500, /被以下单据引用|库存记录/))
+      await requestExpectedDomainRejection(api, 'DELETE',
+        `/mes/basMaterial/delete?id=${plain.id}`, undefined,
+        expectedMesBaseDomainRejection(500, /被以下单据引用|库存记录/))
     }
     await openRoute(page, '/settings/erp/material-grade', { readyText: '品级' }).catch(() => {})
     await saveScreenshot(page, outputDir, 'pb038-002-grade-config', record).catch(() => {})
@@ -1258,6 +1814,7 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
 
   if (caseId === 'PB038-003') {
     await assertLocalWriteSafety(caseRecord)
+    initializeCatalogAssertions(caseRecord, caseId)
     const marker = newMarker('MESB038C')
     const grades = mesBaseRows(await api.getBusiness('/base/material-grade/simple-list'), '启用品级')
     const gA = grades.find((row) => row.code === 'A')
@@ -1289,58 +1846,198 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
       caseRecord.evidence.push(
         `专属 A/B 级入库单 aBill=${aBillId}, bBill=${bBillId}, material=${material.id}, batch=${batchNo}`)
 
-      const aRows = await readInventoryByGrade(material.id, gA.id, batchNo)
-      const bRows = await readInventoryByGrade(material.id, gB.id, batchNo)
+      const inventoryDimensions = {
+        warehouseId: wms.warehouse.id,
+        wareAreaId: wms.area.id,
+        wareLocationId: wms.location.id
+      }
+      const aRows = await readInventoryByGrade(material.id, gA.id, batchNo, inventoryDimensions)
+      const bRows = await readInventoryByGrade(material.id, gB.id, batchNo, inventoryDimensions)
       check('同存货同仓库同批次分别入库 A/B 级生成两条独立库存行',
         aRows.length === 1 && bRows.length === 1 &&
-        aRows[0].id !== bRows[0].id && aRows[0].warehouseId === bRows[0].warehouseId,
+        aRows[0].id !== bRows[0].id &&
+        aRows[0].materialId === String(material.id) && bRows[0].materialId === String(material.id) &&
+        aRows[0].gradeId === String(gA.id) && bRows[0].gradeId === String(gB.id) &&
+        aRows[0].warehouseId === String(wms.warehouse.id) &&
+        bRows[0].warehouseId === String(wms.warehouse.id) &&
+        aRows[0].wareAreaId === String(wms.area.id) &&
+        bRows[0].wareAreaId === String(wms.area.id) &&
+        aRows[0].wareLocationId === String(wms.location.id) &&
+        bRows[0].wareLocationId === String(wms.location.id),
         `a=${JSON.stringify(aRows)}, b=${JSON.stringify(bRows)}`)
       check('两条品级库存行的数量、可用量与成本互不影响',
         aRows[0].qty === 1 && aRows[0].availableQty === 1 &&
-        bRows[0].qty === 2 && bRows[0].availableQty === 2,
-        `aQty=${aRows[0]?.qty}/${aRows[0]?.availableQty}, bQty=${bRows[0]?.qty}/${bRows[0]?.availableQty}`)
+        bRows[0].qty === 2 && bRows[0].availableQty === 2 &&
+        Number(aRows[0].cost) === 1 && Number(bRows[0].cost) === 1,
+        `aQty=${aRows[0]?.qty}/${aRows[0]?.availableQty}, aCost=${aRows[0]?.cost}; ` +
+        `bQty=${bRows[0]?.qty}/${bRows[0]?.availableQty}, bCost=${bRows[0]?.cost}`)
 
-      const reportAll = asList((await api.getBusiness(
-        `/mes/stkIo/queryStockQty?pageNo=1&pageSize=100&materialId=${encodeURIComponent(material.id)}`))?.data)
-      const reportA = asList((await api.getBusiness(
-        `/mes/stkIo/queryStockQty?pageNo=1&pageSize=100&materialId=${encodeURIComponent(material.id)}&gradeId=${encodeURIComponent(gA.id)}`))?.data)
-      const reportB = asList((await api.getBusiness(
-        `/mes/stkIo/queryStockQty?pageNo=1&pageSize=100&materialId=${encodeURIComponent(material.id)}&gradeId=${encodeURIComponent(gB.id)}`))?.data)
-      check('现存量报表按品级聚合并可按品级筛选',
-        reportA.length === 1 && reportB.length === 1 &&
-        !reportA.some((row) => String(row.gradeId) === String(gB.id)) &&
-        reportAll.filter((row) => [String(gA.id), String(gB.id)].includes(String(row.gradeId))).length === 2,
-        `all=${reportAll.length}, a=${reportA.length}, b=${reportB.length}`)
+      const reportQuery = (gradeId = null) => {
+        const params = new URLSearchParams({
+          pageNo: '1', pageSize: '100',
+          materialCode: material.code,
+          warehouseId: wms.warehouse.id,
+          wareAreaId: wms.area.id,
+          wareLocationId: wms.location.id
+        })
+        if (gradeId != null) params.set('gradeId', String(gradeId))
+        return `/mes/stkIo/queryStockQty?${params.toString()}`
+      }
+      const reportAll = asList((await api.getBusiness(reportQuery()))?.data)
+      const reportA = asList((await api.getBusiness(reportQuery(gA.id)))?.data)
+      const reportB = asList((await api.getBusiness(reportQuery(gB.id)))?.data)
+      const reportCostField = (row) =>
+        ['cost', 'costPrice', 'stockCost', 'inventoryCost', 'avgCost']
+          .find((field) => Object.prototype.hasOwnProperty.call(row || {}, field))
+      const reportRowMatches = (row, gradeId, qty) =>
+        matchesGradeInventoryReportRow(row, {
+          materialId: material.id,
+          materialCode: material.code,
+          warehouseId: wms.warehouse.id,
+          wareAreaId: wms.area.id,
+          wareLocationId: wms.location.id,
+          gradeId,
+          qty
+        })
+      const exactReport = reportAll.length === 2 &&
+        reportAll.filter((row) => reportRowMatches(row, gA.id, 1)).length === 1 &&
+        reportAll.filter((row) => reportRowMatches(row, gB.id, 2)).length === 1
+      const exactA = reportA.length === 1 && reportRowMatches(reportA[0], gA.id, 1)
+      const exactB = reportB.length === 1 && reportRowMatches(reportB[0], gB.id, 2)
+      caseRecord.checks.push({
+        name: '现存量报表按专属物料、仓储维度和品级精确返回 A/B 两行',
+        passed: exactReport && exactA && exactB,
+        details: `all=${reportAll.length}, a=${reportA.length}, b=${reportB.length}, ` +
+          `rows=${JSON.stringify(reportAll.map((row) => ({
+            materialId: row.materialId, materialCode: row.materialCode,
+            warehouseId: row.warehouseId, wareAreaId: row.wareAreaId,
+            wareLocationId: row.wareLocationId, gradeId: row.gradeId,
+            qty: row.qty, availableQty: row.availableQty,
+            costField: reportCostField(row), cost: reportCostField(row) ? row[reportCostField(row)] : null
+          })))} `
+      })
+      caseRecord.checks.push({
+        name: '现存量页面正向显示本轮 A/B 数量及可用量 1/2',
+        ...await verifyPb038ReportPage({
+          api, page, openRoute, materialCode: material.code,
+          warehouse: wms.warehouse, area: wms.area, location: wms.location, expectedQty: [1, 2]
+        })
+      })
+      await saveScreenshot(page, outputDir, 'pb038-003-grade-forward', record)
 
+      const beforeVoidFlow = asList((await api.getBusiness(
+        `/mes/stk/report/view/list?pageNo=1&pageSize=100&id=${encodeURIComponent(aBillId)}`))?.data)
       const voidAttempt = await api.request('PUT', '/mes/stkIo/void', { id: String(aBillId) })
+      const voidedBill = unwrap(await api.getBusiness(
+        `/mes/stkIo/queryById?id=${encodeURIComponent(aBillId)}`))
       const afterVoidEntries = asList((await api.getBusiness(
         `/mes/stkIo/queryEntryByMainId?id=${encodeURIComponent(aBillId)}`))?.data)
-      const inherited = (afterVoidEntries || []).every((entry) =>
-        entry.gradeId == null || String(entry.gradeId) === String(gA.id))
+      const afterVoidFlow = asList((await api.getBusiness(
+        `/mes/stk/report/view/list?pageNo=1&pageSize=100&id=${encodeURIComponent(aBillId)}`))?.data)
+      const scopedFlow = asList((await api.getBusiness(
+        `/mes/stk/report/view/list?pageNo=1&pageSize=100&materialCode=${encodeURIComponent(material.code)}` +
+        `&warehouseId=${encodeURIComponent(wms.warehouse.id)}&wareAreaId=${encodeURIComponent(wms.area.id)}` +
+        `&wareLocationId=${encodeURIComponent(wms.location.id)}`))?.data)
+      const afterVoidInventory = await readInventoryByGrade(
+        material.id, gA.id, batchNo, { ...inventoryDimensions, includeDeleted: true })
+      const afterVoidBInventory = await readInventoryByGrade(
+        material.id, gB.id, batchNo, inventoryDimensions)
+      const flowRowMatches = (row, isVoided) =>
+        String(row.id) === String(aBillId) &&
+        String(row.materialId) === String(material.id) &&
+        String(row.warehouseId) === String(wms.warehouse.id) &&
+        String(row.wareAreaId) === String(wms.area.id) &&
+        String(row.wareLocationId) === String(wms.location.id) &&
+        Number(row.inQty) === 1 && Number(row.outQty) === 0 &&
+        Number(row.stockIoDirection) === 1 &&
+        Number(row.isVoided) === isVoided
+      const entryMatches = afterVoidEntries.length === 1 && afterVoidEntries.every((entry) =>
+        String(entry.mid) === String(aBillId) &&
+        String(entry.materialId) === String(material.id) &&
+        String(entry.gradeId) === String(gA.id) &&
+        String(entry.warehouseId) === String(wms.warehouse.id) &&
+        String(entry.wareAreaId) === String(wms.area.id) &&
+        String(entry.wareLocationId) === String(wms.location.id) &&
+        Number(entry.qty) === 1 && Number(entry.stockIoDirection) === 1)
+      const beforeFlowExact = beforeVoidFlow.length === 1 && beforeVoidFlow.every((row) => flowRowMatches(row, 0))
+      const afterFlowExact = afterVoidFlow.length === 1 && afterVoidFlow.every((row) => flowRowMatches(row, 1))
+      const totalQty = (rows) => rows.reduce((sum, row) => sum + Number(row.qty || 0), 0)
+      const totalAvailableQty = (rows) => rows.reduce((sum, row) => sum + Number(row.availableQty || 0), 0)
+      const aReturnedToZero = (afterVoidInventory.length === 0 ||
+        afterVoidInventory.every((row) =>
+          Number(row.qty) === 0 && Number(row.availableQty) === 0)) &&
+        totalQty(afterVoidInventory) === 0 && totalAvailableQty(afterVoidInventory) === 0
+      const bRetained = afterVoidBInventory.length === 1 &&
+        afterVoidBInventory.every((row) => row.materialId === String(material.id) &&
+        row.gradeId === String(gB.id) && row.warehouseId === String(wms.warehouse.id) &&
+        row.wareAreaId === String(wms.area.id) && row.wareLocationId === String(wms.location.id) &&
+        Number(row.qty) === 2 && Number(row.availableQty) === 2 &&
+        Number(row.cost) === Number(bRows[0]?.cost))
+      const independentReverseFlow = scopedFlow.some((row) =>
+        String(row.id) !== String(aBillId) && String(row.srcBillId) === String(aBillId) &&
+        String(row.materialId) === String(material.id) &&
+        String(row.warehouseId) === String(wms.warehouse.id) &&
+        String(row.wareAreaId) === String(wms.area.id) &&
+        String(row.wareLocationId) === String(wms.location.id) &&
+        Number(row.qty) === 1 && Number(row.stockIoDirection) === 2)
       caseRecord.checks.push({
-        name: '弃审/红冲动作继承原单品质级而不是重新选择',
-        passed: Number(voidAttempt?.code) === 0 && inherited,
-        details: `void=${JSON.stringify(voidAttempt).slice(0, 200)}, ` +
-          `entries=${JSON.stringify((afterVoidEntries || []).map((entry) => entry.gradeId))}`
+        name: '作废后原单流水每行保留主单、物料、仓储、数量、方向和作废状态',
+        passed: beforeFlowExact && afterFlowExact,
+        details: `before=${JSON.stringify(beforeVoidFlow)}, after=${JSON.stringify(afterVoidFlow)}`
       })
+      caseRecord.checks.push({
+        name: '作废反向库存 A 级回零且 B 级仍为 2',
+        passed: aReturnedToZero && bRetained,
+        details: `a=${JSON.stringify(afterVoidInventory)}, b=${JSON.stringify(afterVoidBInventory)}`
+      })
+      const inherited = entryMatches
+      caseRecord.checks.push({
+        name: '正式作废明细继承原单品级且作废状态回读',
+        passed: isMesBaseSuccess(voidAttempt) && Number(voidedBill.isVoided) === 1 &&
+          inherited,
+        details: `void=${JSON.stringify(voidAttempt).slice(0, 200)}, ` +
+          `voidedBill=${JSON.stringify({ isVoided: voidedBill.isVoided, isEffective: voidedBill.isEffective })}, ` +
+          `inherited=${inherited}, independentReverseFlow=${independentReverseFlow}, ` +
+          `entries=${JSON.stringify(afterVoidEntries)}, afterInventory=${JSON.stringify(afterVoidInventory)}`
+      })
+      caseRecord.evidence.push(
+        `作废证据：原单=${aBillId}，原单流水 before=${beforeFlowExact} after=${afterFlowExact}，` +
+        `A库存回零=${aReturnedToZero}，B库存保留2=${bRetained}，独立反向流水=${independentReverseFlow}`)
+
+      markCatalogAssertion(caseRecord, 0, ['同存货同仓库同批次分别入库 A/B 级生成两条独立库存行'])
+      markCatalogAssertion(caseRecord, 1, ['两条品级库存行的数量、可用量与成本互不影响'])
+      markCatalogAssertion(caseRecord, 2, ['现存量报表按专属物料、仓储维度和品级精确返回 A/B 两行'])
+      markCatalogAssertion(caseRecord, 3, ['正式作废明细继承原单品级且作废状态回读'],
+        '本轮只执行正式 void；未执行目录要求的弃审/红冲/冲销独立反向场景，void 实现也不生成独立反向流水')
 
       for (const id of [aBillId, bBillId]) {
-        await api.deleteBusiness(`/mes/stkIo/delete?id=${encodeURIComponent(id)}`).catch(() => {})
+        await requestExpectedDomainRejection(api, 'DELETE',
+          `/mes/stkIo/delete?id=${encodeURIComponent(id)}`, undefined,
+          expectedMesBaseDomainRejection(500, /单据不能做该操作|库存记录/))
       }
     } finally {
       if (managed) {
-        await api.putBusiness('/mes/basMaterial/edit', materialEditBody(material)).catch(() => {})
+        caseRecord.notes.push(
+          `保留生效库存 material=${material.id}, batch=${batchNo}；不尝试关闭品级管理，不删除仍被库存引用的专属物料`)
       }
-      await api.deleteBusiness(`/mes/basMaterial/delete?id=${material.id}`).catch(() => {})
     }
-    await openRoute(page, '/wms/stock/report/inventory', { readyText: '品级' }).catch(() => {})
-    await saveScreenshot(page, outputDir, 'pb038-003-grade-inventory', record).catch(() => {})
+    caseRecord.checks.push({
+      name: '现存量页面作废后显示本轮 A/B 数量及可用量 0/2',
+      ...await verifyPb038ReportPage({
+        api, page, openRoute, materialCode: material.code,
+        warehouse: wms.warehouse, area: wms.area, location: wms.location, expectedQty: [0, 2]
+      })
+    })
+    await saveScreenshot(page, outputDir, 'pb038-003-grade-reverse', record)
     const failed = caseRecord.checks.filter((row) => !row.passed)
-    return failed.length
+    const catalogGaps = (caseRecord.catalogAssertions || []).filter((row) => row.status !== 'VERIFIED')
+    return failed.length || catalogGaps.length
       ? {
           api, partial: true,
-          note: `品级库存写侧已执行（material=${material.id}, batch=${batchNo}），失败项：` +
-            failed.map((row) => `${row.name}=${row.details}`).join('；')
+          note: `品级库存写侧已执行（material=${material.id}, batch=${batchNo}）；` +
+            '没有独立红冲单不标记 PASS/READY；失败项：' +
+            [...failed.map((row) => `${row.name}=${row.details}`),
+              ...catalogGaps.map((row) => `原断言GAP=${row.assertion}: ${row.details}`)].join('；')
         }
       : { api }
   }
@@ -1445,7 +2142,7 @@ const runWriteBranch = async (caseId, api, page, record, caseRecord, outputDir, 
     caseRecord.checks.push({
       name: '办公用品/样品/赠品/销售出库列配置均含品级列',
       passed: columnConfig.evidence.every((row) =>
-        row.gradeField && row.gradeSlot && row.pageRefs >= 2) && columnConfig.sellGrade,
+        row.gradeField && row.gradeSlot && row.pageRefs >= row.expected) && columnConfig.sellGrade,
       details: JSON.stringify(columnConfig)
     })
     // 逐行确认四个业务明细列集合都包含 grade_select，且页面确实引用对应列配置。
@@ -1523,8 +2220,12 @@ export const runCase = async (input, dependencies = {}) => {
     '生产日历沿用 APS aps_work_calendar*，班组交接为 MES 独立事实表，工艺路线发布后只能升版且工单任务保存版本快照。'
   )
 
-  const token = await login(page)
-  const api = (dependencies.createApiClient || createApiClient)({ token, record })
+  const loginContext = caseId === 'MES-BASE-006'
+    ? await login(page, { returnContext: true }) : await login(page)
+  const token = typeof loginContext === 'string' ? loginContext : loginContext?.token
+  const api = (dependencies.createApiClient || createApiClient)({
+    token, record, ...(caseId === 'MES-BASE-006' ? { tenantId: loginContext?.tenantId } : {})
+  })
 
   if (!hasWriteApi(api)) {
     return runReadOnlyBranch(caseId, api, page, record, caseRecord, openRoute)
@@ -1535,6 +2236,18 @@ export const runCase = async (input, dependencies = {}) => {
   ]
   if (readOnlyCases.includes(caseId)) {
     return runReadOnlyBranch(caseId, api, page, record, caseRecord, openRoute)
+  }
+
+  if (caseId === 'MES-BASE-006') {
+    const closure = dependencies.runMesRouteVersionClosure || runMesRouteVersionClosure
+    const result = await closure({
+      api, record, caseRecord, tenantId: loginContext?.tenantId,
+      dependencies: dependencies.mesRouteVersionDependencies,
+      verifyPage: ({ fixture, api: scopedApi }) => verifyMesRouteVersionPage({
+        api: scopedApi, page, openRoute, saveScreenshot, outputDir, record, fixture
+      })
+    })
+    return { api, ...result }
   }
 
   return runWriteBranch(caseId, api, page, record, caseRecord, outputDir, openRoute, saveScreenshot)

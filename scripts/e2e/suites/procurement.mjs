@@ -1,6 +1,5 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { createPendingRequestBrowserFixture, generatePendingRequestInBrowser, verifyGeneratedRequestList } from '../fixtures/procurement-pending-browser.mjs'
 import { randomBytes } from 'node:crypto'
 import { createApiClient } from '../lib/api.mjs'
 import { launchBrowser, login, loginWithCredentials, openRoute, saveScreenshot } from '../lib/browser.mjs'
@@ -11,9 +10,22 @@ import { createProcurementSettlementFixture } from '../fixtures/procurement-sett
 import { createPurchasePriceSnapshotFixture } from '../fixtures/procurement-price-snapshot.mjs'
 import { createPurchaseOrderChangeFixture } from '../fixtures/procurement-order-change.mjs'
 import { createSettleRuleWriteFixture } from '../fixtures/procurement-settle-rule-write.mjs'
-import { createProcurementPermissionReader } from '../fixtures/procurement-permission-reader.mjs'
+import {
+  PROCUREMENT_DIRECT_CREATE_PERMISSION,
+  PROCUREMENT_SUPER_PERMISSION
+} from '../fixtures/procurement-direct-create-gate.mjs'
+import {
+  closeProcurementReaderSession,
+  createProcurementPermissionReader
+} from '../fixtures/procurement-permission-reader.mjs'
 import { runSupplierAuth } from '../fixtures/supplier-auth.mjs'
-import { databaseConfigured, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
+import { createSupplierAuthRequest } from '../fixtures/supplier-auth.mjs'
+import {
+  databaseConfigured,
+  assertLocalWriteSafety,
+  runReadOnlySql,
+  runLocalFixtureSql
+} from '../lib/db.mjs'
 import { createPurchaseReader } from '../fixtures/purchase-reader.mjs'
 import { collectPagePerformance } from '../lib/performance.mjs'
 import { assertBusinessSuccess } from '../lib/assertions.mjs'
@@ -22,6 +34,41 @@ import {
   cases as procurementFoundationReadonlyCases,
   runProcurementFoundationReadonlyContract
 } from './procurement-foundation-readonly.mjs'
+import {
+  createFinanceRuleWriteFixture,
+  createOpeningInvoiceWriteFixture,
+  createPurchaseTypeRuleWriteFixture,
+  createReconciliationWriteFixture
+} from '../fixtures/procurement-batch-a.mjs'
+import {
+  createPendingRequestBrowserFixture,
+  generatePendingRequestInBrowser,
+  verifyGeneratedRequestList
+} from '../fixtures/procurement-pending-browser.mjs'
+import { createProcurement016OpeningClosureFixture, procurement016TestHooks } from '../fixtures/procurement-016-opening-closure.mjs'
+import {
+  procurementChainCases,
+  runProcurementChainFixture
+} from '../fixtures/procurement-chain.mjs'
+import {
+  PROCUREMENT_SOURCE_GATE_CHECKS,
+  assertProcurementSourceRejection,
+  procurementSourceGateContracts,
+  runProcurementSourceGates
+} from '../fixtures/procurement-source-gates.mjs'
+import { PROCUREMENT_MRP_CHECKS } from '../fixtures/procurement-mrp-closure.mjs'
+import {
+  procurementOrganizationGateStatus,
+  verifyProcurementTenantIsolation
+} from '../fixtures/procurement-tenant-isolation.mjs'
+import {
+  approveOwnedSalesProcess,
+  createApprovedNormalSalesOut,
+  createSalesOpeningInventory,
+  createSalesFixture,
+  createSalesSettlementAccount,
+  salesOrderBody
+} from './erp-sales.mjs'
 
 export function procurementCatalogEvidence (caseId, caseRecord, evidence = {}) {
   // Unit tests may load this module through a data: URL, where import.meta.url
@@ -41,9 +88,12 @@ export function procurementCatalogEvidence (caseId, caseRecord, evidence = {}) {
   if (!definition) throw new Error(`缺少原 catalog 案例 ${caseId}`)
   caseRecord.catalogAssertions = (definition.assertions || []).map((assertion, index) => {
     const item = evidence[index] || {}
-    const names = Array.isArray(item) ? item : item.checks || []
-    const checks = names.map((name) => caseRecord.checks.find((check) => check.name === name))
-    const verified = names.length > 0 && checks.every((check) => check?.passed === true)
+    const names = Array.isArray(item) ? item : Array.isArray(item.checks) ? item.checks : []
+    const matches = names.map((name) => caseRecord.checks.filter((check) => check.name === name))
+    const checks = matches.map((items) => items[0])
+    const verified = names.length > 0 && new Set(names).size === names.length &&
+      names.every((name) => typeof name === 'string' && name.trim().length > 0) &&
+      matches.every((items) => items.length === 1 && items[0].passed === true)
     return {
       index,
       assertion,
@@ -57,12 +107,86 @@ export function procurementCatalogEvidence (caseId, caseRecord, evidence = {}) {
   caseRecord.remainingAssertions = caseRecord.catalogAssertions
     .filter((item) => item.status === 'GAP').map((item) => item.assertion)
   caseRecord.passCandidate = caseRecord.remainingAssertions.length === 0 &&
-    caseRecord.checks.length > 0 && caseRecord.checks.every((check) => check.passed !== false)
+    caseRecord.checks.length > 0 && caseRecord.checks.every((check) => check.passed === true)
   caseRecord.notes.push(
     `原 catalog 未修改；PASS候选=${caseRecord.passCandidate}；` +
     `剩余=${caseRecord.remainingAssertions.join('；') || '无'}`
   )
   return caseRecord
+}
+
+export const supplierAuthCatalogEvidence = (caseRecord) =>
+  procurementCatalogEvidence('PROC-010', caseRecord, {
+    0: { checks: [
+      'headed 供应商登录使用加密请求与 tenant1',
+      'headed supplier 独立存储且未覆盖管理端令牌',
+      'DB 证实专属 token userType=SUPPLIER(3)/tenant1'
+    ] },
+    1: {
+      checks: [
+        '邀请 token 来自本轮专属未发送日志且匹配有效邀请哈希',
+        'headed 邀请激活使用加密请求与 tenant1',
+        'headed 邀请激活成功返回本轮登录名',
+        'headed 邀请激活跳转登录页并预填登录名',
+        '邀请激活后正式 API 消耗 token 且账号启用',
+        '本轮邀请账号清理为 DISABLED'
+      ],
+      gap: '缺少本轮专属真实邀请 token 或完整 headed 激活证据；不发外部邮件、不改邮件配置，外部邮件服务依赖保留 GAP'
+    },
+    2: { checks: [
+      'admin refresh 不可通过 supplier refresh',
+      '跨端 refresh 拒绝后原 admin 会话仍有效',
+      'tenant-id 不匹配 refresh 精确拒绝',
+      '跨租户 refresh 拒绝前后原 access/refresh 完整事实不变',
+      '跨租户 refresh 拒绝后原 supplier 会话仍有效',
+      'supplier refresh 正常轮换 access',
+      'refresh 后旧 access 失效'
+    ] },
+    3: { checks: ['supplier token 可访问自身工作台', 'supplier token 不可访问 admin-api'] },
+    4: {
+      checks: [
+        'admin refresh 不可通过 supplier refresh',
+        '跨端 refresh 拒绝后原 admin 会话仍有效',
+        'Member API 登录取得真实专属会话',
+        'DB 证实真实 Member access/refresh userType=MEMBER(1)/tenant1',
+        'Member refresh 不可通过 supplier refresh 精确拒绝',
+        'DB 证实真实 Member access/refresh userType=MEMBER(1)/tenant1（拒绝后）',
+        'Member 跨端 refresh 拒绝前后原 access/refresh 完整事实不变',
+        '跨端 refresh 拒绝后原 Member 会话仍有效',
+        '专属 Member 会话退出'
+      ],
+      gap: '缺少专属真实 Member 登录会话及完整拒绝/事实不变证据；不伪造 token、不注册、不发短信'
+    },
+    5: { checks: [
+      '账号停用后登录拒绝', '账号停用后refresh拒绝',
+      'partner停用后登录拒绝', 'partner停用后refresh拒绝',
+      '供应商角色停用后登录拒绝', '供应商角色停用后refresh拒绝'
+    ] },
+    6: { checks: ['logout 后 access 失效', 'logout 后 refresh 失效'] }
+  })
+
+const erpAdminDirCandidates = () => [
+  process.env.CFOR_ADMIN_DIR,
+  path.resolve(process.cwd(), 'cfor/cfor-admin'),
+  path.resolve(process.cwd(), '../cfor/cfor-admin'),
+  path.resolve(process.cwd(), 'cfor-admin')
+].filter((dir) => typeof dir === 'string' && dir.trim())
+
+/**
+ * Read a Maven surefire plain-text report from the ERP backend so a catalog
+ * assertion about unit-test coverage is only VERIFIED when the report really
+ * exists and reports zero failures/errors.
+ */
+export function readSurefireSummary (relativeReportPath) {
+  for (const dir of erpAdminDirCandidates()) {
+    const file = path.join(dir, relativeReportPath)
+    try {
+      return { file, text: fs.readFileSync(file, 'utf8') }
+    } catch {
+      // try the next candidate backend checkout
+    }
+  }
+  return null
 }
 
 export const procurementReadOnlyViews = Object.freeze({
@@ -269,6 +393,7 @@ const authenticateProcurementApprover = async ({
   tenantId,
   record,
   approverBrowsers,
+  approverResources = [],
   loginImpl = loginWithCredentials,
   browserFactory = launchBrowser,
   apiFactory = createApiClient
@@ -284,6 +409,7 @@ const authenticateProcurementApprover = async ({
   if (!token) throw new Error(`BLOCKED: PROC-018 ${label}登录成功后未获得 token`)
 
   const bootstrapApi = apiFactory({ token, tenantId, record })
+  approverResources.push({ label, browser: approverBrowser, logoutApi: bootstrapApi })
   const permissionInfo = assertBusinessSuccess(
     await bootstrapApi.getPermissionInfo(),
     `${label}权限上下文`
@@ -312,6 +438,178 @@ const authenticateProcurementApprover = async ({
       nickname: user.nickname || ''
     }
   }
+}
+
+/**
+ * Build the approved request precondition used by PROC-014's independent
+ * closed-line rejection probe. The BPM route intentionally stays formal so
+ * the negative order request cannot be explained by a draft status.
+ */
+const approvePurchaseRequestForClosure = async ({ api, fixture, caseRecord, record }) => {
+  assertProcurementApproverCredentials()
+  const approverBrowsers = []
+  const approverResources = []
+  const approverSessions = {}
+  const tenantId = String(config.tenantId || '1')
+  let approved
+  let failure
+  try {
+    approverSessions.purchase = await authenticateProcurementApprover({
+      label: '采购负责人', username: config.purchaseApproverUsername,
+      password: config.purchaseApproverPassword, tenantId, record, approverBrowsers,
+      approverResources
+    })
+    approverSessions.finance = await authenticateProcurementApprover({
+      label: '财务复核', username: config.financeApproverUsername,
+      password: config.financeApproverPassword, tenantId, record, approverBrowsers,
+      approverResources
+    })
+    approverSessions.final = await authenticateProcurementApprover({
+      label: '负责人终审', username: config.finalApproverUsername,
+      password: config.finalApproverPassword, tenantId, record, approverBrowsers,
+      approverResources
+    })
+
+    const waitForRequest = async (predicate, timeoutMs = 60000) => {
+      const deadline = Date.now() + timeoutMs
+      let latest
+      while (Date.now() < deadline) {
+        latest = await fixture.read()
+        if (predicate(latest)) return latest
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+      return latest
+    }
+
+    await api.putBusiness(
+      `/erp/purchase/order/request/update-status?id=${encodeURIComponent(fixture.id)}&status=10`
+    )
+    const submitted = await waitForRequest(
+      (request) => String(request.billStage) === '22' && Boolean(request.processInstanceId)
+    )
+    if (!submitted?.processInstanceId) {
+      throw new Error(`PROC-014 专属已审核前置未进入 BPM：${JSON.stringify(submitted)}`)
+    }
+
+  const readProcessTasks = async () => {
+    const payload = await api.getBusiness(
+      `/bpm/task/list-by-process-instance-id?processInstanceId=${encodeURIComponent(submitted.processInstanceId)}`
+    )
+    return procurementTaskList(payload)
+  }
+  const waitForProcessTask = async (taskDefinitionKey, timeoutMs = 60000) => {
+    const deadline = Date.now() + timeoutMs
+    let latest = []
+    while (Date.now() < deadline) {
+      latest = await readProcessTasks()
+      const task = findProcurementTask(latest, taskDefinitionKey)
+      if (task?.id) return task
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    return findProcurementTask(latest, taskDefinitionKey)
+  }
+  const waitForTodo = async (approverApi, timeoutMs = 60000) => {
+    const deadline = Date.now() + timeoutMs
+    let latest
+    while (Date.now() < deadline) {
+      latest = await approverApi.getBusiness(
+        `/bpm/task/my-todo?processInstanceId=${encodeURIComponent(submitted.processInstanceId)}`
+      )
+      const value = latest?.data ?? latest
+      const task = Array.isArray(value) ? value[0] : value
+      if (task?.id) return task
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    return null
+  }
+    const approveInBrowser = async ({ label, session, taskDefinitionKey, opinionText }) => {
+    const { browser, api: approverApi, identity } = session
+    const processTask = await waitForProcessTask(taskDefinitionKey)
+    assertProcurementTaskAssignee({ task: processTask, identity, label })
+    const task = await waitForTodo(approverApi)
+    if (!task?.id) throw new Error(`PROC-014 ${label}未收到请购 BPM 待办`)
+    await openRoute(
+      browser.page,
+      `/bpm/process-instance/detail?id=${encodeURIComponent(submitted.processInstanceId)}&taskId=${encodeURIComponent(task.id)}`,
+      { readySelector: '.processInstance-wrap-main', readyTimeoutMs: 20000, retries: 2 }
+    )
+    const approveReference = browser.page.getByRole('button', { name: '通过', exact: true }).first()
+    await approveReference.waitFor({ state: 'visible', timeout: 30000 })
+    await approveReference.click()
+    const approvePopover = browser.page.locator('.el-popover:visible').last()
+    await approvePopover.waitFor({ state: 'visible', timeout: 30000 })
+    const opinion = approvePopover.getByPlaceholder(/请输入.*意见/).first()
+    if (await opinion.count()) await opinion.fill(opinionText)
+    const [response] = await Promise.all([
+      browser.page.waitForResponse(
+        (response) => new URL(response.url()).pathname.endsWith('/bpm/task/approve') &&
+          response.request().method() === 'PUT',
+        { timeout: 60000 }
+      ),
+      approvePopover.getByRole('button', { name: '通过', exact: true }).click()
+    ])
+    if (!response.ok()) throw new Error(`${label}审批请求失败：HTTP ${response.status()}`)
+    const approvalResult = await readBrowserBusinessResponse(response)
+    assertBusinessSuccess(approvalResult, `${label}审批`)
+  }
+
+  await approveInBrowser({
+    label: '采购负责人', session: approverSessions.purchase,
+    taskDefinitionKey: 'FirstApprove_purchase-request', opinionText: 'PROC-014 第一段审批通过'
+  })
+  await approveInBrowser({
+    label: '财务复核', session: approverSessions.finance,
+    taskDefinitionKey: 'SecondApprove_purchase-request', opinionText: 'PROC-014 第二段审批通过'
+  })
+  await approveInBrowser({
+    label: '负责人终审', session: approverSessions.final,
+    taskDefinitionKey: 'FinalApprove_purchase-request', opinionText: 'PROC-014 终审通过'
+  })
+
+    approved = await waitForRequest((request) =>
+      String(request.billStage) === '24' && Number(request.isEffective) === 1)
+    if (String(approved?.billStage) !== '24' || Number(approved?.isEffective) !== 1) {
+      throw new Error(`PROC-014 专属请购未形成已审核状态：${JSON.stringify(approved)}`)
+    }
+    caseRecord.checks.push({
+      name: '专属请购通过正式 BPM 审核后再执行独立关闭行反例',
+      passed: true,
+      details: `requestId=${fixture.id}, billStage=${approved.billStage}, isEffective=${approved.isEffective}, isPlaceOrder=${approved.isPlaceOrder}`
+    })
+  } catch (error) {
+    failure = error
+  } finally {
+    const cleanupErrors = []
+    for (const browser of approverBrowsers) {
+      try {
+        await browser.flushResponses()
+      } catch (error) {
+        cleanupErrors.push(`审批页面响应检查失败：${String(error.message || error).slice(0, 300)}`)
+      }
+    }
+    for (const browser of approverBrowsers) {
+      try {
+        await browser.browser.close()
+      } catch (error) {
+        cleanupErrors.push(`审批浏览器关闭失败：${String(error.message || error).slice(0, 300)}`)
+      }
+    }
+    for (const resource of approverResources) {
+      try {
+        await resource.logoutApi.postBusiness('/system/auth/logout')
+      } catch (error) {
+        cleanupErrors.push(`${resource.label}退出失败：${String(error.message || error).slice(0, 300)}`)
+      }
+    }
+    if (cleanupErrors.length) {
+      const cleanupFailure = cleanupErrors.join('；')
+      failure = failure
+        ? new Error(`${String(failure.message || failure).slice(0, 1000)}；${cleanupFailure}`)
+        : new Error(cleanupFailure)
+    }
+  }
+  if (failure) throw failure
+  return approved
 }
 
 const resolveProcurementTenantContext = async ({
@@ -545,9 +843,691 @@ export const cases = [
   'PROC-019'
 ]
 
+const procurementChainSessions = new WeakMap()
+
+async function procurementChainSession ({ page, record, dependencies }) {
+  const existing = procurementChainSessions.get(page)
+  if (existing) return existing
+  const token = await (dependencies.login || login)(page)
+  const api = (dependencies.createApiClient || createApiClient)({ token, record })
+  const session = { token, api, chain: {} }
+  procurementChainSessions.set(page, session)
+  return session
+}
+
+const createSupplierPortalBusinessApi = ({ request, token }) => ({
+  async getBusiness (pathname) {
+    const result = await request('GET', pathname, undefined, { token })
+    return assertBusinessSuccess(result.body, pathname)
+  },
+  async postBusiness (pathname, body) {
+    const result = await request('POST', pathname, body, { token })
+    return assertBusinessSuccess(result.body, pathname)
+  }
+})
+
+const ensureProcurementSourceMapping = async ({ supplierId, caseRecord }) => {
+  if (!/^[1-9]\d*$/.test(String(supplierId))) {
+    throw new Error(`BLOCKED: PROC-004 供应商映射缺少稳定 ERP supplierId=${supplierId}`)
+  }
+  const sourceId = String(supplierId)
+  const readMapping = async () => runReadOnlySql(`
+    SELECT id, source_id, target_partner_id, review_status
+    FROM base_partner_legacy_mapping
+    WHERE tenant_id = 1
+      AND source_domain = 'ERP_SUPPLIER'
+      AND source_id = ${sourceId}
+      AND deleted = b'0'
+    ORDER BY id ASC
+  `)
+  const before = await readMapping()
+  if (!before.available) throw new Error('BLOCKED: PROC-004 无法读取本地 ERP 供应商映射')
+  if (before.rows.length > 1) {
+    throw new Error(`BLOCKED: PROC-004 供应商存在多个有效 ERP 映射：sourceId=${sourceId}`)
+  }
+  if (before.rows.length === 1) {
+    const [mappingId, mappedSourceId, targetPartnerId, reviewStatus] = before.rows[0]
+    if (mappedSourceId === sourceId &&
+        targetPartnerId === sourceId &&
+        reviewStatus === 'CONFIRMED') {
+      caseRecord.evidence.push(
+        `PROC-004 复用已有确认 ERP 供应商映射：mappingId=${mappingId}; sourceId=${sourceId}`
+      )
+      return {
+        mappingId,
+        sourceId,
+        targetPartnerId: sourceId,
+        created: false
+      }
+    }
+    throw new Error(
+      `BLOCKED: PROC-004 供应商已有非唯一确认映射：mappingId=${mappingId}; ` +
+      `sourceId=${mappedSourceId}; targetPartnerId=${targetPartnerId}; reviewStatus=${reviewStatus}`
+    )
+  }
+
+  await runLocalFixtureSql(`
+    INSERT INTO base_partner_legacy_mapping (
+      tenant_id, source_domain, source_id, source_code, source_name, source_tax_no,
+      match_type, match_key, candidate_group, target_partner_id, review_status,
+      review_remark, evidence_json, reference_summary_json,
+      creator, create_time, updater, update_time, deleted
+    )
+    SELECT
+      1, 'ERP_SUPPLIER', supplier.id, supplier.code, supplier.name, supplier.tax_no,
+      'TAX_EXACT', CONCAT('E2E:ERP_SUPPLIER:', supplier.id), NULL,
+      partner.id, 'CONFIRMED',
+      'PROC-004 local source-gate fixture',
+      JSON_OBJECT(
+        'fixture', 'PROC-004',
+        'sourceId', supplier.id,
+        'targetPartnerId', partner.id
+      ),
+      JSON_OBJECT('fixture', 'PROC-004'),
+      'e2e', NOW(), 'e2e', NOW(), b'0'
+    FROM erp_supplier supplier
+    JOIN base_partner partner
+      ON partner.id = ${sourceId}
+     AND partner.tenant_id = 1
+     AND partner.deleted = b'0'
+    WHERE supplier.id = ${sourceId}
+      AND supplier.tenant_id = 1
+      AND supplier.deleted = b'0'
+      AND supplier.id = partner.id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM base_partner_legacy_mapping existing
+        WHERE existing.tenant_id = 1
+          AND existing.source_domain = 'ERP_SUPPLIER'
+          AND existing.source_id = supplier.id
+          AND existing.deleted = b'0'
+      )
+  `)
+
+  const after = await readMapping()
+  if (!after.available || after.rows.length !== 1 ||
+      after.rows[0][1] !== sourceId ||
+      after.rows[0][2] !== sourceId ||
+      after.rows[0][3] !== 'CONFIRMED') {
+    throw new Error(`PROC-004 本地 ERP 供应商映射写入后校验失败：sourceId=${sourceId}`)
+  }
+  const mappingId = after.rows[0][0]
+  caseRecord.database = [...(caseRecord.database || []), {
+    stage: 'procurement-source-mapping',
+    available: true,
+    rows: after.rows
+  }]
+  caseRecord.evidence.push(
+    `PROC-004 创建本地确认 ERP 供应商映射：mappingId=${mappingId}; sourceId=${sourceId}; ` +
+    `targetPartnerId=${sourceId}`
+  )
+  return {
+    mappingId,
+    sourceId,
+    targetPartnerId: sourceId,
+    created: true
+  }
+}
+
+const cleanupProcurementSourceMapping = async ({ mapping, caseRecord }) => {
+  if (!mapping?.created) return
+  await runLocalFixtureSql(`
+    UPDATE base_partner_legacy_mapping
+    SET deleted = b'1', updater = 'e2e', update_time = NOW()
+    WHERE id = ${mapping.mappingId}
+      AND tenant_id = 1
+      AND source_domain = 'ERP_SUPPLIER'
+      AND source_id = ${mapping.sourceId || mapping.targetPartnerId || 0}
+      AND target_partner_id = ${mapping.targetPartnerId || mapping.sourceId || 0}
+      AND review_status = 'CONFIRMED'
+      AND deleted = b'0'
+  `)
+  const verify = await runReadOnlySql(`
+    SELECT COUNT(*)
+    FROM base_partner_legacy_mapping
+    WHERE id = ${mapping.mappingId}
+      AND tenant_id = 1
+      AND deleted = b'0'
+  `)
+  if (!verify.available || verify.rows[0]?.[0] !== '0') {
+    throw new Error(`PROC-004 本地 ERP 供应商映射清理校验失败：mappingId=${mapping.mappingId}`)
+  }
+  caseRecord.evidence.push(`PROC-004 本地 ERP 供应商映射已软删除：mappingId=${mapping.mappingId}`)
+}
+
+const createProcurementSourceGateRunner = ({ api, page, record, caseRecord }) => {
+  let reader
+  let readerBrowser
+  let readerApi
+  let supplierAccountId
+  let supplierToken
+  let supplierMapping
+  const tenantId = String(config.tenantId || '1')
+  const supplierRequest = createSupplierAuthRequest({ record, settings: config })
+
+  const cleanup = async () => {
+    const cleanupErrors = []
+    if (supplierToken) {
+      try {
+        await supplierRequest('POST', '/supplier-api/erp/auth/logout', undefined, {
+          token: supplierToken
+        })
+      } catch (error) {
+        cleanupErrors.push(`供应商门户退出失败：${error.message || error}`)
+      }
+    }
+    if (supplierAccountId) {
+      try {
+        await api.putBusiness(
+          `/erp/supplier-portal/account/status?id=${encodeURIComponent(supplierAccountId)}&status=DISABLED`
+        )
+      } catch (error) {
+        cleanupErrors.push(`供应商门户账号停用失败：${error.message || error}`)
+      }
+    }
+    if (supplierMapping) {
+      try {
+        await cleanupProcurementSourceMapping({ mapping: supplierMapping, caseRecord })
+      } catch (error) {
+        cleanupErrors.push(`供应商 ERP 映射清理失败：${error.message || error}`)
+      }
+    }
+    try {
+      await closeProcurementReaderSession({
+        browser: readerBrowser,
+        readerApi,
+        reader
+      })
+    } catch (error) {
+      cleanupErrors.push(`低权限账号清理失败：${error.message || error}`)
+    }
+    if (cleanupErrors.length) {
+      caseRecord.notes.push(`PROC-004 source gate cleanup：${cleanupErrors.join('；')}`)
+    }
+  }
+
+  const createSaleInvoiceEvidence = async ({ privilegedApi }) => {
+    const state = {
+      originalValue: null,
+      temporaryOverride: false,
+      restored: false
+    }
+    const configPath = '/system/config/get?category=sales&tag=reconciliation'
+    const savePath = '/system/config/save?category=sales&tag=reconciliation'
+    const configData = (await privilegedApi.getBusiness(configPath)).data
+    state.originalValue = configData?.configData == null ? 'false' : String(configData.configData)
+    const enabled = (value) => {
+      const normalized = String(value ?? '').trim().toLowerCase()
+      if (normalized === 'true' || normalized === '1') return true
+      if (normalized === 'false' || normalized === '0' || normalized === '') return false
+      try {
+        return JSON.parse(normalized)?.enabled === true
+      } catch {
+        return false
+      }
+    }
+    const restore = async () => {
+      if (!state.temporaryOverride || state.restored) return
+      const current = (await privilegedApi.getBusiness(configPath)).data
+      if (!enabled(current?.configData)) {
+        throw new Error('BLOCKED: PROC-004 销售对账配置被并发修改，拒绝覆盖当前值')
+      }
+      await privilegedApi.postBusiness(savePath, { configData: state.originalValue })
+      const restored = (await privilegedApi.getBusiness(configPath)).data
+      if (String(restored?.configData ?? '') !== state.originalValue) {
+        throw new Error(
+          `BLOCKED: PROC-004 销售对账配置恢复失败：expected=${state.originalValue}; ` +
+          `actual=${restored?.configData ?? ''}`
+        )
+      }
+      state.restored = true
+      caseRecord.evidence.push(`PROC-004 sales/reconciliation 已恢复原值=${state.originalValue}`)
+    }
+    try {
+      if (!enabled(state.originalValue)) {
+        await privilegedApi.postBusiness(savePath, { configData: '{"enabled":true}' })
+        const prepared = (await privilegedApi.getBusiness(configPath)).data
+        if (!enabled(prepared?.configData)) {
+          throw new Error('PROC-004 销售对账配置启用后回读仍未生效')
+        }
+        state.temporaryOverride = true
+        caseRecord.evidence.push(
+          `PROC-004 sales/reconciliation 临时启用，原值=${state.originalValue}`
+        )
+      } else {
+        caseRecord.evidence.push('PROC-004 sales/reconciliation 原值已启用，直接复用来源门禁')
+      }
+
+      const permission = assertBusinessSuccess(
+        await privilegedApi.getBusiness('/system/auth/get-permission-info'),
+        'PROC-004 销售来源账号权限'
+      ).data
+      const userId = permission?.user?.id
+      if (!isStableId(userId)) {
+        throw new Error('BLOCKED: PROC-004 销售来源账号缺少稳定用户 ID')
+      }
+      const fixture = await createSalesFixture(
+        privilegedApi, caseRecord, userId, { crm: true, warehouse: true }
+      )
+      const account = await createSalesSettlementAccount(privilegedApi, caseRecord, fixture.tag)
+      await createSalesOpeningInventory(privilegedApi, caseRecord, fixture, 106)
+      const orderId = String(assertBusinessSuccess(
+        await privilegedApi.postBusiness('/erp/sale-order/create',
+          salesOrderBody(fixture, 'NORMAL')),
+        'PROC-004 创建专属销售订单'
+      ).data)
+      const order = (await privilegedApi.getBusiness(`/erp/sale-order/get?id=${orderId}`)).data
+      if (!isStableId(order?.id) || String(order.customerId) !== String(fixture.partnerId) ||
+          !Array.isArray(order.items) || order.items.length !== 1) {
+        throw new Error('PROC-004 专属销售订单详情不完整，未继续创建销售应收')
+      }
+      caseRecord.fixtures = [...(caseRecord.fixtures || []), {
+        kind: 'procurement-source-gate-sale-order',
+        id: orderId,
+        owned: true,
+        tenantId: 1,
+        tag: fixture.tag,
+        customerId: String(fixture.partnerId)
+      }]
+
+      const invoiceTypes = (await privilegedApi.getBusiness(
+        '/system/dict-data/page?pageNo=1&pageSize=100&dictType=invoice_type'
+      )).data
+      const invoiceType = invoiceTypes?.list?.find((row) =>
+        Number(row.status) === 0 && /^\d+$/.test(String(row.value)))
+      if (!invoiceType) throw new Error('BLOCKED: PROC-004 缺少启用发票类型')
+      const invoiceBody = {
+        customerId: String(fixture.partnerId),
+        companyName: fixture.tag,
+        taxNo: `E2E${fixture.tag.replace(/[^A-Z0-9]/g, '').slice(0, 30)}`,
+        invoiceType: Number(invoiceType.value),
+        taxRate: 0,
+        invoiceMoney: Number(order.totalPrice),
+        invoicePrice: Number(order.totalPrice),
+        srcBillType: 'SALE_ORDER',
+        saleOrderNo: order.no,
+        billDate: new Date().toISOString().slice(0, 10),
+        remark: `${fixture.tag} PROC-004 sales source gate`,
+        isRubric: 0,
+        items: [{ saleOrderId: orderId, invoiceMoneyItem: Number(order.totalPrice) }]
+      }
+      const rejected = await privilegedApi.post('/erp/sale-invoice/create', invoiceBody, {
+        expectedBusinessRejection: procurementSourceGateContracts.saleInvoiceReconciliation
+      })
+      assertProcurementSourceRejection(
+        rejected,
+        procurementSourceGateContracts.saleInvoiceReconciliation,
+        'PROC-004 销售对账启用后未确认应收创建销售发票'
+      )
+      caseRecord.checks.push({
+        name: 'PROC-004 销售对账启用后未确认应收不能创建销售发票',
+        passed: true,
+        details: `code=${rejected.code}; msg=${rejected.msg || ''}; orderId=${orderId}`
+      })
+
+      let approved = (await privilegedApi.getBusiness(`/erp/sale-order/get?id=${orderId}`)).data
+      if (Number(approved.status) !== 20) {
+        await privilegedApi.putBusiness(`/erp/sale-order/update-status?id=${orderId}&status=10`)
+        const submitted = (await privilegedApi.getBusiness(`/erp/sale-order/get?id=${orderId}`)).data
+        const processId = submitted.processInstanceId || submitted.bpmiInstanceId
+        if (processId) {
+          await approveOwnedSalesProcess({
+            api: privilegedApi,
+            page,
+            record,
+            caseRecord,
+            processId
+          })
+        } else {
+          throw new Error(`BLOCKED: PROC-004 销售订单提交后没有 BPM 流程，status=${submitted.status}`)
+        }
+        approved = (await privilegedApi.getBusiness(`/erp/sale-order/get?id=${orderId}`)).data
+      }
+      if (Number(approved.status) !== 20) {
+        throw new Error(`BLOCKED: PROC-004 专属销售订单审批未完成，status=${approved.status}`)
+      }
+      const receivablePage = (await privilegedApi.getBusiness(
+        `/finance/finReceivable/list?pageNo=1&pageSize=100&customerId=${encodeURIComponent(fixture.partnerId)}`
+      )).data
+      const receivableRows = Array.isArray(receivablePage?.list)
+        ? receivablePage.list
+        : Array.isArray(receivablePage?.records)
+          ? receivablePage.records
+          : []
+      const receivable = receivableRows.find((row) =>
+        row.srcBillType === 'SalOrder' && String(row.srcBillId) === orderId)
+      if (!isStableId(receivable?.id)) {
+        throw new Error('BLOCKED: PROC-004 销售订单审批后没有形成专属应收')
+      }
+      const unconfirmed = (await privilegedApi.getBusiness(
+        `/finance/finReceivable/queryById?id=${encodeURIComponent(receivable.id)}`
+      )).data
+      if (Number(unconfirmed?.isConfirm) === 1) {
+        throw new Error('BLOCKED: PROC-004 专属应收创建后已经被提前确认，无法验证未确认负向门禁')
+      }
+      const { out } = await createApprovedNormalSalesOut(
+        { page, record, caseRecord },
+        privilegedApi,
+        fixture,
+        account,
+        { ...(await privilegedApi.getBusiness(`/erp/sale-order/get?id=${orderId}`)).data }
+      )
+      const availableLines = (await privilegedApi.getBusiness(
+        `/erp/sale-reconciliation/available-lines?customerId=${encodeURIComponent(fixture.partnerId)}`
+      )).data
+      if (!Array.isArray(availableLines)) {
+        throw new Error('BLOCKED: PROC-004 销售对账可用明细响应不是数组')
+      }
+      const availableLine = availableLines.find((line) =>
+        String(line?.sourceOutId) === String(out.id) &&
+        isStableId(line?.sourceOutItemId))
+      if (!availableLine) {
+        throw new Error(
+          `BLOCKED: PROC-004 已审核销售出库没有进入销售对账可用明细；saleOutId=${out.id}`
+        )
+      }
+      const reconciliationId = String(assertBusinessSuccess(
+        await privilegedApi.postBusiness('/erp/sale-reconciliation/create', {
+          customerId: String(fixture.partnerId),
+          periodStart: new Date().toISOString().slice(0, 10),
+          periodEnd: new Date().toISOString().slice(0, 10),
+          sourceOutItemIds: [String(availableLine.sourceOutItemId)],
+          remark: `${fixture.tag} PROC-004 sales reconciliation`
+        }),
+        'PROC-004 创建专属销售对账单'
+      ).data)
+      let reconciliation = (await privilegedApi.getBusiness(
+        `/erp/sale-reconciliation/get?id=${encodeURIComponent(reconciliationId)}`
+      )).data
+      const sourceLine = reconciliation?.lines?.find((line) =>
+        String(line?.sourceOutItemId) === String(availableLine.sourceOutItemId))
+      if (!isStableId(sourceLine?.id) || !Number.isInteger(Number(reconciliation?.version))) {
+        throw new Error('BLOCKED: PROC-004 销售对账详情缺少专属明细或版本')
+      }
+      const confirmLine = (line) => ({
+        id: String(line.id),
+        confirmedQty: Number(line.enterpriseConfirmedQty),
+        confirmedPrice: Number(line.enterpriseConfirmedPrice),
+        confirmedTaxPrice: Number(line.enterpriseConfirmedTaxPrice || 0),
+        remark: `${fixture.tag} confirmed`
+      })
+      await privilegedApi.putBusiness('/erp/sale-reconciliation/submit', {
+        id: reconciliationId, version: reconciliation.version
+      })
+      reconciliation = (await privilegedApi.getBusiness(
+        `/erp/sale-reconciliation/get?id=${encodeURIComponent(reconciliationId)}`
+      )).data
+      await privilegedApi.putBusiness('/erp/sale-reconciliation/internal-confirm', {
+        id: reconciliationId,
+        version: reconciliation.version,
+        lines: (reconciliation.lines || []).map(confirmLine)
+      })
+      reconciliation = (await privilegedApi.getBusiness(
+        `/erp/sale-reconciliation/get?id=${encodeURIComponent(reconciliationId)}`
+      )).data
+      await privilegedApi.putBusiness('/erp/sale-reconciliation/customer-confirm', {
+        id: reconciliationId,
+        version: reconciliation.version,
+        lines: (reconciliation.lines || []).map(confirmLine)
+      })
+      reconciliation = (await privilegedApi.getBusiness(
+        `/erp/sale-reconciliation/get?id=${encodeURIComponent(reconciliationId)}`
+      )).data
+      await privilegedApi.putBusiness('/erp/sale-reconciliation/complete', {
+        id: reconciliationId, version: reconciliation.version
+      })
+      reconciliation = (await privilegedApi.getBusiness(
+        `/erp/sale-reconciliation/get?id=${encodeURIComponent(reconciliationId)}`
+      )).data
+      const completedLine = reconciliation?.lines?.find((line) =>
+        String(line?.id) === String(sourceLine.id))
+      if (reconciliation?.status !== 'COMPLETED' ||
+          Number(completedLine?.remainingInvoiceAmount) <= 0) {
+        throw new Error(
+          `BLOCKED: PROC-004 销售对账完成后没有可开票余额；` +
+          `reconciliationId=${reconciliationId}, status=${reconciliation?.status}`
+        )
+      }
+      caseRecord.evidence.push(
+        `PROC-004 ERP销售对账已完成：reconciliationId=${reconciliationId}; ` +
+        `entryId=${completedLine.id}; version=${reconciliation.version}`
+      )
+      const invoiceId = String(assertBusinessSuccess(
+        await privilegedApi.postBusiness('/erp/sale-invoice/create', invoiceBody),
+        'PROC-004 已确认应收创建销售发票'
+      ).data)
+      const invoice = (await privilegedApi.getBusiness(
+        `/erp/sale-invoice/get?id=${encodeURIComponent(invoiceId)}`
+      )).data
+      let version
+      try {
+        const rawSnapshot = invoice.reconciliationSourceVersions
+        const snapshot = typeof rawSnapshot === 'string'
+          ? JSON.parse(rawSnapshot)
+          : rawSnapshot
+        version = snapshot?.allocations
+          ?.find((item) => String(item?.entryId) === String(completedLine.id))
+          ?.sourceVersion
+      } catch {}
+      if (!version) {
+        throw new Error('PROC-004 销售发票来源版本快照缺少专属销售对账明细版本')
+      }
+      caseRecord.evidence.push(
+        `PROC-004 销售对账正向来源已确认并生成发票：orderId=${orderId}; ` +
+        `receivableId=${receivable.id}; invoiceId=${invoiceId}`
+      )
+      return {
+        invoice,
+        receivableId: String(receivable.id),
+        entryIds: [String(completedLine.id)],
+        version
+      }
+    } finally {
+      await restore()
+    }
+  }
+
+  const submitSupplierInvoice = async ({ supplierPortalApi, reconciliation, confirmedLine }) => {
+    if (!supplierToken) {
+      const tag = `PROC004_${Date.now().toString(36).toUpperCase()}_${randomBytes(2).toString('hex')}`
+      const loginName = `e2e_proc004_${tag.toLowerCase()}`
+      const password = `P04-${randomBytes(12).toString('base64url')}-x9`
+      supplierAccountId = String(assertBusinessSuccess(
+        await api.postBusiness('/erp/supplier-portal/account/create', {
+          basePartnerId: String(reconciliation.supplierId),
+          loginName,
+          password,
+          contactName: 'PROC-004 local source gate',
+          contactEmail: '',
+          status: 'ENABLED'
+        }),
+        'PROC-004 供应商门户账号创建'
+      ).data)
+      caseRecord.accounts = [...(caseRecord.accounts || []), {
+        kind: 'supplier-portal-source-gate',
+        accountId: supplierAccountId,
+        supplierId: String(reconciliation.supplierId),
+        status: 'ENABLED'
+      }]
+      supplierMapping = await ensureProcurementSourceMapping({
+        supplierId: reconciliation.supplierId,
+        caseRecord
+      })
+      const loginResult = await supplierRequest('POST', '/supplier-api/erp/auth/login', {
+        loginName,
+        password
+      }, { encrypted: true })
+      const session = assertBusinessSuccess(loginResult.body, 'PROC-004 供应商门户登录').data
+      if (!session?.accessToken) throw new Error('PROC-004 供应商门户登录未返回 accessToken')
+      supplierToken = session.accessToken
+    }
+
+    const invoiceablePayload = await supplierPortalApi.getBusiness(
+      '/supplier-api/erp/purchase-invoices/invoiceable-lines'
+    )
+    const invoiceableLines = invoiceablePayload?.data
+    if (!Array.isArray(invoiceableLines)) {
+      throw new Error(
+        `PROC-004 供应商门户可开票明细响应不是数组：${JSON.stringify({
+          code: invoiceablePayload?.code,
+          dataType: typeof invoiceableLines
+        })}`
+      )
+    }
+    const line = invoiceableLines.find((item) =>
+      String(item?.id) === String(confirmedLine.id))
+    if (!line) {
+      throw new Error(
+        `PROC-004 供应商门户可开票明细缺少已确认对账行：entryId=${confirmedLine.id}`
+      )
+    }
+    const amount = Number(line.remainingInvoiceAmount)
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error(`PROC-004 供应商门户可开票余额无效：entryId=${line.id}`)
+    }
+    const invoiceId = String((await supplierPortalApi.postBusiness(
+      '/supplier-api/erp/purchase-invoices/submit',
+      {
+        invoiceNo: `PROC004-${Date.now().toString(36).toUpperCase()}`,
+        invoiceType: 1,
+        taxRate: 0,
+        remark: `PROC-004 supplier portal source gate ${reconciliation.reconciliationId}`,
+        lines: [{
+          entryId: String(line.id),
+          amount,
+          sourceVersion: String(reconciliation.confirmed?.confirmVersion || '')
+        }]
+      }
+    )).data)
+    return assertBusinessSuccess(
+      await api.getBusiness(`/erp/purchase-invoice/get?id=${encodeURIComponent(invoiceId)}`),
+      'PROC-004 供应商门户采购发票回读'
+    ).data
+  }
+
+  return async ({ api: privilegedApi }) => {
+    try {
+      reader = await createProcurementPermissionReader(privilegedApi, caseRecord, {
+        permission: 'erp:purchase-order:query',
+        label: 'PROC004',
+        component: 'erp/purchase/order/index'
+      })
+      readerBrowser = await launchBrowser({ record })
+      const readerToken = await loginWithCredentials(readerBrowser.page, reader.credentials)
+      readerApi = createApiClient({ token: readerToken, tenantId, record })
+      const permission = assertBusinessSuccess(
+        await readerApi.getPermissionInfo(),
+        'PROC-004 低权限账号权限上下文'
+      ).data
+      if (permission?.permissions?.includes('erp:purchase-order:direct-create')) {
+        throw new Error('PROC-004 低权限账号意外拥有 erp:purchase-order:direct-create')
+      }
+      const lowPrivilegeApi = createApiClient({ token: readerToken, tenantId, record })
+      const supplierPortalApi = createSupplierPortalBusinessApi({
+        request: supplierRequest,
+        token: () => supplierToken
+      })
+      // The adapter resolves the token only after the supplier account is created.
+      supplierPortalApi.getBusiness = async (pathname) => {
+        const result = await supplierRequest('GET', pathname, undefined, {
+          token: supplierToken
+        })
+        return assertBusinessSuccess(result.body, pathname)
+      }
+      supplierPortalApi.postBusiness = async (pathname, body) => {
+        const result = await supplierRequest('POST', pathname, body, {
+          token: supplierToken
+        })
+        return assertBusinessSuccess(result.body, pathname)
+      }
+      return await runProcurementSourceGates({
+        privilegedApi,
+        lowPrivilegeApi,
+        supplierPortalApi,
+        submitSupplierInvoice,
+        createSaleInvoiceEvidence,
+        caseRecord
+      })
+    } finally {
+      await cleanup()
+    }
+  }
+}
+
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, dependencies = {}) => {
+  if (procurementChainCases.includes(caseId)) {
+    const session = await procurementChainSession({ page, record, dependencies })
+    const runChainFixture = dependencies.runProcurementChainFixture || runProcurementChainFixture
+    const writeEnabled = (dependencies.env || process.env).CFOR_E2E_WRITE_FIXTURES === 'true'
+    const sourceGateRunner = caseId === 'PROC-004' && writeEnabled
+      ? createProcurementSourceGateRunner({ api: session.api, page, record, caseRecord })
+      : undefined
+    const result = await runChainFixture({
+      caseId,
+      api: session.api,
+      page,
+      record,
+      caseRecord,
+      outputDir,
+      chain: session.chain,
+      writeEnabled,
+      openRoute: dependencies.openRoute || openRoute,
+      saveScreenshot: dependencies.saveScreenshot || saveScreenshot,
+      runMrpClosure: dependencies.runProcurementMrpClosure,
+      runProcurementSourceGates: sourceGateRunner
+    })
+    const chainEvidence = {
+      'PROC-001': {
+        0: { checks: [PROCUREMENT_MRP_CHECKS.atp] },
+        1: { checks: [PROCUREMENT_MRP_CHECKS.netDemand] },
+        2: { checks: [PROCUREMENT_MRP_CHECKS.startGate] },
+        3: { checks: [PROCUREMENT_MRP_CHECKS.shortage,
+          PROCUREMENT_MRP_CHECKS.source,
+          'PROC-001 owned Execution 物料通过正式 MRP 自动请购保留来源和明细'] }
+      },
+      'PROC-002': {
+        0: { checks: ['PROC-002 续用 PROC-001 本轮 owned MRP 自动请购来源'] },
+        1: { checks: ['PROC-002 三段 BPM 审批回写请购为已生效',
+          'PROC-002 只有正式审批完成的请购才能生成采购订单且保留主表及明细来源'] },
+        2: { checks: ['PROC-002 本轮 owned MRP 重复生成未新增请购'] },
+        3: { checks: ['采购负责人', '财务复核', '负责人终审'].map((label) =>
+          `PROC-002 ${label}收到同流程同节点准确待办并核对实际 assignee`) }
+      },
+      'PROC-003': {
+        0: { checks: ['PROC-003 采购订单审核不新增应付，历史订单应付保留且不重复生成'] },
+        1: { checks: ['PROC-003 采购发票复核后生成唯一采购应付，重复复核不重复生成'] },
+        2: { checks: ['PROC-003 无到货通知不得直接创建采购入库'] },
+        3: { checks: ['PROC-003 101 入库生效后未完成质检时数量停留在待检隔离量',
+          'PROC-003 采购入库检正式审核后 availableQty 增加且 holdQty 等量减少',
+          'PROC-003 采购入库检审核前后库存总量守恒'] },
+        4: { checks: ['PROC-003 采购入库回写订单 inCount'] }
+      },
+      'PROC-004': {
+        0: { checks: ['PROC-004 请购开关启用时无有效来源的普通采购订单被后端拒绝'] },
+        1: { checks: [
+          PROCUREMENT_SOURCE_GATE_CHECKS.directPermission,
+          PROCUREMENT_SOURCE_GATE_CHECKS.directReason,
+          PROCUREMENT_SOURCE_GATE_CHECKS.directSnapshot
+        ] },
+        2: { checks: [PROCUREMENT_SOURCE_GATE_CHECKS.saleInvoiceUnconfirmed] },
+        3: { checks: [PROCUREMENT_SOURCE_GATE_CHECKS.purchaseInvoiceUnconfirmed] },
+        4: { checks: [
+          PROCUREMENT_SOURCE_GATE_CHECKS.confirmedReconciliation,
+          PROCUREMENT_SOURCE_GATE_CHECKS.purchaseInvoiceSource
+        ] }
+      }
+    }
+    procurementCatalogEvidence(caseId, caseRecord, chainEvidence[caseId])
+    return { ...result, partial: !caseRecord.passCandidate }
+  }
   if (caseId === 'PROC-010') {
-    return runSupplierAuth({ page, record, caseRecord, outputDir }, dependencies.supplierAuth)
+    let result
+    try {
+      result = await runSupplierAuth({ page, record, caseRecord, outputDir }, dependencies.supplierAuth)
+    } finally {
+      supplierAuthCatalogEvidence(caseRecord)
+    }
+    return { ...result, partial: !caseRecord.passCandidate }
   }
   if (caseId === 'PROC-005') {
     const token = await (dependencies.login || login)(page)
@@ -555,6 +1535,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const api = createProcurementReadonlyApi({ api: baseApi, caseRecord })
     const result = await createProcurementSettlementFixture(api, caseRecord)
     caseRecord.checks.push(
+      {
+        name: 'PROC-005 请购开关开启时管理员具备合法直采权限',
+        passed: result.fixture.requisitionEnabled === false ||
+          [PROCUREMENT_DIRECT_CREATE_PERMISSION, PROCUREMENT_SUPER_PERMISSION]
+            .includes(result.fixture.directCreatePermission),
+        details: `requisitionEnabled=${result.fixture.requisitionEnabled}, ` +
+          `directCreatePermission=${result.fixture.directCreatePermission || 'none'}`
+      },
       {
         name: 'PROC-005 专属供应商通过正规 API 创建并可用于采购订单',
         passed: true,
@@ -606,6 +1594,38 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push(
       '仅执行当前租户认证后的 GET 只读前置；未创建请购、采购、发票、应付、入库或审批事实'
     )
+    const foundationGaps = {
+      'PROC-001': [
+        '未在同一业务时点用 WMS ATP 重算 MRP 现存/预留/在途与建议数量',
+        '未构造缺料工单验证禁止开工',
+        '未触发并核对缺料流程实例、节点和待办'
+      ],
+      'PROC-002': [
+        '仅回读现有 MRP/请购来源，未从缺料结果触发自动转请购',
+        '未执行请购审核生成采购订单闭环',
+        '未以同一 MRP 运算重复触发验证幂等',
+        '当前账号只读，不能证明指定审批角色收到待办'
+      ],
+      'PROC-003': [
+        '未用专属采购订单验证订单审核不新增应付及历史应付保留',
+        '未用专属发票验证复核只生成唯一采购应付和重复复核幂等',
+        'ASN 只读关联不能替代到货必经门禁',
+        '未执行 WMS 101 入库检放行/阻断及订单 inCount 回写、弃审回退'
+      ],
+      'PROC-004': [
+        '仅读取采购/销售对账和请购开关，未切换共享配置构造来源门禁反例',
+        '未构造紧急直采权限+原因双门禁反例',
+        '未用已确认对账来源创建购销发票并回读 reconciliationSource 快照'
+      ],
+      'PROC-005': [
+        '未创建专属结算字典和规则改变共享数据',
+        '未用新订单验证业务日期命中规则并保存版本快照',
+        '未验证停用字典拒绝创建及规则调整不回溯历史订单'
+      ]
+    }
+    procurementCatalogEvidence(caseId, caseRecord, Object.fromEntries(
+      (foundationGaps[caseId] || []).map((gap, index) => [index, { gap }])
+    ))
     return { token, api, ...result }
   }
   if (procurementReadOnlyViews[caseId]) {
@@ -627,9 +1647,80 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     const screenshot = await (dependencies.saveScreenshot || saveScreenshot)(
       page, outputDir, `${caseId}-readonly-settings`, record)
     caseRecord.evidence.push(screenshot)
+    if (caseId === 'PROC-008') {
+      const env = dependencies.env || process.env
+      if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+        procurementCatalogEvidence('PROC-008', caseRecord, {
+          0: ['实际权限菜单路由和领域表头已就绪'],
+          1: ['启用单据类型目录返回稳定 ID、编码、名称及布尔启用值'],
+          2: ['规则分页返回真实 list/total', '规则详情与当前分页快照一致']
+        })
+        return { token, api, ...result }
+      }
+      if (config.target !== 'local') {
+        throw new Error('BLOCKED: PROC-008 写侧验收仅允许 local target')
+      }
+      if (!databaseConfigured()) {
+        throw new Error('BLOCKED: PROC-008 写侧验收需要配置本地数据库只读证据，尚未创建专属规则')
+      }
+      await assertLocalWriteSafety(caseRecord)
+      const write = await createPurchaseTypeRuleWriteFixture(api, caseRecord)
+      caseRecord.checks.push({
+        name: 'PROC-008 专属采购类型规则创建并回读版本1',
+        passed:
+          String(write.created?.documentTypeId) === write.documentTypeId &&
+          write.created?.documentTypeCode === write.documentTypeCode &&
+          Number(write.created?.version) === 1,
+        details: `ruleId=${write.ruleId}; type=${write.documentTypeCode}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-008 非 PURCHASE 前缀单据类型不能创建采购规则',
+        passed: write.nonPurchaseRejected?.code !== 0,
+        details: `code=${write.nonPurchaseRejected?.code}; msg=${write.nonPurchaseRejected?.msg || ''}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-008 采购订单保存单据类型、稳定编码与规则版本快照',
+        passed:
+          String(write.order?.detail?.documentTypeId) === write.documentTypeId &&
+          write.order?.detail?.documentTypeCode === write.documentTypeCode &&
+          Number(write.order?.detail?.documentTypeRuleVersion) === 1,
+        details: `orderId=${write.order?.orderId}; type=${write.order?.detail?.documentTypeCode}; ` +
+          `version=${write.order?.detail?.documentTypeRuleVersion}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-008 采购规则更新后版本自增且可停用',
+        passed: Number(write.updated?.version) === 2 && Number(write.disabled?.status) === 0 &&
+          Number(write.disabled?.version) === 3,
+        details: `ruleId=${write.ruleId}; updated=${write.updated?.version}; ` +
+          `disabled=${write.disabled?.status}/${write.disabled?.version}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-008 被采购订单引用的单据类型禁止删除，只允许停用',
+        passed: write.deleteTypeRejected?.code !== 0 && Number(write.disabled?.status) === 0,
+        details: `deleteCode=${write.deleteTypeRejected?.code}; status=${write.disabled?.status}`
+      })
+      procurementCatalogEvidence('PROC-008', caseRecord, {
+        0: ['实际权限菜单路由和领域表头已就绪'],
+        1: ['启用单据类型目录返回稳定 ID、编码、名称及布尔启用值', 'PROC-008 非 PURCHASE 前缀单据类型不能创建采购规则'],
+        2: ['PROC-008 专属采购类型规则创建并回读版本1', 'PROC-008 采购规则更新后版本自增且可停用'],
+        3: ['PROC-008 采购订单保存单据类型、稳定编码与规则版本快照'],
+        4: ['PROC-008 被采购订单引用的单据类型禁止删除，只允许停用']
+      })
+      return { token, api, partial: !caseRecord.passCandidate }
+    }
     if (caseId === 'PROC-006') {
       const env = dependencies.env || process.env
-      if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') return { token, api, ...result }
+      if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+        procurementCatalogEvidence('PROC-006', caseRecord, {
+          0: ['实际权限菜单路由和领域表头已就绪'],
+          1: ['结算规则方向、账户与票据账期字段类型正确'],
+          2: ['规则分页返回真实 list/total'],
+          3: {
+            gap: '只读模式未启用写侧夹具，查询/维护权限矩阵尚未构造'
+          }
+        })
+        return { token, api, ...result }
+      }
       if (config.target !== 'local') {
         throw new Error('BLOCKED: PROC-006 写侧验收仅允许本地 local target')
       }
@@ -637,7 +1728,37 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         throw new Error('BLOCKED: PROC-006 写侧验收需要配置本地数据库只读证据，尚未创建规则')
       }
       await assertLocalWriteSafety(caseRecord)
-      const write = await createSettleRuleWriteFixture(api, caseRecord)
+      let write
+      try {
+        write = await createSettleRuleWriteFixture(api, caseRecord)
+      } catch (error) {
+        const fixture = caseRecord.fixtures?.find((item) => item.kind === 'procurement-settle-rule-write')
+        if (fixture?.status === 'creating') {
+          fixture.status = 'failed'
+          fixture.failure = String(error.message || error).slice(0, 500)
+          caseRecord.evidence.push(
+            `PROC-006 专属夹具中途失败，已登记 retained IDs；${fixture.failure}`
+          )
+        }
+        throw error
+      }
+      write.fixture.status = 'verified'
+      write.fixture.cleanup = {
+        rule: 'disabled',
+        readerAccount: 'pending-deactivation',
+        retainedOrderIds: [write.orderV1?.orderId, write.orderV2?.orderId].filter(Boolean)
+      }
+      caseRecord.evidence.push(
+        `PROC-006 专属夹具已完成验证；规则 ${write.ruleId} 已停用，采购订单仅保留快照证据`
+      )
+      caseRecord.checks.push({
+        name: 'PROC-006 请购开关开启时管理员具备合法直采权限',
+        passed: write.fixture.requisitionEnabled === false ||
+          [PROCUREMENT_DIRECT_CREATE_PERMISSION, PROCUREMENT_SUPER_PERMISSION]
+            .includes(write.fixture.directCreatePermission),
+        details: `requisitionEnabled=${write.fixture.requisitionEnabled}, ` +
+          `directCreatePermission=${write.fixture.directCreatePermission || 'none'}`
+      })
       caseRecord.checks.push({
         name: '专属结算方式字典与规则版本1真实创建并回读',
         passed:
@@ -682,14 +1803,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       let readerPageVerified = false
       const reader = await createProcurementPermissionReader(api, caseRecord, {
         permission: 'erp:settle-method-rule:query',
-        label: 'PROC006'
+        label: 'PROC006',
+        component: view.component
       })
       let readerBrowser
+      let readerApi
+      let readerFailure
       try {
         readerBrowser = await (dependencies.launchBrowser || launchBrowser)({ record })
         const readerToken = await (dependencies.loginWithCredentials || loginWithCredentials)(
           readerBrowser.page, reader.credentials)
-        const readerApi = (dependencies.createApiClient || createApiClient)({ token: readerToken, record })
+        readerApi = (dependencies.createApiClient || createApiClient)({ token: readerToken, record })
         const readerPermission = (await readerApi.getBusiness(
           '/system/auth/get-permission-info')).data
         caseRecord.checks.push({
@@ -702,8 +1826,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           details: `username=${reader.username}, permissions=${JSON.stringify(readerPermission.permissions)}`
         })
         let readerPageRendered = true
+        const readerRoute = findMenuRouteByComponent(readerPermission.menus, view.component)
+        if (!readerRoute) throw new Error(`只读账号权限菜单缺少页面 ${view.component}`)
         try {
-          await (dependencies.openRoute || openRoute)(readerBrowser.page, route, {
+          await (dependencies.openRoute || openRoute)(readerBrowser.page, readerRoute, {
             readySelector: view.readySelector
           })
         } catch {
@@ -729,7 +1855,13 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           ...write.ruleBase,
           id: write.ruleId,
           status: 0
-        }).catch((error) => ({ code: 'throw', msg: String(error.message || error) }))
+        }, {
+          expectedBusinessRejection: {
+            code: 403,
+            message: '没有该操作权限',
+            allowServiceCode: true
+          }
+        })
         const finalRuleAfter = (await api.getBusiness(
           `/erp/settle-method-rule/get?id=${encodeURIComponent(write.ruleId)}`)).data
         caseRecord.checks.push({
@@ -744,19 +1876,47 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         caseRecord.evidence.push(
           `关联只读账号 ${reader.username} 隔离 Chrome 登录、页面无写入口、维护接口 403 取证`
         )
+      } catch (error) {
+        readerFailure = error
       } finally {
         try {
-          await reader.deactivate()
+          await closeProcurementReaderSession({ browser: readerBrowser, readerApi, reader })
+          write.fixture.cleanup.readerAccount = 'deactivated'
+          write.fixture.cleanup.readerToken = readerApi ? 'logged-out' : 'not-created'
+          caseRecord.checks.push({
+            name: 'PROC-006 只读账号在取证后已停用',
+            passed: true,
+            details: `username=${reader.username}`
+          })
           caseRecord.notes.push(`PROC-006 已停用本轮关联只读账号 ${reader.username}，保留角色与审计证据`)
-        } finally {
-          await readerBrowser?.browser.close()
+        } catch (error) {
+          readerFailure = readerFailure
+            ? new AggregateError([readerFailure, error], `${readerFailure.message}；${error.message}`)
+            : error
         }
       }
+      if (readerFailure) throw readerFailure
       await saveScreenshot(page, outputDir, 'erp-settle-method-rule-write-side', record)
       caseRecord.evidence.push(
         `专属结算方式 ${write.code}、规则 ${write.ruleId} 创建/更新版本1→2/停用、` +
         `采购订单 ${write.orderV1?.orderId}/${write.orderV2?.orderId} 版本快照、只读账号权限矩阵`
       )
+      procurementCatalogEvidence('PROC-006', caseRecord, {
+        0: ['实际权限菜单路由和领域表头已就绪'],
+        1: [
+          '专属结算方式字典与规则版本1真实创建并回读',
+          '结算规则方向、账户与票据账期字段类型正确'
+        ],
+        2: ['规则分页返回真实 list/total'],
+        3: readerPageVerified
+          ? [
+              '隔离只读账号仅拥有结算规则查询权限',
+              '只读账号直接请求维护接口被后端 403 拒绝且规则未被改写',
+              '只读账号可打开规则页但不提供维护写入口',
+              'PROC-006 只读账号在取证后已停用'
+            ]
+          : { gap: '只读账号页面无维护入口未渲染完成，不能以接口 403 单独替代页面权限验收' }
+      })
       return {
         token, api, partial: !readerPageVerified,
         note: readerPageVerified ? undefined : '只读账号页面无维护入口尚未验证'
@@ -808,9 +1968,104 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     await openRoute(page, '/settings/erp/finance-document-type-rule', {
       readySelector: '.el-table__header-wrapper th:has-text("手工创建")'
     })
+    const headers = await page.locator('.el-table__header-wrapper th').allInnerTexts()
+    readonlyFact(caseRecord, '财务单据类型规则设置页真实渲染业务表头',
+      new URL(page.url()).pathname === '/settings/erp/finance-document-type-rule' &&
+        ['单据类型', '默认审批', '手工创建', '必填字段'].every((label) =>
+          headers.some((header) => header.trim() === label)),
+      `route=${page.url()}, headers=${headers.join(',')}`)
+    const financeTypes = procurementReadonlyPage(await api.getBusiness(
+      '/system/document/type/page?pageNo=1&pageSize=100&isOpen=true'), '启用财务单据类型').list
+      .filter((row) => typeof row.code === 'string' && row.code.startsWith('FIN_'))
+    readonlyFact(caseRecord, '财务类型目录只接受启用且 FIN_ 前缀的稳定类型',
+      financeTypes.length > 0 &&
+        financeTypes.every((row) => isStableId(row.id) && row.isOpen === true &&
+          String(row.code).startsWith('FIN_') && ruleText(row.name)),
+      `financeTypes=${financeTypes.length}`)
     caseRecord.evidence.push(await saveScreenshot(
       page, outputDir, 'erp-finance-document-type-rule-readonly', record))
-    return { token, api, ...result }
+    const env = dependencies.env || process.env
+    if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+      procurementCatalogEvidence('PROC-007', caseRecord, {
+        0: ['财务单据类型规则设置页真实渲染业务表头'],
+        1: ['财务类型目录只接受启用且 FIN_ 前缀的稳定类型'],
+        2: ['财务规则 ID、类型、默认审批及手工创建字段有效']
+      })
+      return { token, api, ...result }
+    }
+    if (config.target !== 'local') {
+      throw new Error('BLOCKED: PROC-007 写侧验收仅允许 local target')
+    }
+    if (!databaseConfigured()) {
+      throw new Error('BLOCKED: PROC-007 写侧验收需要配置本地数据库只读证据，尚未创建专属规则')
+    }
+    await assertLocalWriteSafety(caseRecord)
+    const write = await createFinanceRuleWriteFixture(api, caseRecord)
+    caseRecord.checks.push({
+      name: 'PROC-007 专属财务规则创建策略字段完整回读',
+      passed:
+        String(write.created?.documentTypeId) === write.documentTypeId &&
+        write.created?.documentTypeCode === write.documentTypeCode &&
+        write.created?.defaultApproval === true &&
+        write.created?.allowManualCreate === false &&
+        write.created?.requiredFields === write.createPayload.requiredFields,
+      details: `ruleId=${write.ruleId}; type=${write.documentTypeCode}`
+    })
+    caseRecord.checks.push({
+      name: 'PROC-007 allowManualCreate=false 时收款单手工保存被拒绝',
+      passed: write.manualCreateProbe?.rejected === true &&
+        /不允许手工创建单据/.test(write.manualCreateProbe?.message || ''),
+      details: `code=${write.manualCreateProbe?.code}; msg=${write.manualCreateProbe?.message || ''}`
+    })
+    caseRecord.checks.push({
+      name: 'PROC-007 requiredFields 命中为空时收款单保存被拒绝并提示字段',
+      passed: write.requiredFieldProbe?.rejected === true &&
+        /bankAccountId|settleMethod/.test(write.requiredFieldProbe?.message || ''),
+      details: `code=${write.requiredFieldProbe?.code}; msg=${write.requiredFieldProbe?.message || ''}`
+    })
+    caseRecord.checks.push({
+      name: 'PROC-007 defaultApproval=true 且配置流程时覆盖免审为流程审批',
+      passed: write.defaultApprovalProbe?.effective === false &&
+        Number(write.defaultApprovalProbe?.detail?.isEffective) === 0 &&
+        String(write.defaultApprovalProbe?.detail?.billStage) === '22' &&
+        typeof write.defaultApprovalProbe?.detail?.processInstanceId === 'string' &&
+        write.defaultApprovalProbe.detail.processInstanceId.trim() !== '',
+      details: `billId=${write.defaultApprovalProbe?.billId || ''}; ` +
+        `stage=${write.defaultApprovalProbe?.detail?.billStage || ''}; ` +
+        `effective=${write.defaultApprovalProbe?.detail?.isEffective ?? ''}; ` +
+        `processInstanceId=${write.defaultApprovalProbe?.detail?.processInstanceId || ''}; ` +
+        `msg=${write.defaultApprovalProbe?.message || ''}`
+    })
+    caseRecord.checks.push({
+      name: 'PROC-007 同一单据类型重复启用规则被拒绝',
+      passed: write.duplicate?.code !== 0,
+      details: `code=${write.duplicate?.code}; msg=${write.duplicate?.msg || ''}`
+    })
+    caseRecord.checks.push({
+      name: 'PROC-007 被规则引用后的单据类型只可停用不可删除',
+      passed: write.deleteTypeRejected?.code !== 0,
+      details: `code=${write.deleteTypeRejected?.code}; msg=${write.deleteTypeRejected?.msg || ''}`
+    })
+    caseRecord.checks.push({
+      name: 'PROC-007 规则停用后的策略值可回读且夹具按受控顺序清理',
+      passed: Number(write.updated?.status) === 0 &&
+        write.updated?.defaultApproval === false &&
+        write.updated?.allowManualCreate === true &&
+        write.updated?.requiredFields == null,
+      details: `ruleId=${write.ruleId}; cleanup=${write.fixture?.cleanup || 'retained'}`
+    })
+    procurementCatalogEvidence('PROC-007', caseRecord, {
+      0: ['财务单据类型规则设置页真实渲染业务表头'],
+      1: ['财务类型目录只接受启用且 FIN_ 前缀的稳定类型'],
+      2: ['PROC-007 专属财务规则创建策略字段完整回读'],
+      3: ['PROC-007 专属财务规则创建策略字段完整回读', 'PROC-007 规则停用后的策略值可回读且夹具按受控顺序清理'],
+      4: ['PROC-007 allowManualCreate=false 时收款单手工保存被拒绝'],
+      5: ['PROC-007 requiredFields 命中为空时收款单保存被拒绝并提示字段'],
+      6: ['PROC-007 defaultApproval=true 且配置流程时覆盖免审为流程审批'],
+      7: ['PROC-007 同一单据类型重复启用规则被拒绝'],
+      8: ['PROC-007 被规则引用后的单据类型只可停用不可删除']
+    })
+    return { token, api, partial: !caseRecord.passCandidate }
   }
 
   if (caseId === 'PROC-009') {
@@ -825,6 +2080,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     )
     const accountRows = Array.isArray(accountPage?.data?.list) ? accountPage.data.list : []
     const settings = await api.getBusiness('/erp/supplier-portal/account/settings')
+    const subsystemPage = await api.getBusiness('/system/system-init/subsystems')
+    const subsystemRows = Array.isArray(subsystemPage?.data) ? subsystemPage.data : []
+    const supplierPortalSubsystem = subsystemRows.find(
+      (item) => item?.subsystemCode === 'erp.supplier-portal'
+    )
     const partnerPage = await api.getBusiness(
       '/base/partner/page?pageNo=1&pageSize=100&status=ACTIVE&supplierEnabled=true'
     )
@@ -883,6 +2143,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     const renderDurationMs = Date.now() - renderStartedAt
     const bodyText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '门户设置开关与套餐可用性复用 erp.supplier-portal 事实源',
+      passed:
+        supplierPortalSubsystem != null &&
+        typeof supplierPortalSubsystem.available === 'boolean' &&
+        typeof supplierPortalSubsystem.status === 'string' &&
+        (supplierPortalSubsystem.available || !bodyText.includes('已开启')),
+      details: JSON.stringify({
+        status: supplierPortalSubsystem?.status,
+        available: supplierPortalSubsystem?.available
+      })
+    })
     const inviteCandidate = accountRows.find(
       (row) => row?.status !== 'ENABLED' && row?.status !== 'LOCKED'
     )
@@ -1139,9 +2411,77 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         passed: dialogVisible,
         details: dialogVisible ? '弹窗已打开' : '未找到期初入库选择弹窗'
       })
+      if (dialogVisible) {
+        const dialogText = await page.locator('.el-dialog:visible').last().innerText()
+        caseRecord.checks.push({
+          name: '期初采购入库来源弹窗展示本次开票数量字段',
+          passed: /本次开票数量|开票数量/.test(dialogText),
+          details: dialogText.slice(0, 500)
+        })
+      }
     }
     await saveScreenshot(page, outputDir, 'erp-purchase-opening-invoice-source', record)
     caseRecord.evidence.push('真实登录、期初采购入库分页字段检查、采购发票入口和来源弹窗截图')
+    const env = dependencies.env || process.env
+    if (env.CFOR_E2E_WRITE_FIXTURES === 'true') {
+      if (config.target !== 'local') {
+        throw new Error('BLOCKED: PROC-011 写侧验收仅允许 local target')
+      }
+      if (!databaseConfigured()) {
+        throw new Error('BLOCKED: PROC-011 写侧验收需要配置本地数据库只读证据，尚未创建期初发票')
+      }
+      await assertLocalWriteSafety(caseRecord)
+      const write = await createOpeningInvoiceWriteFixture(api, caseRecord)
+      caseRecord.checks.push({
+        name: 'PROC-011 已审核期初采购入库可开票但不进入 WMS 库存',
+        passed:
+          Number(write.opening?.status) === 20 &&
+          Number(write.openingAfter?.invoicedCount) === 6 &&
+          Number(write.openingAfter?.invoicedPrice) === 60 &&
+          Number(write.beforeInventory) === Number(write.afterInventory),
+        details: `purchaseInId=${write.purchaseInId}; invoiced=${write.openingAfter?.invoicedCount}/` +
+          `${write.openingAfter?.invoicedPrice}; inventory=${write.beforeInventory}->${write.afterInventory}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-011 期初来源数量和金额上限均返回业务拒绝',
+        passed:
+          write.overflowCount?.code !== 0 &&
+          write.overflowMoney?.code !== 0 &&
+          write.pendingDuplicate?.code !== 0,
+        details: `countCode=${write.overflowCount?.code}; moneyCode=${write.overflowMoney?.code}; ` +
+          `duplicateCode=${write.pendingDuplicate?.code}`
+      })
+      caseRecord.checks.push({
+        name: 'PROC-011 采购发票保存并回读期初来源、数量金额与开票状态',
+        passed:
+          String(write.invoice?.srcBillType) === 'OPENING_PURCHASE_IN' &&
+          String(write.invoice?.srcBillId) === write.purchaseInId &&
+          String(write.invoice?.details || '').includes(write.purchaseInId) &&
+          Number(write.openingAfter?.invoicedCount) === 6 &&
+          Number(write.openingAfter?.invoicedPrice) === 60,
+        details: `invoiceId=${write.invoiceId}; src=${write.invoice?.srcBillType}/${write.invoice?.srcBillId}`
+      })
+      procurementCatalogEvidence('PROC-011', caseRecord, {
+        0: ['PROC-011 已审核期初采购入库可开票但不进入 WMS 库存'],
+        1: [
+          '期初采购入库来源分页只返回已审核期初单',
+          '期初采购入库返回开票数量和金额控制字段',
+          'PROC-011 期初来源数量和金额上限均返回业务拒绝'
+        ],
+        2: [
+          '采购发票表单提供期初入库来源入口',
+          '期初采购入库来源弹窗展示本次开票数量字段'
+        ],
+        3: ['PROC-011 采购发票保存并回读期初来源、数量金额与开票状态']
+      })
+      return { token, api, partial: !caseRecord.passCandidate }
+    }
+    procurementCatalogEvidence('PROC-011', caseRecord, {
+      0: { gap: '未启用本地写侧夹具，不能证明期初入库实际可作为发票来源且不入 WMS' },
+      1: ['期初采购入库返回开票数量和金额控制字段'],
+      2: ['采购发票表单提供期初入库来源入口', '期初采购入库来源弹窗展示本次开票数量字段'],
+      3: { gap: '未执行 purchaseInId/srcBillType/invoiceCountItem/invoiceMoneyItem 真实保存' }
+    })
     return { token, api, partial: true,
       note: '只读来源与表单入口已检查，未选择专属来源、核对本次数量金额或保存 purchaseInId/srcBillType 映射' }
   }
@@ -1207,8 +2547,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'PROC-013') {
-    const token = await login(page)
-    const api = createApiClient({ token, record })
+    const token = await (dependencies.login || login)(page)
+    const api = (dependencies.createApiClient || createApiClient)({ token, record })
     const summary = await api.getBusiness('/erp/purchase/workbench/summary')
     const data = summary?.data || {}
     const expectedFields = [
@@ -1223,6 +2563,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.checks.push({
       name: '企业侧采购工作台摘要返回 7 项非负整数待办',
       passed:
+        summary?.code === 0 &&
         expectedFields.every((field) => Object.prototype.hasOwnProperty.call(data, field)) &&
         expectedFields.every((field) => Number.isInteger(data[field]) && data[field] >= 0),
       details: JSON.stringify(data)
@@ -1236,7 +2577,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
           response.request().method() === 'GET',
         { timeout: 30000 }
       ),
-      openRoute(page, '/erp/purchase/home')
+      (dependencies.openRoute || openRoute)(page, '/erp/purchase/home')
     ])
     const browserSummary = await readBrowserBusinessResponse(browserSummaryResponse)
     if (browserSummary.code !== 0 ||
@@ -1260,17 +2601,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       { timeout: 30000 }
     )
     const pageRenderDurationMs = Date.now() - pageRenderStartedAt
-    caseRecord.performance = await collectPagePerformance(page, pageRenderDurationMs)
+    caseRecord.performance = await (dependencies.collectPagePerformance || collectPagePerformance)(
+      page, pageRenderDurationMs)
+    const renderedCardValues = await page.locator('.p_workbench_card .p_workbench_value').allInnerTexts()
     caseRecord.checks.push({
       name: '7 张待办卡片显示浏览器真实摘要响应的数值，不以默认零值结案',
-      passed: true,
-      details: JSON.stringify(browserSummary.data)
+      passed: renderedCardValues.length === expectedFields.length &&
+        renderedCardValues.every((value, index) =>
+          value.trim() === String(browserSummary.data[expectedFields[index]])),
+      details: JSON.stringify({ summary: browserSummary.data, renderedCardValues })
     })
-    const bodyText = await page.locator('body').innerText()
-    const visibleTitles = titles.filter((title) => bodyText.includes(title))
+    const renderedCards = await page.locator('.p_workbench_card').allInnerTexts()
+    const visibleTitles = titles.filter((title, index) => renderedCards[index]?.includes(title))
     caseRecord.checks.push({
       name: '采购工作台首页渲染 7 张待办卡片',
-      passed: visibleTitles.length === titles.length,
+      passed: renderedCards.length === titles.length && visibleTitles.length === titles.length,
       details: `visible=${visibleTitles.join(',')}, renderMs=${pageRenderDurationMs}`
     })
     caseRecord.checks.push({
@@ -1278,7 +2623,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       passed: pageRenderDurationMs <= 5000,
       details: `renderMs=${pageRenderDurationMs}`
     })
-    await saveScreenshot(page, outputDir, 'erp-purchase-workbench-summary', record)
+    await (dependencies.saveScreenshot || saveScreenshot)(
+      page, outputDir, 'erp-purchase-workbench-summary', record)
     const supplierFilter = page.locator('.cardBox .paramsBox .el-select')
     await supplierFilter.scrollIntoViewIfNeeded()
     await supplierFilter.click()
@@ -1316,7 +2662,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         acceptanceRows.every((row) => row.portalStatus === 'SENT'),
       details: `url=${page.url()}, responseCode=${acceptanceResult?.code}, orders=${acceptanceRows?.length ?? 'invalid'}`
     })
-    await saveScreenshot(page, outputDir, 'erp-purchase-workbench-acceptance-filter', record)
+    await (dependencies.saveScreenshot || saveScreenshot)(
+      page, outputDir, 'erp-purchase-workbench-acceptance-filter', record)
 
     const resetResponsePromise = page.waitForResponse(
       (response) => {
@@ -1338,7 +2685,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push(
       '真实登录、7 项摘要及页面数值一致、首次数据就绪计时、SENT 查询请求/响应、门户筛选可见与重置请求、截图'
     )
-    return { token, api }
+    procurementCatalogEvidence('PROC-013', caseRecord, {
+      0: ['企业侧采购工作台摘要返回 7 项非负整数待办'],
+      1: ['采购工作台首页渲染 7 张待办卡片',
+        '7 张待办卡片显示浏览器真实摘要响应的数值，不以默认零值结案'],
+      2: ['待接单下钻请求真实携带 SENT 且页面显示筛选条件',
+        '重置后清除门户筛选并重新查询全部订单']
+    })
+    return { token, api, partial: !caseRecord.passCandidate }
   }
 
   if (caseId === 'PROC-014') {
@@ -1367,6 +2721,27 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
         Number(before.find((row) => row[0] === 'bill')?.[4]) === 8,
       details: `requestId=${fixture.id}, billNo=${fixture.billNo}`
     })
+    if (process.env.CFOR_E2E_WRITE_FIXTURES === 'true') {
+      const initialRequest = await fixture.read()
+      const isolation = await verifyProcurementTenantIsolation({
+        context: { page, record }, api, tenant1Fixture: fixture
+      })
+      const afterIsolation = await fixture.read()
+      const afterIsolationSnapshot = await snapshotPurchaseRequest(
+        fixture, caseRecord, 'after-tenant-isolation-probe'
+      )
+      caseRecord.checks.push({
+        name: '真实第二租户详情与分页不可见且源请购完整原值不变',
+        passed: isolation.hidden === true && isolation.pageHidden === true &&
+          JSON.stringify(afterIsolation) === JSON.stringify(initialRequest) &&
+          JSON.stringify(afterIsolationSnapshot) === JSON.stringify(before),
+        details: `tenantId=${isolation.tenantId}, requestId=${fixture.id}, detailCode=${isolation.detailCode}, pageRows=${isolation.pageRowCount}`
+      })
+      caseRecord.evidence.push(
+        `第二租户 ${isolation.tenantId} 的真实登录、请购 GET/分页隔离、源单据 API/SQL 全量原值及退出停用`
+      )
+    }
+    await approvePurchaseRequestForClosure({ api, fixture, caseRecord, record })
     const renderStartedAt = Date.now()
     await openRoute(page, '/erp/purchase/purchaseRequest')
     await page.locator('.request-status-tabs').waitFor({ state: 'visible', timeout: 60000 })
@@ -1431,13 +2806,40 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     if (!firstClosed) throw new Error('首行关闭后未回读到已关闭分录')
     await snapshotPurchaseRequest(fixture, caseRecord, 'after-first-line')
+    const firstLineSourceOrdersBefore = await runReadOnlySql(`
+      SELECT COUNT(*) FROM erp_purchase_order_items
+      WHERE src_entry_id = '${firstClosed.id}' AND deleted = 0
+    `)
     const rejectedOrder = await api.put(
-      `/erp/purchase/order/request/place/an/order?ids=${firstClosed.id}&isSeparate=0`
+      `/erp/purchase/order/request/place/an/order?ids=${firstClosed.id}&isSeparate=0`,
+      undefined,
+      {
+        expectedBusinessRejection: {
+          code: 500,
+          message: /存在已关闭的请购分录，无法生成采购订单/,
+          allowServiceCode: true
+        }
+      }
     )
+    const afterRejectedOrder = await fixture.read()
+    const afterRejectedSnapshot = await snapshotPurchaseRequest(
+      fixture, caseRecord, 'after-approved-closed-line-order-rejection'
+    )
+    const firstLineSourceOrdersAfter = await runReadOnlySql(`
+      SELECT COUNT(*) FROM erp_purchase_order_items
+      WHERE src_entry_id = '${firstClosed.id}' AND deleted = 0
+    `)
     caseRecord.checks.push({
-      name: '真实已关闭分录所在请购不能绕过后端下单门禁',
-      passed: rejectedOrder.code !== 0,
-      details: `code=${rejectedOrder.code}, msg=${rejectedOrder.msg}（未审核单据优先命中审核门禁时仍应拒绝）`
+      name: '已审核且仅一行关闭的请购正式下单被关闭分录门禁拒绝，数据不变',
+      passed: rejectedOrder.code === 500 &&
+        String(rejectedOrder.msg).includes('存在已关闭的请购分录') &&
+        JSON.stringify(afterRejectedOrder) === JSON.stringify(afterOne) &&
+        firstLineSourceOrdersBefore.available && firstLineSourceOrdersAfter.available &&
+        JSON.stringify(firstLineSourceOrdersBefore.rows) === JSON.stringify(firstLineSourceOrdersAfter.rows) &&
+        JSON.stringify(afterRejectedSnapshot) === JSON.stringify(
+          caseRecord.database.findLast((entry) => entry.stage === 'after-first-line')?.rows
+        ),
+      details: `code=${rejectedOrder.code}, msg=${rejectedOrder.msg}, sourceOrdersBefore=${firstLineSourceOrdersBefore.rows?.[0]?.[0]}, sourceOrdersAfter=${firstLineSourceOrdersAfter.rows?.[0]?.[0]}`
     })
     // Wait for the list reload after closing before clicking the remaining row.
     await page.waitForFunction(
@@ -1459,7 +2861,17 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       passed: Number(afterOne.isClosed) === 0 && Number(afterAll.isClosed) === 1,
       details: `before=${afterOne.isClosed}, after=${afterAll.isClosed}`
     })
-    const repeated = await api.put(`/erp/purchase/order/request/close?id=${fixture.id}`)
+    const beforeRepeatedClose = await snapshotPurchaseRequest(
+      fixture, caseRecord, 'before-repeat-whole-close'
+    )
+    const repeated = await api.put(`/erp/purchase/order/request/close?id=${fixture.id}`, undefined, {
+      expectedBusinessRejection: {
+        code: 500,
+        message: /请购单已关闭，请勿重复操作/,
+        allowServiceCode: true
+      }
+    })
+    const afterRepeatedClose = await fixture.read()
     const after = await snapshotPurchaseRequest(fixture, caseRecord, 'after-all-lines')
     caseRecord.checks.push({
       name: '两次页面行关闭的审计均持久化为关闭类型',
@@ -1467,11 +2879,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       details: `requestId=${fixture.id}`
     })
     caseRecord.checks.push({
-      name: '整单重复关闭明确拒绝，未设置下单标志、未修改数量',
-      passed: repeated.code !== 0 && String(repeated.msg).includes('已关闭') &&
-        Number(after.find((row) => row[0] === 'bill')?.[3]) === 0 &&
-        Number(after.find((row) => row[0] === 'bill')?.[4]) === 8,
-      details: `code=${repeated.code}, msg=${repeated.msg}`
+      name: '整单重复关闭明确拒绝，既有下单标志、数量及审计不变',
+      passed: repeated.code === 500 && String(repeated.msg).includes('请购单已关闭，请勿重复操作') &&
+        JSON.stringify(afterRepeatedClose) === JSON.stringify(afterAll) &&
+        JSON.stringify(after) === JSON.stringify(beforeRepeatedClose),
+      details: `code=${repeated.code}, msg=${repeated.msg}, isPlaceOrderBefore=${afterAll.isPlaceOrder}, isPlaceOrderAfter=${afterRepeatedClose.isPlaceOrder}`
     })
     const [closedQuery] = await Promise.all([
       waitForList(true),
@@ -1544,9 +2956,27 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     const wholeItem = wholeAfter.itemsList[0]
     const wholeOrderProbe = await api.put(
-      `/erp/purchase/order/request/place/an/order?ids=${wholeItem.id}&isSeparate=0`
+      `/erp/purchase/order/request/place/an/order?ids=${wholeItem.id}&isSeparate=0`,
+      undefined,
+      {
+        expectedBusinessRejection: {
+          code: 500,
+          message: /请购单已关闭，无法生成采购订单/,
+          allowServiceCode: true
+        }
+      }
     )
-    const wholeRepeated = await api.put(`/erp/purchase/order/request/close?id=${wholeFixture.id}`)
+    const wholeRepeated = await api.put(
+      `/erp/purchase/order/request/close?id=${wholeFixture.id}`,
+      undefined,
+      {
+        expectedBusinessRejection: {
+          code: 500,
+          message: /请购单已关闭，请勿重复操作/,
+          allowServiceCode: true
+        }
+      }
+    )
     const wholeReverseSnapshot = await snapshotPurchaseRequest(
       wholeFixture, caseRecord, 'after-whole-close-reverse-probes'
     )
@@ -1565,12 +2995,14 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push(`整单主动关闭 ${wholeFixture.id} 的真实 Chrome 操作、两行回读、关闭审计与反向阻断`)
     const reader = await createPurchaseReader(api, caseRecord)
     let readerBrowser
+    let readerApi
+    let readerFailure
     try {
       const readerFixture = await createPurchaseRequest(api, caseRecord)
       const readerBefore = await snapshotPurchaseRequest(readerFixture, caseRecord, 'before-reader-probe')
       readerBrowser = await launchBrowser({ record })
       const readerToken = await loginWithCredentials(readerBrowser.page, reader.credentials)
-      const readerApi = createApiClient({ token: readerToken, record })
+      readerApi = createApiClient({ token: readerToken, record })
       const permissionInfo = (await readerApi.getBusiness('/system/auth/get-permission-info')).data
       caseRecord.checks.push({
         name: '隔离 Chrome 关联账号仅有请购查询权限，不具有管理员或写权限',
@@ -1617,17 +3049,56 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       caseRecord.evidence.push(
         `关联只读账号 ${reader.username}、独立 Chrome 登录、页面写入口和直接关闭接口权限取证`
       )
+    } catch (error) {
+      readerFailure = error
     } finally {
       try {
-        await reader.deactivate()
+        await closeProcurementReaderSession({ browser: readerBrowser, readerApi, reader })
         caseRecord.notes.push(`已停用本轮关联测试账号 ${reader.username}，保留角色和审计证据`)
-      } finally {
-        await readerBrowser?.browser.close()
+      } catch (error) {
+        readerFailure = readerFailure
+          ? new AggregateError([readerFailure, error], `${readerFailure.message}；${error.message}`)
+          : error
       }
     }
+    if (readerFailure) throw readerFailure
+    procurementCatalogEvidence('PROC-014', caseRecord, {
+      0: ['真实创建两行请购，数量 3+5、主表及分录未关闭'],
+      1: [
+        'Chrome 关闭第一行后仅该行关闭，主表保持打开',
+        'Chrome 关闭剩余行后全部分录关闭，数量不变',
+        '全部分录关闭时主表由打开同步转为关闭'
+      ],
+      2: {
+        checks: ['已审核且仅一行关闭的请购正式下单被关闭分录门禁拒绝，数据不变']
+      },
+      3: ['整单重复关闭明确拒绝，既有下单标志、数量及审计不变'],
+      4: ['请购单列表渲染状态快捷查询标签'],
+      5: ['已关闭快捷标签真实请求 isClosed=1 并回读测试单据'],
+      6: [
+        '来源未传行号时后端补齐唯一行号并成功创建两行',
+        '两次页面行关闭的审计均持久化为关闭类型'
+      ],
+      7: ['来源未传行号时后端补齐唯一行号并成功创建两行'],
+      8: [
+        '隔离 Chrome 关联账号仅有请购查询权限，不具有管理员或写权限',
+        '只读关联账号页面不提供关闭写操作',
+        '只读关联账号不能通过直接请求关闭测试请购分录，数据库不变'
+      ],
+      9: ['Chrome 主动整单关闭后同步关闭两行，数量和下单标志不变'],
+      10: [
+        '主动整单关闭的审计持久化且类型正确',
+        '主动整单关闭后下单与重复关闭明确拒绝，数据库不变且未生成来源订单'
+      ]
+    })
+    const organizationGate = procurementOrganizationGateStatus()
+    const organizationGap = `跨租户/组织矩阵未补齐前保持 PARTIAL：${organizationGate.reason}`
+    caseRecord.remainingAssertions.push(organizationGap)
+    caseRecord.passCandidate = false
+    caseRecord.notes.push(`GAP: ${organizationGap}`)
     return {
       token, api, notImplemented: true,
-      note: '已执行行关闭、整单主动关闭、关闭后下单/重复关闭阻断及只读账号取证；跨租户/组织矩阵仍待补验'
+      note: '已执行行关闭、整单主动关闭、关闭后下单/重复关闭阻断及只读账号取证；启用专属夹具时追加真实跨租户只读隔离，组织矩阵仍待补验'
     }
   }
 
@@ -1817,95 +3288,141 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
   }
 
   if (caseId === 'PROC-016') {
-    const token = await login(page)
-    const api = createApiClient({ token, record })
-    const invoicePage = await api.getBusiness('/erp/purchase-invoice/page?pageNo=1&pageSize=100')
-    const invoiceRows = Array.isArray(invoicePage?.data?.list) ? invoicePage.data.list : []
-    if (invoiceRows.length) caseRecord.checks.push({
-      name: '采购发票分页返回来源、明细快照与生效字段',
-      passed:
-        Array.isArray(invoicePage?.data?.list) &&
-        invoiceRows.every(
-          (row) =>
-            Object.prototype.hasOwnProperty.call(row, 'srcBillType') &&
-            Object.prototype.hasOwnProperty.call(row, 'srcBillId') &&
-            Object.prototype.hasOwnProperty.call(row, 'details') &&
-            Object.prototype.hasOwnProperty.call(row, 'isEffective')
-        ),
-      details: `invoices=${invoiceRows.length}`
-    })
-    else caseRecord.notes.push('当前没有采购发票样本，来源与明细字段的实单契约尚未验证')
+    const token = await (dependencies.login || login)(page)
+    const api = (dependencies.createApiClient || createApiClient)({ token, record })
+    const env = dependencies.env || process.env
+    const invoicePage = await api.getBusiness('/erp/purchase-invoice/page?pageNo=1&pageSize=20')
+    let invoiceRows = []
+    try {
+      invoiceRows = procurement016TestHooks.requirePageRows(invoicePage, 'PROC-016 采购发票分页')
+    } catch (error) {
+      caseRecord.notes.push(`PROC-016 采购发票分页契约缺失：${error.message}`)
+    }
+    const readonlyFieldsPresent = invoiceRows.length > 0 && invoiceRows.every((row) =>
+      ['srcBillType', 'srcBillId', 'details', 'isEffective']
+        .every((field) => Object.prototype.hasOwnProperty.call(row, field)))
+    if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+      caseRecord.checks.push({
+        name: '采购发票分页返回来源、明细快照与生效字段',
+        passed: readonlyFieldsPresent,
+        details: `invoices=${invoiceRows.length}`
+      })
+    }
 
-    const payablePage = await api.getBusiness(
-      '/finance/finPayable/list/dictText?pageNo=1&pageSize=100'
+    if (env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+      const pageRenderStartedAt = Date.now()
+      await (dependencies.openRoute || openRoute)(page, '/erp/purchase/invoice', { readyText: '采购发票' })
+      const bodyText = await page.locator('body').innerText()
+      const pageRendered = page.url().includes('/erp/purchase/invoice') && bodyText.includes('采购发票')
+      caseRecord.checks.push({
+        name: '采购发票页面基础渲染可见',
+        passed: pageRendered,
+        details: `${page.url()}, renderMs=${Date.now() - pageRenderStartedAt}; ` +
+          '未启用写侧，专属发票唯一定位详情与审核入口仍由 catalog GAP 约束'
+      })
+      caseRecord.checks.push({
+        name: '采购发票页面首屏渲染耗时不超过 5 秒',
+        passed: pageRendered && Date.now() - pageRenderStartedAt <= 5000,
+        details: `renderMs=${Date.now() - pageRenderStartedAt}`
+      })
+      caseRecord.notes.push('未启用 CFOR_E2E_WRITE_FIXTURES：不创建专属订单/发票/应付，历史防重复和专属详情页面证据保持 GAP')
+      const surefire = readSurefireSummary(
+        'cfor-module-erp/cfor-module-erp-biz/target/surefire-reports/' +
+        'tech.cfor17.module.erp.service.fin.Impl.FinPayableServiceImplHistoricalPayableTest.txt'
+      )
+      const unitTestPassed = Boolean(surefire) &&
+        /Tests run:\s*3,\s*Failures:\s*0,\s*Errors:\s*0,\s*Skipped:\s*0/.test(surefire.text)
+      procurementCatalogEvidence('PROC-016', caseRecord, {
+        0: readonlyFieldsPresent ? ['采购发票分页返回来源、明细快照与生效字段'] : { gap: '无有效发票字段样本' },
+        1: { gap: '未启用专属写侧，不能以空集扫描替代三场景历史应付事实' },
+        2: { gap: '未启用专属写侧，无法按专属发票唯一定位详情与复核入口' },
+        3: unitTestPassed ? { gap: `已有报告可引用但非本轮执行：${surefire.file}` } : { gap: '缺少已有三分支零失败报告' }
+      })
+      return { token, api, partial: true, notImplemented: true, note: 'PROC-016 只读门禁保持 GAP，未创建或修改业务事实' }
+    }
+    if (config.target !== 'local') throw new Error('BLOCKED: PROC-016 专属写侧验收仅允许 local target')
+    if (!databaseConfigured()) throw new Error('BLOCKED: PROC-016 专属写侧验收需要本地数据库安全证据')
+    await assertLocalWriteSafety(caseRecord)
+    const result = await createProcurement016OpeningClosureFixture(api, caseRecord, {
+      pageEvidence: {
+        page,
+        openRoute: dependencies.openRoute || openRoute,
+        saveScreenshot: dependencies.saveScreenshot || saveScreenshot,
+        outputDir,
+        record
+      }
+    })
+    caseRecord.checks.push(
+      {
+        name: '采购发票分页返回来源、明细快照与生效字段',
+        passed: ['srcBillType', 'srcBillId', 'details', 'isEffective'].every((field) =>
+          Object.prototype.hasOwnProperty.call(result.historical.invoice.created, field)),
+        details: `invoiceId=${result.historical.invoice.invoiceId}`
+      },
+      {
+        name: 'PROC-016 历史应付存在时正式审核精确拒绝且完整快照不变',
+        passed: result.historical.rejected?.code === 1_030_102_040 &&
+          result.historical.snapshots?.before === result.historical.snapshots?.after &&
+          result.historical.snapshots?.after === result.historical.snapshots?.duplicateAfter,
+        details: `invoiceId=${result.historical.invoice.invoiceId}; code=${result.historical.rejected?.code}`
+      },
+      {
+        name: 'PROC-016 无历史应付正式审核生成唯一 PurInvoice 应付并保留完整快照',
+        passed: Boolean(result.absent.generated?.length === 1 &&
+          result.absent.generated[0]?.srcBillType === 'PurInvoice' &&
+          result.absent.snapshots?.before && result.absent.snapshots?.after),
+        details: `invoiceId=${result.absent.invoice.invoiceId}; payableId=${result.absent.generated?.[0]?.id}`
+      },
+      {
+        name: 'PROC-016 期初发票跳过历史订单检查并生成正确来源应付',
+        passed: Boolean(result.opening.generated?.length === 1 &&
+          result.opening.generated[0]?.srcBillType === 'PurInvoice' &&
+          result.opening.snapshots?.before && result.opening.snapshots?.after),
+        details: `invoiceId=${result.opening.invoice.invoiceId}; payableId=${result.opening.generated?.[0]?.id}`
+      },
+      {
+        name: 'PROC-016 专属发票真实页面唯一定位详情字段与审核入口',
+        passed: result.pageEvidence.status === 'VERIFIED',
+        details: JSON.stringify(result.pageEvidence)
+      }
     )
-    const payableRows = Array.isArray(payablePage?.data?.list)
-      ? payablePage.data.list
-      : Array.isArray(payablePage?.data?.records)
-        ? payablePage.data.records
-        : []
-    const historicalOrderIds = new Set(
-      payableRows
-        .filter(
-          (row) =>
-            row?.srcBillType === 'PurOrder' && Number(row?.isVoided || 0) !== 1 && row?.srcBillId
-        )
-        .map((row) => String(row.srcBillId))
-    )
-    const invoiceById = new Map(invoiceRows.map((row) => [String(row.id), row]))
-    const duplicateInvoicePayables = payableRows.filter((row) => {
-      if (row?.srcBillType !== 'PurInvoice' || Number(row?.isVoided || 0) === 1) {
-        return false
-      }
-      const invoice = invoiceById.get(String(row.srcBillId))
-      if (!invoice?.details) {
-        return false
-      }
-      try {
-        const sourceOrderIds = Object.keys(JSON.parse(invoice.details))
-        return sourceOrderIds.some((orderId) => historicalOrderIds.has(String(orderId)))
-      } catch {
-        return false
-      }
-    })
-    if (payableRows.length && invoiceRows.length) caseRecord.checks.push({
-      name: '不存在同一采购订单同时挂历史应付和发票应付',
-      passed: duplicateInvoicePayables.length === 0,
-      details: `historicalOrderPayables=${historicalOrderIds.size}, invoicePayables=${payableRows.filter((row) => row?.srcBillType === 'PurInvoice').length}, duplicates=${duplicateInvoicePayables.length}`
-    })
-    else caseRecord.notes.push('当前发票或应付样本为空，空集扫描不能证明防重复业务通过')
-
-    const pageRenderStartedAt = Date.now()
-    await openRoute(page, '/erp/purchase/invoice')
-    const createButton = page.getByRole('button', { name: '新增', exact: true }).first()
-    const reconciliationButton = page.getByRole('button', { name: '待开票对账', exact: true }).first()
-    await createButton.waitFor({ state: 'visible', timeout: 60000 })
-    await reconciliationButton.waitFor({ state: 'visible', timeout: 60000 })
-    const pageRenderDurationMs = Date.now() - pageRenderStartedAt
-    const bodyText = await page.locator('body').innerText()
-    caseRecord.checks.push({
-      name: '采购发票页面正常渲染并保留复核入口',
-      passed:
-        page.url().includes('/erp/purchase/invoice') &&
-        bodyText.includes('采购发票') &&
-        bodyText.includes('待开票对账'),
-      details: `${page.url()}, renderMs=${pageRenderDurationMs}`
-    })
-    caseRecord.checks.push({
-      name: '采购发票页面首屏渲染耗时不超过 5 秒',
-      passed: pageRenderDurationMs <= 5000,
-      details: `renderMs=${pageRenderDurationMs}`
-    })
-    await saveScreenshot(page, outputDir, 'erp-purchase-invoice-historical-payable-guard', record)
     caseRecord.evidence.push(
-      '真实登录、采购发票来源字段契约、历史订单应付与发票应付重复扫描、发票页面截图'
+      `PROC-016 专属供应商=${result.fixture.supplierId}、账户=${result.fixture.accountId}；` +
+      `历史应付存在/不存在/期初三场景正式 API、拒绝前后完整快照、专属发票 ${result.historical.invoice.invoiceId} ` +
+      `真实筛选详情与复核入口截图；已审核事实按 cleanupPlan 保留，不使用 SQL`
     )
+    const surefire = readSurefireSummary(
+      'cfor-module-erp/cfor-module-erp-biz/target/surefire-reports/' +
+      'tech.cfor17.module.erp.service.fin.Impl.FinPayableServiceImplHistoricalPayableTest.txt'
+    )
+    const unitTestPassed = Boolean(surefire) &&
+      /Tests run:\s*3,\s*Failures:\s*0,\s*Errors:\s*0,\s*Skipped:\s*0/.test(surefire.text)
+    if (unitTestPassed) {
+      caseRecord.checks.push({
+        name: '已有报告覆盖历史应付存在/不存在/期初发票跳过三分支（非本轮执行）',
+        passed: true,
+        details: `existing-report-only:${surefire.file}`
+      })
+      caseRecord.evidence.push(`已有 Maven surefire 报告（非本轮执行）：${surefire.file}`)
+    } else {
+      caseRecord.notes.push(
+        'GAP: 未找到 FinPayableServiceImplHistoricalPayableTest 的零失败既有 surefire 报告；' +
+        '本轮不执行 Java 单测')
+    }
+    procurementCatalogEvidence('PROC-016', caseRecord, {
+      0: ['采购发票分页返回来源、明细快照与生效字段'],
+      1: ['PROC-016 历史应付存在时正式审核精确拒绝且完整快照不变'],
+      2: ['PROC-016 专属发票真实页面唯一定位详情字段与审核入口'],
+      3: unitTestPassed
+        ? ['已有报告覆盖历史应付存在/不存在/期初发票跳过三分支（非本轮执行）']
+        : { gap: '缺少既有 FinPayableServiceImplHistoricalPayableTest 的零失败 surefire 报告' }
+    })
     return {
       token,
       api,
-      notImplemented: true,
-      note: `页面与当前数据扫描已完成（发票=${invoiceRows.length}、历史订单应付=${historicalOrderIds.size}）；` +
-        '尚未通过专用单据执行历史应付存在/不存在/期初跳过三类真实复核，不能以空列表或页面通过代替防重复业务验收'
+      ...result,
+      notImplemented: false,
+      note: 'PROC-016 三场景专属正式 API 夹具、完整快照、专属发票详情页面证据已接入；Java 报告仅引用既有证据'
     }
   }
 
@@ -2450,15 +3967,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       details: `rows=${rows.length}, total=${pageResult?.data?.total}`
     })
 
-    await page.goto(`${config.webBase}/erp/purchase/reconciliation`, {
-      waitUntil: 'domcontentloaded',
-      timeout: config.browserTimeoutMs
+    await openRoute(page, '/erp/purchase/reconciliation', {
+      readySelector: 'input[placeholder="请输入对账单号"]'
     })
-    await page.waitForFunction(
-      (expectedPath) => window.location.pathname === expectedPath,
-      '/erp/purchase/reconciliation',
-      { timeout: config.browserTimeoutMs }
-    )
     const menuItem = page.locator('.el-menu-item').filter({ hasText: '采购对账' }).first()
     await menuItem.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
     const menuVisible = await menuItem.isVisible().catch(() => false)
@@ -2493,7 +4004,63 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     })
     await page.getByRole('button', { name: '取消', exact: true }).last().click()
 
-    if (!rows.length) {
+    let targetRow = rows[0] || null
+    let writeReconciliation = null
+    const env = dependencies.env || process.env
+    if (env.CFOR_E2E_WRITE_FIXTURES === 'true') {
+      if (config.target !== 'local') {
+        throw new Error('BLOCKED: PROC-019 写侧验收仅允许 local target')
+      }
+      if (!databaseConfigured()) {
+        throw new Error('BLOCKED: PROC-019 写侧验收需要配置本地数据库只读证据，尚未创建对账单')
+      }
+      await assertLocalWriteSafety(caseRecord)
+      writeReconciliation = await createReconciliationWriteFixture(api, caseRecord)
+      const confirmedLine = writeReconciliation.confirmed?.lines?.[0]
+      caseRecord.checks.push({
+        name: 'PROC-019 专属采购订单经 ASN 形成可对账明细并确认',
+        passed:
+          Boolean(writeReconciliation.availableLine) &&
+          Number(writeReconciliation.availableLine?.shippedQty) >= 2 &&
+          Number(confirmedLine?.confirmedQty) === 2 &&
+          Number(confirmedLine?.confirmedPrice) === Number(writeReconciliation.confirmedPrice) &&
+          Number(confirmedLine?.remainingInvoiceQty) === 2,
+        details: `reconciliationId=${writeReconciliation.reconciliationId}; ` +
+          `shipped=${writeReconciliation.availableLine?.shippedQty}; ` +
+          `confirmed=${confirmedLine?.confirmedQty}/${confirmedLine?.confirmedPrice}; ` +
+          `remaining=${confirmedLine?.remainingInvoiceQty}`
+      })
+      targetRow = { ...(targetRow || {}), billNo: writeReconciliation.confirmed?.billNo || targetRow?.billNo }
+      if (!targetRow.billNo) {
+        throw new Error('PROC-019 专属对账单详情未返回 billNo，无法执行页面详情回读')
+      }
+      await page.getByPlaceholder('请输入对账单号', { exact: true }).fill(targetRow.billNo)
+      const [filteredResponse] = await Promise.all([
+        page.waitForResponse((response) => {
+          const url = new URL(response.url())
+          return url.pathname.endsWith('/erp/purchase-reconciliation/page') &&
+            url.searchParams.get('billNo') === targetRow.billNo
+        }),
+        page.getByRole('button', { name: '搜索', exact: true }).click()
+      ])
+      const filtered = await readBrowserBusinessResponse(filteredResponse)
+      caseRecord.checks.push({
+        name: '采购对账页面按本轮单号唯一回读已确认来源单',
+        passed: filtered.code === 0 && filtered.data?.list?.length === 1 &&
+          String(filtered.data.list[0].id) === writeReconciliation.reconciliationId,
+        details: `billNo=${targetRow.billNo}; reconciliationId=${writeReconciliation.reconciliationId}`
+      })
+    }
+
+    if (!targetRow) {
+      procurementCatalogEvidence('PROC-019', caseRecord, {
+        0: ['供应链菜单显示采购对账且深链不再进入 404'],
+        1: ['供应链菜单显示采购对账且深链不再进入 404'],
+        2: ['采购对账分页返回 list/total 业务结构'],
+        3: ['采购对账页面渲染发起对账入口'],
+        4: ['发起采购对账弹窗展示供应商与可对账发货明细入口'],
+        5: { gap: '当前租户没有对账单且未启用写侧夹具，详情字段缺少真实样本' }
+      })
       caseRecord.evidence.push(
         '真实 admin Chrome 已验证供应链菜单、采购对账深链、分页契约和发起弹窗；当前无对账单样本，详情字段待补数据复验'
       )
@@ -2505,7 +4072,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
       }
     }
 
-    const firstRow = rows[0]
+    const firstRow = targetRow
     const billButton = page.getByRole('button', { name: String(firstRow.billNo), exact: true }).first()
     await billButton.waitFor({ state: 'visible', timeout: config.browserTimeoutMs })
     await billButton.click()
@@ -2522,7 +4089,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }, d
     caseRecord.evidence.push(
       `真实 admin Chrome 验证采购对账深链、发起弹窗和详情字段，billNo=${firstRow.billNo}`
     )
-    return { token, api }
+    procurementCatalogEvidence('PROC-019', caseRecord, {
+      0: ['供应链菜单显示采购对账且深链不再进入 404'],
+      1: ['供应链菜单显示采购对账且深链不再进入 404'],
+      2: ['采购对账分页返回 list/total 业务结构'],
+      3: ['采购对账页面渲染发起对账入口'],
+      4: ['发起采购对账弹窗展示供应商与可对账发货明细入口'],
+      5: writeReconciliation
+        ? ['PROC-019 专属采购订单经 ASN 形成可对账明细并确认', '采购对账详情展示关键数量、价格和可开票字段']
+        : {
+            gap: '详情字段只对现有样本做页面检查，未证明专属发货/收货/确认数量与剩余开票闭环'
+          }
+    })
+    return { token, api, partial: !caseRecord.passCandidate }
   }
 
   return { designed: true }

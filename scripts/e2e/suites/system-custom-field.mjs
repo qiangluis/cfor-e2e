@@ -155,6 +155,32 @@ export function evaluateRuntimeSnapshot (schema, definition, visible) {
   )
 }
 
+export function evaluateRuntimeLifecycle (fixture, runId) {
+  if (!runId || fixture?.runId !== runId || fixture?.tenantId !== '1' ||
+      fixture.createdThisRun !== true || !isFieldId(fixture.fieldId) ||
+      !fixture.fieldCode?.startsWith(FIELD_PREFIX) || !Array.isArray(fixture.runtime)) return false
+  const requiredStates = ['DRAFT', 'PENDING_PUBLISH', 'PUBLISHED', 'DISABLED']
+  const owned = (snapshot) =>
+    snapshot?.runId === runId && String(snapshot.definition?.id) === String(fixture.fieldId) &&
+    snapshot.definition.fieldCode === fixture.fieldCode && Boolean(snapshot.definition.dataType)
+  const positive = fixture.runtime.find((snapshot) =>
+    owned(snapshot) && snapshot.visible === true &&
+    evaluateRuntimeSnapshot(snapshot.schema, snapshot.definition, true))
+  if (!positive) return false
+  // Empty exclusions are meaningful only beside this same field's nonempty
+  // published proof. A standalone empty runtime query remains insufficient.
+  return requiredStates.every((status) => fixture.runtime.some((snapshot) =>
+    owned(snapshot) && snapshot.definition.status === status &&
+    snapshot.definition.dataType === positive.definition.dataType &&
+    snapshot.visible === (status === 'PUBLISHED') &&
+    (status === 'PUBLISHED'
+      ? evaluateRuntimeSnapshot(snapshot.schema, snapshot.definition, true)
+      : Array.isArray(snapshot.schema) &&
+        (snapshot.schema.length === 0 ||
+          evaluateRuntimeSnapshot(snapshot.schema, snapshot.definition, false)))
+  ))
+}
+
 export function assertCustomFieldWriteScope (settings = config, auth, env = process.env) {
   if (
     env.CFOR_E2E_WRITE_FIXTURES !== 'true' ||
@@ -623,6 +649,12 @@ async function runDraftLifecycle ({ page, api, record, caseRecord, outputDir, au
       '真实页面新版本日志保留提交与审核'
     ])
     await recordRuntimeSnapshot(api, caseRecord, fixture, nextDraft, false)
+    recordFact(
+      caseRecord,
+      '专属字段运行时完整状态闭环',
+      evaluateRuntimeLifecycle(fixture, record.runId),
+      `fieldId=${fixture.fieldId}; runId=${record.runId}; states=DRAFT,PENDING_PUBLISH,PUBLISHED,DISABLED`
+    )
 
     for (const [key, value, expectedCode] of [
       ['fieldCode', `${fixture.fieldCode}_CHANGED`, ERROR_CODE.CODE_IMMUTABLE],
@@ -867,26 +899,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   const lifecycleCase = record.cases?.find((item) => item.id === 'PB040-002')
   const fixture = lifecycleCase?.fixtures?.[0]
-  const snapshots = fixture?.runtime || []
   const requiredStates = ['DRAFT', 'PENDING_PUBLISH', 'PUBLISHED', 'DISABLED']
   const hasLifecycleProof =
-    fixture?.runId === record.runId &&
-    fixture.createdThisRun === true &&
-    requiredStates.every((status) =>
-      snapshots.some((snapshot) =>
-        snapshot.runId === record.runId &&
-        snapshot.definition.status === status &&
-        String(snapshot.definition.id) === String(fixture.fieldId) &&
-        evaluateRuntimeSnapshot(
-          snapshot.schema,
-          snapshot.definition,
-          status === 'PUBLISHED'
-        ) &&
-        lifecycleCase.checks.some((check) =>
-          check.name === snapshot.check && check.passed === true
-        )
-      )
-    )
+    lifecycleCase?.status === 'PASS' && fixture?.cleanup === 'DELETED_VERIFIED' &&
+    evaluateRuntimeLifecycle(fixture, record.runId) &&
+    lifecycleCase.checks.some((check) =>
+      check.name === '专属字段运行时完整状态闭环' && check.passed === true)
   if (hasLifecycleProof) {
     recordFact(
       caseRecord,

@@ -163,7 +163,8 @@ test('PM project fixture consumes formal enabled rules and keeps large IDs as st
     }
   })
   assert.deepEqual(result, { projectId, handoverId })
-  assert.equal(calls[0].body.sourceType, 'E2E-RDM')
+  assert.equal(calls[0].body.sourceType, 'MANUAL')
+  assert.equal(calls[0].body.sourceBusinessNo, 'E2E-RDM-test')
   assert.equal(calls[0].body.projectName, 'E2E-RDM-test-PM')
   assert.equal(calls[2].body.decision, 'APPROVE')
 })

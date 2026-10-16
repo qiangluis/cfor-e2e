@@ -18,14 +18,15 @@ const unwrap = (response, label = 'MES APS fixture') => {
  * 保证不同 runner 之间不共享排产样本。
  */
 export class ApsSchedulingFixture {
-  constructor (api, record, caseId, { calculate = true } = {}) {
+  constructor (api, record, caseId, { calculate = true, withOpeningInventory = true } = {}) {
     this.api = api
     this.record = record
     this.caseId = caseId
     this.marker = executionMarker(caseId)
     this.calculate = calculate
     this.execution = new ExecutionWorkflowFixture(api, record, caseId, {
-      schedule: false
+      schedule: false,
+      withOpeningInventory
     })
   }
 
@@ -40,11 +41,17 @@ export class ApsSchedulingFixture {
       workOrderIds: work.id
     }), '创建排产版本'))
     assert(/^[0-9]+$/.test(this.versionId), '排产版本主键必须为数字')
+    const version = unwrap(await this.api.getBusiness(
+      `/mes/aps/scheduling/get?id=${encodeURIComponent(this.versionId)}`
+    ), '排产版本创建后回读')
+    assert.equal(String(version?.id), this.versionId, '排产版本创建后主键必须保持一致')
     if (this.calculate) {
       this.calculation = unwrap(await this.api.postBusiness(
         '/mes/aps/scheduling/calculate',
         {
-          versionId: Number(this.versionId),
+          // Snowflake IDs exceed Number.MAX_SAFE_INTEGER; keep the JSON value
+          // as a decimal string so Spring can bind the exact Long value.
+          versionId: this.versionId,
           workOrders: [{
             workOrderId: work.id,
             sortOrder: 1,

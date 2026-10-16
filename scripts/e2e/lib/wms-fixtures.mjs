@@ -4,6 +4,7 @@ import { assertBusinessSuccess } from './assertions.mjs'
 
 export const WMS_FIXTURE_MARK = 'E2E-WMS-20261007 dedicated fixture'
 export const WMS_WRITE_ENV = 'CFOR_E2E_WRITE_FIXTURES'
+const stockIoSequenceByFixture = new WeakMap()
 
 export const isWmsWriteEnabled = (env = process.env) =>
   String(env[WMS_WRITE_ENV] || '').trim().toLowerCase() === 'true'
@@ -111,8 +112,9 @@ export async function createWarehouseFixture (api, caseRecord, token, index = 1)
   remember(caseRecord, { kind: 'area', id: String(area.id), code: areaCode, warehouseId: String(warehouse.id), token })
 
   const locationCode = fixtureCode(token, 'LC', index)
+  const locationName = `E2E-WMS location ${index}`
   const locationId = dataOf(await api.postBusiness('/mes/wms-house-location/create', {
-    locationName: `E2E-WMS location ${index}`,
+    locationName,
     locationCode,
     houseId: String(warehouse.id),
     areaId: String(area.id),
@@ -126,7 +128,7 @@ export async function createWarehouseFixture (api, caseRecord, token, index = 1)
   remember(caseRecord, { kind: 'location', id: String(locationId), code: locationCode,
     warehouseId: String(warehouse.id), areaId: String(area.id), token })
   return { warehouse: { ...warehouse, id: String(warehouse.id) }, area: { ...area, id: String(area.id) },
-    location: { id: String(locationId), locationCode }, token }
+    location: { id: String(locationId), locationCode, locationName }, token }
 }
 
 export async function createMaterialFixture (api, caseRecord, token, unitId) {
@@ -217,7 +219,18 @@ export async function createOpeningInventory (api, caseRecord, fixture, material
   let detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(id)}`), '106 期初回读')
   const owned = String(detail?.stockIoType) === '106' && isOwnedFixture(detail, fixture.token)
   addCheck(caseRecord, '106 期初正式提交后回读类型和所有权', owned, `id=${id}; type=${detail?.stockIoType}`)
-  const opening = remember(caseRecord, { kind: 'opening', id: String(id), batchNo, quantity, token: fixture.token, status: 'SUBMITTED' })
+  const opening = remember(caseRecord, {
+    kind: 'opening',
+    id: String(id),
+    batchNo,
+    quantity,
+    token: fixture.token,
+    status: 'SUBMITTED',
+    warehouseId: String(fixture.warehouse.id),
+    areaId: String(fixture.area.id),
+    locationId: String(fixture.location.id),
+    materialId: String(material.id)
+  })
   let approved = isEffective(detail)
   if (approved) {
     addCheck(caseRecord, '106 期初详情已自动生效且未重复审批', true, `id=${id}; effective=${detail.isEffective}`)
@@ -241,8 +254,10 @@ export async function createOpeningInventory (api, caseRecord, fixture, material
 export async function createStockIoFixture (api, caseRecord, fixture, material, unitId, {
   stockIoType = '101', quantity = 10, isQc = 0, batchNo = `${fixture.token}-RECEIPT-BATCH`
 } = {}) {
+  const sequence = (stockIoSequenceByFixture.get(fixture) || 0) + 1
+  stockIoSequenceByFixture.set(fixture, sequence)
   const body = {
-    billNo: fixtureCode(fixture.token, 'IO', stockIoType),
+    billNo: fixtureCode(fixture.token, 'IO', `${stockIoType}-${sequence}`),
     billDate: new Date().toISOString().slice(0, 10),
     subject: `${fixture.token} stock io ${stockIoType}`,
     remark: `${WMS_FIXTURE_MARK} ${fixture.token}`,
@@ -263,7 +278,17 @@ export async function createStockIoFixture (api, caseRecord, fixture, material, 
   let detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(id)}`), `${stockIoType} 回读`)
   const owned = String(detail?.stockIoType) === stockIoType && isOwnedFixture(detail, fixture.token)
   addCheck(caseRecord, `${stockIoType} 正式提交后回读类型和所有权`, owned, `id=${id}`)
-  remember(caseRecord, { kind: 'stockIo', id: String(id), stockIoType, token: fixture.token, status: 'SUBMITTED' })
+  const stockIoFixture = remember(caseRecord, {
+    kind: 'stockIo',
+    id: String(id),
+    stockIoType,
+    token: fixture.token,
+    status: 'SUBMITTED',
+    warehouseId: String(fixture.warehouse.id),
+    areaId: String(fixture.area.id),
+    locationId: String(fixture.location.id),
+    materialId: String(material.id)
+  })
   let approved = isEffective(detail)
   if (approved) {
     addCheck(caseRecord, `${stockIoType} 详情已自动生效且未重复审批`, true, `id=${id}; effective=${detail.isEffective}`)
@@ -278,6 +303,7 @@ export async function createStockIoFixture (api, caseRecord, fixture, material, 
     detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(id)}`), `${stockIoType} 审批后回读`)
     approved = isEffective(detail)
   }
+  stockIoFixture.status = approved ? 'EFFECTIVE' : 'SUBMITTED'
   addCheck(caseRecord, `${stockIoType} 以详情 isEffective 判断生效状态`, approved, `id=${id}; effective=${detail?.isEffective}`)
   return { id: String(id), detail, approved, body, batchNo, quantity }
 }
@@ -297,7 +323,20 @@ export async function createTransferFixture (api, caseRecord, fixture, material,
   if (!id) throw new Error('调拨创建未返回 ID')
   const retry = dataOf(await api.postBusiness('/wms/transfer-bill/create', body), '调拨幂等重试')
   addCheck(caseRecord, '调拨同一幂等键返回同一单据', String(retry) === String(id), `first=${id}; retry=${retry}`)
-  remember(caseRecord, { kind: 'transfer', id: String(id), idempotencyKey, token: fixture.token, status: 'DRAFT' })
+  remember(caseRecord, {
+    kind: 'transfer',
+    id: String(id),
+    idempotencyKey,
+    token: fixture.token,
+    status: 'DRAFT',
+    warehouseId: String(fixture.warehouse.id),
+    areaId: String(fixture.area.id),
+    locationId: String(fixture.location.id),
+    targetWarehouseId: String(target.warehouse.id),
+    targetAreaId: String(target.area.id),
+    targetLocationId: String(target.location.id),
+    materialId: String(material.id)
+  })
   return { id: String(id), body }
 }
 
@@ -315,7 +354,17 @@ export async function createBorrowFixture (api, caseRecord, fixture, material, u
   if (!id) throw new Error('借用创建未返回 ID')
   const retry = dataOf(await api.postBusiness('/wms/borrow-bill/create', body), '借用幂等重试')
   addCheck(caseRecord, '借用同一幂等键返回同一单据', String(retry) === String(id), `first=${id}; retry=${retry}`)
-  remember(caseRecord, { kind: 'borrow', id: String(id), idempotencyKey, token: fixture.token, status: 'DRAFT' })
+  remember(caseRecord, {
+    kind: 'borrow',
+    id: String(id),
+    idempotencyKey,
+    token: fixture.token,
+    status: 'DRAFT',
+    warehouseId: String(fixture.warehouse.id),
+    areaId: String(fixture.area.id),
+    locationId: String(fixture.location.id),
+    materialId: String(material.id)
+  })
   return { id: String(id), body }
 }
 
@@ -337,41 +386,113 @@ export async function inventorySnapshot (api, fixture, materialId) {
 
 export async function cleanupWmsFixtures (api, caseRecord) {
   const fixtures = [...(caseRecord.fixtures || [])].reverse()
+  const protectedRefs = new Map()
+  let dependencyCleanupBlocked = false
+  const businessDetails = new Map()
+  const businessFixtures = fixtures.filter((item) =>
+    ['opening', 'stockIo', 'transfer', 'borrow'].includes(item.kind))
+  const detailPath = (fixture) => {
+    if (fixture.kind === 'opening' || fixture.kind === 'stockIo') {
+      return `/mes/stkIo/queryById?id=${encodeURIComponent(fixture.id)}`
+    }
+    if (fixture.kind === 'transfer') {
+      return `/wms/transfer-bill/get?id=${encodeURIComponent(fixture.id)}`
+    }
+    return `/wms/borrow-bill/get?id=${encodeURIComponent(fixture.id)}`
+  }
+  const isDraftStockIo = (detail) =>
+    String(detail?.billStage || '') === '12' &&
+    Number(detail?.isEffective || 0) === 0 &&
+    Number(detail?.isVoided || 0) === 0
+  const isDraftTransfer = (detail) =>
+    detail?.transferStatus === 'DRAFT' && Number(detail?.isEffective || 0) !== 1
+  const isDraftBorrow = (detail) =>
+    detail?.borrowStatus === 'DRAFT' && Number(detail?.isEffective || 0) !== 1
+  const requiresDependencyProtection = (fixture, detail) => {
+    if (fixture.kind === 'opening' || fixture.kind === 'stockIo') {
+      return !isDraftStockIo(detail)
+    }
+    if (fixture.kind === 'transfer') return !isDraftTransfer(detail)
+    return !isDraftBorrow(detail)
+  }
+  const protectDependencies = (fixture) => {
+    for (const [kind, id] of [
+      ['warehouse', fixture.warehouseId],
+      ['warehouse', fixture.targetWarehouseId],
+      ['area', fixture.areaId],
+      ['area', fixture.targetAreaId],
+      ['location', fixture.locationId],
+      ['location', fixture.targetLocationId],
+      ['material', fixture.materialId]
+    ]) {
+      if (id) protectedRefs.set(`${kind}:${id}`, fixture.id)
+    }
+  }
+  for (const fixture of businessFixtures) {
+    try {
+      const detail = dataOf(await api.getBusiness(detailPath(fixture)), `清理前${fixture.kind}回读`)
+      businessDetails.set(`${fixture.kind}:${fixture.id}`, detail)
+      if (requiresDependencyProtection(fixture, detail)) protectDependencies(fixture)
+    } catch (error) {
+      dependencyCleanupBlocked = true
+      caseRecord.notes.push(`清理前${fixture.kind}回读失败 id=${fixture.id}，保守跳过结构依赖删除：${error.message}`)
+    }
+  }
   for (const fixture of fixtures) {
     try {
       if (fixture.kind === 'opening') {
-        const detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(fixture.id)}`), '清理前期初回读')
-        if (Number(detail?.isEffective || 0) === 1) {
-          caseRecord.notes.push(`保留已生效 106 期初夹具 ${fixture.id}，不直接删除库存事实`)
+        const detail = businessDetails.get(`${fixture.kind}:${fixture.id}`)
+        if (!detail || !isDraftStockIo(detail)) {
+          caseRecord.notes.push(`保留已生效 106 期初夹具 ${fixture.id} 及其库存依赖，不直接删除库存事实`)
           continue
         }
         await api.deleteBusiness(`/mes/stkIo/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'stockIo') {
-        const detail = dataOf(await api.getBusiness(`/mes/stkIo/queryById?id=${encodeURIComponent(fixture.id)}`), '清理前库存单回读')
-        if (Number(detail?.isEffective || 0) === 1) {
-          caseRecord.notes.push(`保留已生效库存单 ${fixture.id}，不直接删除库存流水`)
+        const detail = businessDetails.get(`${fixture.kind}:${fixture.id}`)
+        if (!detail || !isDraftStockIo(detail)) {
+          caseRecord.notes.push(`保留非草稿或已生效库存单 ${fixture.id}，不直接删除库存流水`)
           continue
         }
         await api.deleteBusiness(`/mes/stkIo/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'transfer') {
-        const detail = dataOf(await api.getBusiness(`/wms/transfer-bill/get?id=${encodeURIComponent(fixture.id)}`), '清理前调拨回读')
-        if (detail?.transferStatus !== 'DRAFT' || Number(detail?.isEffective || 0) === 1) continue
+        const detail = businessDetails.get(`${fixture.kind}:${fixture.id}`)
+        if (!detail || !isDraftTransfer(detail)) continue
         await api.deleteBusiness(`/wms/transfer-bill/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'borrow') {
-        const detail = dataOf(await api.getBusiness(`/wms/borrow-bill/get?id=${encodeURIComponent(fixture.id)}`), '清理前借用回读')
-        if (detail?.borrowStatus !== 'DRAFT' || Number(detail?.isEffective || 0) === 1) continue
+        const detail = businessDetails.get(`${fixture.kind}:${fixture.id}`)
+        if (!detail || !isDraftBorrow(detail)) continue
         await api.deleteBusiness(`/wms/borrow-bill/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'material') {
+        const protectedBy = protectedRefs.get(`material:${fixture.id}`)
+        if (dependencyCleanupBlocked || protectedBy) {
+          caseRecord.notes.push(`保留业务夹具 ${protectedBy || '未完成回读'} 的物料依赖 ${fixture.id}，不删除库存事实引用`)
+          continue
+        }
         const detail = dataOf(await api.getBusiness(`/mes/basMaterial/queryById?id=${encodeURIComponent(fixture.id)}`), '清理前物料回读')
         if (String(detail?.code) !== String(fixture.code) || !isOwnedFixture(detail, fixture.token)) continue
         await api.deleteBusiness(`/mes/basMaterial/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'qualityMaterial') {
         await api.deleteBusiness(`/mes/quality/qualityMaterial/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'location') {
+        const protectedBy = protectedRefs.get(`location:${fixture.id}`)
+        if (dependencyCleanupBlocked || protectedBy) {
+          caseRecord.notes.push(`保留业务夹具 ${protectedBy || '未完成回读'} 的库位依赖 ${fixture.id}，不删除库存事实引用`)
+          continue
+        }
         await api.deleteBusiness(`/mes/wms-house-location/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'area') {
+        const protectedBy = protectedRefs.get(`area:${fixture.id}`)
+        if (dependencyCleanupBlocked || protectedBy) {
+          caseRecord.notes.push(`保留业务夹具 ${protectedBy || '未完成回读'} 的库区依赖 ${fixture.id}，不删除库存事实引用`)
+          continue
+        }
         await api.deleteBusiness(`/mes/wmsHouseArea/delete?id=${encodeURIComponent(fixture.id)}`)
       } else if (fixture.kind === 'warehouse') {
+        const protectedBy = protectedRefs.get(`warehouse:${fixture.id}`)
+        if (dependencyCleanupBlocked || protectedBy) {
+          caseRecord.notes.push(`保留业务夹具 ${protectedBy || '未完成回读'} 的仓库依赖 ${fixture.id}，不删除库存事实引用`)
+          continue
+        }
         await api.deleteBusiness(`/mes/wmsWareHouse/delete?id=${encodeURIComponent(fixture.id)}`)
       }
     } catch (error) {

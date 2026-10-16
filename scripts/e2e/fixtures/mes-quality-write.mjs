@@ -75,6 +75,12 @@ export const today = () => new Date().toISOString().slice(0, 10)
 export const plusDays = (days) =>
   new Date(Date.now() + days * 86400000).toISOString().slice(0, 10)
 
+const boundedInspectionItemName = (value, fallback = 'E2E 质检项') =>
+  String(value || fallback).slice(0, 32)
+
+const boundedInspectionItemRemark = (value, fallback = 'E2E 质检项') =>
+  String(value || fallback).slice(0, 32)
+
 export const firstEnabledUnit = async (api) => {
   const units = rowsOf(await api.getBusiness('/mes/basUnit/list/enabled'), '启用计量单位')
   const unit = units.find((row) => row?.id)
@@ -94,8 +100,16 @@ export const queryItemByCode = async (api, itemCode) => {
  * its own, so owned plans are located by the unique planName plus remark.
  */
 export const queryOwnedPlans = async (api, planName, token, type = 101) => {
+  const params = new URLSearchParams({
+    pageNo: '1',
+    pageSize: '100',
+    type: String(type)
+  })
+  if (planName !== undefined && planName !== null) {
+    params.set('planName', String(planName))
+  }
   const rows = rowsOf(await api.getBusiness(
-    `/mes/quality/qualityPlan/list/dictText?pageNo=1&pageSize=100&type=${encodeURIComponent(type)}`
+    `/mes/quality/qualityPlan/list/dictText?${params.toString()}`
   ), '质检方案回读')
   return rows
     .filter((row) =>
@@ -140,7 +154,8 @@ export async function createPublishedItem (api, caseRecord, {
   const token = qualityToken(kind)
   const itemCode = `${token}-CODE`
   const payload = {
-    itemName: `${token} 质检项目`,
+    // mes_quality_item.item_name is a short varchar; keep the full ownership token in remark/itemCode.
+    itemName: `${token} 质检项目`.slice(0, 32),
     itemType,
     inspectionResultType,
     inspectionResult,
@@ -185,7 +200,8 @@ export async function createPlan (api, caseRecord, {
   subOverrides = {}
 } = {}) {
   const token = qualityToken(kind)
-  const name = planName || `${token} 质检方案`
+  // mes_quality_plan.plan_name is a short varchar; keep the full ownership token in remark.
+  const name = (planName || `${token} 质检方案`).slice(0, 32)
   await api.postBusiness('/mes/quality/qualityPlan/add', {
     planName: name,
     type,
@@ -434,6 +450,7 @@ export async function createInspection (api, caseRecord, {
   inspectionResultType = 'select',
   inspectionResult = '1',
   judgmentMode = 'ENUM',
+  sysOrgCode = null,
   srcBillType = null,
   srcBillId = null,
   srcEntryId = null,
@@ -441,10 +458,14 @@ export async function createInspection (api, caseRecord, {
   subTypeName = null
 } = {}) {
   const runToken = token || qualityToken('QC')
-  const billNoValue = billNo || `${runToken}-QC`
-  // mes_quality_inspection.subject is varchar(32); keep the full run token in
-  // billNo/remark and only a short label in subject.
+  const billNoValue = billNo || `QC-${randomUUID().replaceAll('-', '').slice(0, 20)}`
+  if (String(billNoValue).length > 32) {
+    throw new Error('Quality fixture billNo exceeds the downstream src_no limit of 32 characters')
+  }
+  // Downstream NG src_no, inspection subject, and inspection item fields have short
+  // varchar limits. The itemCode and billNo still provide stable ownership anchors.
   const subjectValue = String(runToken).slice(0, 32)
+  const itemRemarkValue = boundedInspectionItemRemark(runToken)
   const payload = {
     billNo: billNoValue,
     billDate: today(),
@@ -453,6 +474,7 @@ export async function createInspection (api, caseRecord, {
     isRubric: 0,
     isAuto: 0,
     type: String(type),
+    sysOrgCode: sysOrgCode ? String(sysOrgCode) : null,
     qualitySceneSubTypeCode: subTypeCode,
     qualitySceneSubTypeName: subTypeName,
     srcBillType,
@@ -482,7 +504,7 @@ export async function createInspection (api, caseRecord, {
     }],
     qualityInspectionItemList: [{
       itemId: itemId ? String(itemId) : null,
-      itemName: itemName || `${runToken} 质检项`,
+      itemName: boundedInspectionItemName(itemName || `${runToken} 质检项`),
       itemType,
       inspectionResultType,
       inspectionResult,
@@ -491,7 +513,7 @@ export async function createInspection (api, caseRecord, {
       inspectionQty: quantity,
       passQty: quantity,
       ngQty: 0,
-      remark: runToken
+      remark: itemRemarkValue
     }]
   }
   const response = await api.postBusiness(
@@ -526,7 +548,7 @@ export async function createInspection (api, caseRecord, {
       mid: String(inspectionId),
       entryId: String(entry.id),
       itemId: itemId ? String(itemId) : null,
-      itemName: itemName || `${runToken} 质检项`,
+      itemName: boundedInspectionItemName(itemName || `${runToken} 质检项`),
       itemType,
       inspectionResultType,
       inspectionResult,
@@ -535,7 +557,7 @@ export async function createInspection (api, caseRecord, {
       inspectionQty: quantity,
       passQty: quantity,
       ngQty: 0,
-      remark: runToken
+      remark: itemRemarkValue
     })
     items = rowsOf(await api.getBusiness(
       `/mes/quality/qualityInspection/queryMesQualityInspectionItemByMainId/dictText?id=${encodeURIComponent(inspectionId)}`
@@ -567,8 +589,14 @@ export async function checkInspection (api, caseRecord, inspectionId, {
   const detail = dataOf(await api.getBusiness(
     `/mes/quality/qualityInspection/queryById/dictText?id=${encodeURIComponent(inspectionId)}`
   ), '质检单审核后回读')
-  pushCheck(caseRecord, '质检单审核后回读生效阶段与轮次', true,
+  const passed = isBusinessSuccess(response) &&
+    Number(detail?.isEffective) === 1 &&
+    ['34', 'END_OF_EXECUTION'].some((stage) => String(detail?.billStage || '').includes(stage))
+  pushCheck(caseRecord, '质检单审核后回读生效阶段与轮次', passed,
     `id=${inspectionId}; code=${response?.code}; isEffective=${detail?.isEffective}; billStage=${detail?.billStage}; round=${detail?.inspectionRound}`)
+  if (!passed) {
+    throw new Error(`质检单审核未生效：id=${inspectionId}; code=${response?.code}; msg=${response?.msg || response?.message || ''}; billStage=${detail?.billStage}`)
+  }
   return { response, detail }
 }
 
@@ -642,8 +670,37 @@ export async function createFailedDetailAndAudit (api, caseRecord, inspection, {
   ) || details[0]
   if (!created?.id) throw new Error(`失败质检明细创建后未回读：inspection=${inspection.inspectionId}`)
 
+  const item = inspection.items?.find((row) => String(row?.id) === String(detailIdValue)) ||
+    inspection.items?.[0]
+  if (!item?.id) throw new Error(`正式质检项目明细未回读：inspection=${inspection.inspectionId}`)
+  const itemUpdate = await api.putBusiness('/mes/quality/qualityInspectionItem/edit', {
+    id: String(item.id),
+    inspectionResult: '0',
+    finalInspectionResult: '0',
+    inspectionQty: quantity,
+    passQty: 0,
+    ngQty: quantity
+  })
+  const refreshedItems = rowsOf(await api.getBusiness(
+    `/mes/quality/qualityInspection/queryMesQualityInspectionItemByMainId/dictText?id=${encodeURIComponent(inspection.inspectionId)}`
+  ), '失败质检项目结论回读')
+  const failedItem = refreshedItems.find((row) => String(row?.id) === String(item.id))
+  const itemConclusionPassed = isBusinessSuccess(itemUpdate) &&
+    failedItem != null &&
+    String(failedItem.finalInspectionResult) === '0' &&
+    Number(failedItem.passQty || 0) === 0 &&
+    Number(failedItem.ngQty || 0) === Number(quantity)
+  pushCheck(caseRecord, '正式质检项目明细保存不合格结论并回读', itemConclusionPassed,
+    `itemId=${item.id}; code=${itemUpdate?.code}; final=${failedItem?.finalInspectionResult}; passQty=${failedItem?.passQty}; ngQty=${failedItem?.ngQty}`)
+  if (!itemConclusionPassed) {
+    throw new Error(`正式质检项目不合格结论未保存：inspection=${inspection.inspectionId}; item=${item.id}`)
+  }
+
   const check = inspection.action === 'save'
-    ? await submitDraftInspection(api, caseRecord, inspection)
+    ? await submitDraftInspection(api, caseRecord, {
+        ...inspection,
+        items: refreshedItems
+      })
     : await checkInspection(api, caseRecord, inspection.inspectionId)
   return { detail: created, check }
 }
@@ -655,7 +712,13 @@ export async function findNgRecordBySrcEntry (api, srcEntryId) {
   const rows = rowsOf(await api.getBusiness(
     `/mes/quality/qualityNgRecords/list/dictText?pageNo=1&pageSize=100&srcEntryId=${encodeURIComponent(srcEntryId)}`
   ), '不合格记录回读')
-  return rows.find((row) => String(row?.srcEntryId) === String(srcEntryId)) || null
+  const row = rows.find((item) => String(item?.srcEntryId) === String(srcEntryId)) || null
+  if (!row?.id) return null
+  // The list projection intentionally omits snapshot columns; use the formal detail
+  // endpoint for assertions about persisted NG master snapshots.
+  return dataOf(await api.getBusiness(
+    `/mes/quality/qualityNgRecords/queryById?id=${encodeURIComponent(row.id)}`
+  ), '不合格记录详情回读')
 }
 
 export const findNgRecordById = async (api, id) => {

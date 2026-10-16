@@ -9,7 +9,14 @@ import {
   inspectWorkbenchFixtureTarget,
   isWorkbenchWriteFixturesEnabled
 } from './fixture.mjs'
-import { ownedCaseConclusion, recordCatalogAssertion } from './contracts.mjs'
+import { dailyGapConclusion, ownedCaseConclusion, recordCatalogAssertion } from './contracts.mjs'
+import {
+  approveWorkbenchDailyReport,
+  createWorkbenchDailyReport,
+  inspectWorkbenchDailyGap,
+  prepareWorkbenchDailyProject,
+  readWorkbenchPmReference
+} from '../fixtures/workbench-daily-gaps.mjs'
 
 export const OWNED_CASE_PERMISSIONS = Object.freeze({
   'WBF-004': ['pm:daily-report:query', 'crm:work-report:query',
@@ -44,6 +51,8 @@ const numericId = (value) => {
   return String(value)
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+const isQueryPermission = (permission) => typeof permission === 'string' &&
+  permission.endsWith(':query')
 const check = (caseRecord, name, passed, details = '') =>
   caseRecord.checks.push({ name, passed: Boolean(passed), details })
 const navigation = (tools, page, selector) => (tools.openRoute || openRoute)(
@@ -67,7 +76,7 @@ export function assertFixtureActor (auth, caseId) {
   const required = [
     'system:menu:query', 'system:role:create', 'system:role:query', 'system:role:delete',
     'system:user:create', 'system:user:query', 'system:user:delete', 'system:user:update',
-    'system:permission:assign-role-menu'
+    'system:permission:assign-role-menu', 'system:tenant-package:query'
   ]
   if (caseId === 'WBF-009') required.push('system:portal:save', 'system:portal:query')
   if (!auth?.user?.id || !Array.isArray(auth.permissions)) throw new Error('BLOCKED: 管理员身份响应无效')
@@ -102,20 +111,25 @@ export async function restoreOwnedPreference (api, key, baseline, caseRecord) {
   }
 }
 
-export function selectOwnedMenuIds (menuRows, availableRows, permissions) {
-  if (!Array.isArray(menuRows) || !Array.isArray(availableRows) || !Array.isArray(permissions) ||
+export function selectOwnedMenuIds (menuRows, packageRows, permissions) {
+  if (!Array.isArray(menuRows) || !Array.isArray(packageRows) || !Array.isArray(permissions) ||
     permissions.some((permission) => typeof permission !== 'string' || permission.includes('*'))) {
     throw new Error('BLOCKED: 最小菜单授权输入无效')
   }
   const menus = flatten(menuRows)
-  const available = new Set(flatten(availableRows).map((row) => String(row.id)))
+  const packageMenuIds = new Set(flatten(packageRows).map((row) => String(row.id)))
   const byId = new Map(menus.map((row) => [String(row.id), row]))
   const home = menus.filter((row) =>
     String(row.component || '').replace(/\.vue$/, '') === 'Home/SystemIndex')
   if (home.length !== 1) throw new Error('BLOCKED: 工作台页面菜单未唯一确定；未创建专属账号')
+  if (home[0].status !== 0) {
+    throw new Error(`BLOCKED: 菜单 ${home[0].id} 未启用；未创建专属账号`)
+  }
+  if (!packageMenuIds.has(String(home[0].id))) {
+    throw new Error(`BLOCKED: 菜单 ${home[0].id} 不在租户套餐范围；未创建专属账号`)
+  }
   // 真实菜单表中同一 permission 常被目录页与其按钮复用（例如 pm:report:query 有 20+ 条），
-  // 因此这里按「租户套餐内优先 -> 层级更深（更贴近叶子按钮）-> id 更大」做确定性择一，
-  // 父链的套餐范围与越权权限仍由下方 walking 校验兜底。
+  // 因此这里按「套餐内 -> 层级更深（更贴近叶子按钮）-> id 更大」做确定性择一。
   const menuDepth = (row) => {
     let depth = 0
     let current = row
@@ -131,12 +145,12 @@ export function selectOwnedMenuIds (menuRows, availableRows, permissions) {
   }
   const selected = [home[0]]
   for (const permission of permissions) {
-    const candidates = menus.filter((row) => row.permission === permission && row.status === 0)
+    const candidates = menus.filter((row) =>
+      row.permission === permission && row.status === 0 && packageMenuIds.has(String(row.id)))
     if (candidates.length === 0) {
       throw new Error(`BLOCKED: 权限菜单缺失、禁用或不唯一：${permission}；未创建专属账号`)
     }
     candidates.sort((a, b) =>
-      Number(available.has(String(b.id))) - Number(available.has(String(a.id))) ||
       menuDepth(b) - menuDepth(a) ||
       Number(b.id) - Number(a.id))
     selected.push(candidates[0])
@@ -149,24 +163,56 @@ export function selectOwnedMenuIds (menuRows, availableRows, permissions) {
       const id = String(row.id)
       if (seen.has(id)) throw new Error('BLOCKED: 菜单父链存在循环')
       seen.add(id)
-      if (row.status !== 0 || !available.has(id)) {
-        throw new Error(`BLOCKED: 菜单 ${id} 不在启用/租户套餐范围；未创建专属账号`)
+      if (row.status !== 0) {
+        throw new Error(`BLOCKED: 菜单 ${id} 未启用；未创建专属账号`)
       }
-      // 目录（type=1）在 CFOR 设置树中复用了 system:settings:query 这类菜单分组键，
-      // 它们只决定目录可见性、没有任何后端 @PreAuthorize 引用，属于到达叶子的结构性骨架；
-      // 页面（type=2）和按钮（type=3）父节点的越权权限仍然必须拦截，避免扩大真实授权。
-      const directoryScaffold = Number(row.type) === 1
-      if (row.permission && !permissions.includes(row.permission) && !directoryScaffold) {
+      // Hidden legacy parents may be outside the tenant package while their
+      // enabled permission leaf remains assignable. The server normalizes
+      // parent IDs during role assignment; the fixture only submits package
+      // leaves and never widens the package itself.
+      if (row.permission && !permissions.includes(row.permission) && !isQueryPermission(row.permission)) {
         throw new Error(`BLOCKED: 父菜单携带范围外权限 ${row.permission}，不扩大授权`)
       }
-      ids.add(id)
       const parentId = String(row.parentId ?? 0)
       if (parentId === '0') break
       row = byId.get(parentId)
       if (!row) throw new Error(`BLOCKED: 菜单父链缺失 ${parentId}`)
     }
+    ids.add(String(leaf.id))
   }
   return [...ids]
+}
+
+export function collectOwnedNavigationQueryPermissions (menuRows, menuIds, permissions) {
+  if (!Array.isArray(menuRows) || !Array.isArray(menuIds) || !Array.isArray(permissions)) {
+    throw new Error('BLOCKED: 专属导航查询权限输入无效')
+  }
+  const required = new Set(permissions)
+  const menus = flatten(menuRows)
+  const byId = new Map(menus.map((row) => [String(row.id), row]))
+  const navigationQueries = new Set()
+  for (const id of new Set(menuIds.map(String))) {
+    let row = byId.get(id)
+    if (!row) throw new Error(`BLOCKED: 专属菜单集合包含未知菜单 ${id}`)
+    const seen = new Set()
+    while (row) {
+      const rowId = String(row.id)
+      if (seen.has(rowId)) throw new Error('BLOCKED: 专属导航父链存在循环')
+      seen.add(rowId)
+      const permission = row.permission
+      if (permission && !required.has(permission)) {
+        if (!isQueryPermission(permission)) {
+          throw new Error(`BLOCKED: 专属菜单集合包含非查询型导航权限 ${permission}`)
+        }
+        navigationQueries.add(permission)
+      }
+      const parentId = String(row.parentId ?? 0)
+      if (parentId === '0') break
+      row = byId.get(parentId)
+      if (!row) throw new Error(`BLOCKED: 专属导航父链缺失 ${parentId}`)
+    }
+  }
+  return [...navigationQueries]
 }
 
 // Every destructive operation is tied to a returned ID and a fresh marker read.
@@ -240,7 +286,9 @@ export async function createOwnedAccount ({ api, registry, marker, menuIds, tag,
   dataOf(await api.post('/system/permission/assign-role-menu', { roleId, menuIds }), '分配本轮菜单')
   const assigned = dataOf(await api.get(`/system/permission/list-role-menus?roleId=${roleId}`), '回读角色菜单')
   if (!Array.isArray(assigned) ||
-    !same(assigned.map(String).sort(), [...menuIds].sort())) throw new Error('角色菜单与最小授权不一致')
+    !menuIds.every((menuId) => assigned.map(String).includes(String(menuId)))) {
+    throw new Error('角色菜单未包含本轮最小授权')
+  }
   const username = `autotestwbf${randomBytes(5).toString('hex')}${tag}`.slice(0, 30)
   const password = `Auto!${randomBytes(3).toString('hex')}Aa9`
   const userId = numericId(dataOf(await api.post('/system/user/create', {
@@ -253,11 +301,13 @@ export async function createOwnedAccount ({ api, registry, marker, menuIds, tag,
     read: async () => dataOf(await api.get(`/system/user/get?id=${userId}`), '用户所有权回读'),
     matches: (row) => row.username === username && row.remark === marker,
     remove: async () => {
-      if (account.hasResidualReports || account.hasPreferences) {
+      if (account.hasResidualReports || account.hasRetainedReports || account.hasPreferences) {
         dataOf(await api.put('/system/user/update-status', { id: userId, status: 1 }), '停用专属账号')
         caseRecord.fixtureResiduals = [...(caseRecord.fixtureResiduals || []), {
           type: 'disabled-user', id: userId, username, marker,
-          reason: account.hasResidualReports ? '报告清理未完成，保留归属账号' : '偏好无删除 API，保留停用归属账号'
+          reason: account.hasResidualReports || account.hasRetainedReports
+            ? '正式报告保留审计归属，停用专属账号'
+            : '偏好无删除 API，保留停用归属账号'
         }]
       } else {
         dataOf(await api.delete(`/system/user/delete?id=${userId}`), '删除本轮账号')
@@ -265,7 +315,8 @@ export async function createOwnedAccount ({ api, registry, marker, menuIds, tag,
     },
     verifyRemoved: async () => {
       const row = dataOf(await api.get(`/system/user/get?id=${userId}`), '账号清理回读')
-      return account.hasResidualReports || account.hasPreferences ? row?.status === 1 : row === null
+      return account.hasResidualReports || account.hasRetainedReports || account.hasPreferences
+        ? row?.status === 1 : row === null
     }
   })
   const user = dataOf(await api.get(`/system/user/get?id=${userId}`), '专属账号回读')
@@ -305,10 +356,19 @@ export async function createPortal ({ api, registry, marker, account, sections, 
 
 export async function newOwnedBrowser ({ account, record, outputDir, caseRecord, tools = {} }) {
   const handle = await (tools.launchBrowser || launchBrowser)({ headed: true, record })
+  let phase = 'login'
+  handle.page.on?.('requestfailed', (request) => {
+    caseRecord.evidence.push(JSON.stringify({
+      stage: 'owned-request-failed', userId: account.userId, phase,
+      path: new URL(request.url()).pathname, method: request.method(),
+      resourceType: request.resourceType(), error: request.failure()?.errorText
+    }))
+  })
   try {
     const session = await (tools.login || login)(handle.page, {
       credentials: account.credentials, returnContext: true
     })
+    phase = 'authenticated'
     if (!session?.token || String(session.tenantId) !== '1') throw new Error('BLOCKED: 专属账号登录未证明租户 1')
     const api = (tools.createApiClient || createApiClient)({ token: session.token, tenantId: '1', record })
     const permission = dataOf(await api.get('/system/auth/get-permission-info'), '专属账号权限回读')
@@ -457,8 +517,37 @@ export function validatePurchaseSequence (billNo, before, after) {
     passed: assigned > prior && Number(post[0][2]) >= assigned }
 }
 
-export async function verifyPurchase ({ account, handle, caseRecord, outputDir, record, tools = {} }) {
+async function captureOwnedPurchaseResponse ({
+  page, action, pathname, method, timeoutMs, stage, caseRecord
+}) {
+  const startedAt = Date.now()
+  let completed = false
+  // Keep the listener ahead of the click, including the lazy component load.
+  const pending = page.waitForResponse((response) =>
+    new URL(response.url()).pathname.endsWith(pathname) &&
+    response.request().method() === method, { timeout: timeoutMs })
+    .then((response) => ({ response }), (error) => ({ error }))
+  try {
+    await action()
+    const { response, error } = await pending
+    if (error) throw error
+    completed = true
+    return response
+  } finally {
+    caseRecord.evidence.push(JSON.stringify({
+      stage, timeoutMs, elapsedMs: Date.now() - startedAt, completed
+    }))
+  }
+}
+
+export async function verifyPurchase ({
+  account, handle, caseRecord, outputDir, record, tools = {}, adminApi
+}) {
   const readSql = tools.runReadOnlySql || runReadOnlySql
+  // The fill-rule list is an administration read permission. Keep it on the
+  // administrator context; the owned user only exercises the real number
+  // allocation endpoint used by the purchase form.
+  const ruleApi = adminApi || handle.api
   const baseline = await saveOwnedPreference(account, handle.api, 'workbench.quick-actions', [
     { id: 'purchase-order-create', iconKey: 'plus' },
     { id: 'purchase-execution-report', iconKey: 'dataBoard' }
@@ -479,7 +568,7 @@ export async function verifyPurchase ({ account, handle, caseRecord, outputDir, 
     recordCatalogAssertion(caseRecord, 'WBF-005', 0, visible ? 'VERIFIED' : 'FAILED',
       '本轮专属用户快捷偏好已正式 API 回读；DOM 检查两个采购按钮')
     if (!visible) throw new Error('专属采购快捷未展示，停止取号')
-    const rule = dataOf(await handle.api.get(
+    const rule = dataOf(await ruleApi.get(
       '/mes/fillRule/list?pageNo=1&pageSize=100&ruleCode=erp_purchase_no'
     ), '当前采购取号规则只读回读')
     const candidates = rule?.records?.filter((row) => row.ruleCode === 'erp_purchase_no' && row.status === 'PUBLISHED')
@@ -493,11 +582,11 @@ export async function verifyPurchase ({ account, handle, caseRecord, outputDir, 
     const before = await readSql("SELECT k, tenant_id, v FROM mes_bas_sequence WHERE tenant_id=1 AND k LIKE 'CGDD%'")
     if (!before.available) throw new Error('BLOCKED: 缺少取号前 DB 证据，未打开新增')
     caseRecord.database = [...(caseRecord.database || []), { stage: 'purchase-sequence-before', ...before }]
-    const responsePromise = handle.page.waitForResponse((response) =>
-      new URL(response.url()).pathname.endsWith('/mes/fillRule/executeRuleByCode/erp_purchase_no') &&
-      response.request().method() === 'PUT', { timeout: 15000 })
-    await create.click()
-    const response = await responsePromise
+    const response = await captureOwnedPurchaseResponse({
+      page: handle.page, action: () => create.click(),
+      pathname: '/mes/fillRule/executeRuleByCode/erp_purchase_no', method: 'PUT',
+      timeoutMs: 120000, stage: 'purchase-number-response', caseRecord
+    })
     const billNo = dataOf(await tools.readBrowserResponsePayload(response), '采购正式取号')
     if (!response.ok() || typeof billNo !== 'string' || !/^CGDD\d{9}$/.test(billNo)) {
       throw new Error('采购正式取号响应格式无效')
@@ -506,7 +595,7 @@ export async function verifyPurchase ({ account, handle, caseRecord, outputDir, 
       type: 'consumed-purchase-number', billNo, reason: '打开表单正式取号；不回滚号段，不保存订单'
     }]
     const form = handle.page.locator('.com-dialog:visible').last()
-    await form.waitFor({ state: 'visible', timeout: 20000 })
+    await form.waitFor({ state: 'visible', timeout: 60000 })
     await form.locator('.subtitle', { hasText: '存货清单' }).first().waitFor({ state: 'visible' })
     await form.locator('input:visible').first().waitFor({ state: 'visible' })
     const values = await form.locator('input').evaluateAll((inputs) => inputs.map((input) => input.value))
@@ -518,13 +607,13 @@ export async function verifyPurchase ({ account, handle, caseRecord, outputDir, 
     caseRecord.database.push({ stage: 'purchase-sequence-after', ...after })
     const sequence = validatePurchaseSequence(billNo, before, after)
     check(caseRecord, '取号序列回读包含本次正式号码', sequence.passed, JSON.stringify(sequence))
-    const promise = handle.page.waitForResponse((candidate) =>
-      new URL(candidate.url()).pathname.endsWith('/erp/purchase-order/page') &&
-      candidate.request().method() === 'GET', { timeout: 15000 })
-    await execution.click()
+    const captured = await captureOwnedPurchaseResponse({
+      page: handle.page, action: () => execution.click(),
+      pathname: '/erp/purchase-order/page', method: 'GET',
+      timeoutMs: 180000, stage: 'purchase-execution-response', caseRecord
+    })
     const dialog = handle.page.getByRole('dialog', { name: '采购执行表' }).first()
     await dialog.waitFor({ state: 'visible' })
-    const captured = await promise
     const pageData = dataOf(await tools.readBrowserResponsePayload(captured), '采购执行分页')
     if (!captured.ok() || !Array.isArray(pageData?.list) || !Number.isInteger(pageData.total) ||
       pageData.total < pageData.list.length || pageData.list.length > 100) {
@@ -563,12 +652,20 @@ export function expectedReminders (pages, today) {
   const weekly = covering(pages.WEEKLY.list)
   const monthly = covering(pages.MONTHLY.list)
   const pending = (rows) => rows.filter((row) => row.status === 'SUBMITTED').length
+  const periodLabel = (rows, noun) => {
+    if (rows.length === 0) return `${noun}未填写`
+    if (rows.some((row) => row.status === 'SUBMITTED' || row.status === 'APPROVED')) {
+      return `${noun}已提交`
+    }
+    if (rows.some((row) => row.status === 'DRAFT')) return `${noun}草稿待提交`
+    return `${noun}已填写`
+  }
   return [
     [daily.some((row) => row.periodKey === today) ? '今日日报已填写' : '今日日报未填写',
       `本月日报 已填 ${daily.length} · 待审批 ${pending(daily)}`],
-    [weekly.length ? '本周周报已提交' : '本周周报未填写',
+    [periodLabel(weekly, '本周周报'),
       `待审批 ${pending(weekly)} · 截止 ${weekly[0]?.deadline?.slice(5, 10) || '未设置'}`],
-    [monthly.length ? '本月月报已提交' : '本月月报未填写',
+    [periodLabel(monthly, '本月月报'),
       `待审批 ${pending(monthly)} · 截止 ${monthly[0]?.deadline?.slice(5, 10) || '未设置'}`]
   ]
 }
@@ -580,6 +677,10 @@ export function draftReminderMismatches (pages, actual, today) {
     return covering.length > 0 && covering.every((row) => row.status === 'DRAFT') &&
       actual[index + 1]?.[0]?.includes('已提交')
   })
+}
+
+export function matchesWorkbenchReminders (pages, actual, today) {
+  return same(actual, expectedReminders(pages, today))
 }
 
 export async function verifyPreferences ({ account, handle, pages, today, caseRecord, outputDir, record, tools = {}, adminApi }) {
@@ -600,8 +701,7 @@ export async function verifyPreferences ({ account, handle, pages, today, caseRe
       ]))
     const allKinds = actual.length === 3 && ['日报', '周报', '月报'].every((kind, index) =>
       actual[index]?.[0]?.includes(kind))
-    const countsMatch = allKinds && actual.every((row, index) => row[1] === expected[index][1] &&
-      (expected[index][0].includes('未填写') ? row[0].includes('未填写') : !row[0].includes('未填写')))
+    const countsMatch = matchesWorkbenchReminders(pages, actual, today)
     check(caseRecord, '三类提醒精确匹配正式 API 已填/未填/待审批口径',
       countsMatch, JSON.stringify({ actual, expected }))
     recordCatalogAssertion(caseRecord, 'WBF-008', 0, allKinds ? 'VERIFIED' : 'FAILED',
@@ -691,8 +791,138 @@ export function recordReadOnlyCoverage (caseId, caseRecord, childChecks) {
   }
 }
 
+export async function verifyReportIsolation ({
+  observerApi, ownerId, fixture, report, crmReportIds, caseRecord
+}) {
+  for (const pathname of [
+    `/pm/daily-report/get?id=${report.draftId}`,
+    `/pm/daily-report/page?pageNo=1&pageSize=100&projectId=${fixture.projectId}&reportType=DAILY`
+  ]) {
+    const denied = await expectPermissionDenied(observerApi, pathname)
+    check(caseRecord, '非项目成员不能读取他人日报或项目报告分页', denied.passed, pathname)
+    if (!denied.passed) throw new Error('非项目成员读取了专属日报')
+  }
+  for (const [pathname, ownedIds] of [
+    [`/pm/daily-report/page?pageNo=1&pageSize=100&reportType=DAILY&reporterId=${ownerId}`,
+      [report.draftId]],
+    [`/crm/work-report/page?pageNo=1&pageSize=100&reportType=WEEKLY&ownerUserId=${ownerId}`,
+      crmReportIds],
+    [`/crm/work-report/page?pageNo=1&pageSize=100&reportType=MONTHLY&ownerUserId=${ownerId}`,
+      crmReportIds]
+  ]) {
+    const result = dataOf(await observerApi.get(pathname), '跨用户报告分页反例')
+    const passed = Array.isArray(result?.list) && result.total === 0 &&
+      result.list.length === 0 &&
+      !result.list.some((row) => ownedIds.includes(String(row.id)))
+    check(caseRecord, '受限账号伪造他人填报人筛选仍不能读到报告', passed, pathname)
+    if (!passed) throw new Error('跨用户报告筛选返回了其他用户的报告')
+  }
+}
+
+export async function verifyDatedReportIsolation ({
+  adminApi, observerApi, observer, registry, ownerId, fixture, report, crmReportIds, today, caseRecord
+}) {
+  const shift = (days) => {
+    const date = new Date(`${today}T12:00:00Z`)
+    date.setUTCDate(date.getUTCDate() + days)
+    return date.toISOString().slice(0, 10)
+  }
+  const payload = {
+    projectId: fixture.projectId,
+    userId: observer.userId,
+    roleCode: 'REPORT_READ_BOUNDARY',
+    effectiveStart: shift(1),
+    effectiveEnd: shift(2),
+    sourceType: 'MANUAL',
+    sourceId: fixture.handoverId
+  }
+  const roleId = numericId(dataOf(
+    await adminApi.putBusiness('/pm/project-role/assign', payload), '未来生效成员创建'
+  ))
+  const read = async () => dataOf(await adminApi.getBusiness(
+    `/pm/project-role/list?projectId=${fixture.projectId}`
+  ), '日期边界成员回读').find((row) => String(row.id) === roleId)
+  registry.add({
+    type: 'pm-project-role', id: roleId, read,
+    matches: (row) => String(row.projectId) === fixture.projectId &&
+      String(row.userId) === observer.userId && row.roleCode === payload.roleCode &&
+      row.status === 'ACTIVE',
+    remove: () => adminApi.putBusiness(`/pm/project-role/end?id=${roleId}`, undefined),
+    verifyRemoved: async () => (await read())?.status === 'ENDED'
+  })
+  for (const range of [
+    { label: '未来生效', effectiveStart: shift(1), effectiveEnd: shift(2) },
+    { label: '已过期', effectiveStart: shift(-2), effectiveEnd: shift(-1) }
+  ]) {
+    if (range.label === '已过期') {
+      await adminApi.putBusiness('/pm/project-role/assign', {
+        ...payload, id: roleId, effectiveStart: range.effectiveStart, effectiveEnd: range.effectiveEnd
+      })
+    }
+    const row = await read()
+    if (!row || row.effectiveStart !== range.effectiveStart ||
+      row.effectiveEnd !== range.effectiveEnd || row.status !== 'ACTIVE' ||
+      String(row.userId) !== observer.userId) {
+      throw new Error(`${range.label}项目成员的正式日期回读不符`)
+    }
+    await verifyReportIsolation({
+      observerApi, ownerId, fixture, report, crmReportIds, caseRecord
+    })
+    check(caseRecord, `${range.label}项目角色不能读取他人报告`, true,
+      `roleId=${roleId}; ${row.effectiveStart}~${row.effectiveEnd}; observer=${observer.userId}`)
+  }
+}
+
+export async function captureOwnedWorkbenchReports (page, action, userId, scope = 'self') {
+  const { readBrowserResponsePayload, validateWorkbenchReportPage } =
+    await import('../suites/workbench.mjs')
+  const queries = [
+    { type: 'DAILY', path: '/pm/daily-report/page', label: '日报', owner: 'reporterId' },
+    { type: 'WEEKLY', path: '/crm/work-report/page', label: '周报', owner: 'ownerUserId' },
+    { type: 'MONTHLY', path: '/crm/work-report/page', label: '月报', owner: 'ownerUserId' }
+  ]
+  // A cold owned-account navigation may take the full browser navigation budget.
+  const responses = Promise.all(queries.map((query) => page.waitForResponse(
+    (response) => {
+      const url = new URL(response.url())
+      return response.request().method() === 'GET' && url.pathname.endsWith(query.path) &&
+        url.searchParams.get('reportType') === query.type
+    },
+    { timeout: 60000 }
+  ).catch(() => null)))
+  await action()
+  const captured = await responses
+  const pages = {}
+  const missing = []
+  for (const [index, query] of queries.entries()) {
+    const response = captured[index]
+    if (!response) {
+      missing.push(`${query.label}未捕获真实 GET 响应`)
+      continue
+    }
+    pages[query.type] = validateWorkbenchReportPage(
+      response, await readBrowserResponsePayload(response), query, userId, scope
+    )
+  }
+  return { pages, missing }
+}
+
 export async function runOwnedWorkbenchCase (context, tools = {}) {
   const { caseId, api, token, record, caseRecord, outputDir, settings, sessionTenantId } = context
+  const env = tools.env || process.env
+  const dailyGapsOnly = env.CFOR_E2E_WORKBENCH_DAILY_GAPS === 'true'
+  const dailyClosure = env.CFOR_E2E_WORKBENCH_DAILY_CLOSURE === 'true'
+  if (dailyGapsOnly && dailyClosure) {
+    throw new Error('BLOCKED: 日报缺口只读模式与日报闭环模式不能同时启用')
+  }
+  if (dailyClosure && !['WBF-004', 'WBF-008', 'WBF-012'].includes(caseId)) {
+    throw new Error('BLOCKED: 日报闭环模式当前只允许 WBF-004/008/012')
+  }
+  if (dailyGapsOnly && !['WBF-004', 'WBF-008', 'WBF-012'].includes(caseId)) {
+    throw new Error('BLOCKED: 日报缺口模式仅允许 WBF-004/008/012')
+  }
+  const reference = dailyGapsOnly
+    ? readWorkbenchPmReference(env.CFOR_E2E_WORKBENCH_PM_RESULT) : null
   if (!isWorkbenchWriteFixturesEnabled(tools.env || process.env)) throw new Error('BLOCKED: 未显式 opt-in，停止专属写侧')
   assertLocalWorkbenchWriteTarget(settings)
   const target = await inspectWorkbenchFixtureTarget({ api, settings, sessionTenantId })
@@ -700,19 +930,28 @@ export async function runOwnedWorkbenchCase (context, tools = {}) {
   const health = await (tools.checkHealth || checkHealth)()
   if (!health.response?.ok || health.body?.status !== 'UP') throw new Error('BLOCKED: 后端未 UP，不启动写链')
   await (tools.assertLocalWriteSafety || assertLocalWriteSafety)(caseRecord)
-  const permissions = OWNED_CASE_PERMISSIONS[caseId]
+  const permissions = dailyClosure
+    ? [...OWNED_CASE_PERMISSIONS[caseId], 'pm:daily-report:update']
+    : dailyGapsOnly && ['WBF-004', 'WBF-008', 'WBF-012'].includes(caseId)
+      ? ['pm:daily-report:query', 'crm:work-report:query'] : OWNED_CASE_PERMISSIONS[caseId]
   if (!permissions) throw new Error('BLOCKED: 非专属工作台案例')
   assertFixtureActor(dataOf(await api.get('/system/auth/get-permission-info'), '夹具创建者权限回读'), caseId)
   const menus = dataOf(await api.get('/system/menu/list'), '菜单定义')
-  const available = dataOf(await api.get('/system/menu/list-all-simple'), '租户可分配菜单')
-  const menuIds = selectOwnedMenuIds(menus, available, permissions)
-  // 目录骨架（type=1）自带的菜单分组键会随父链进入账号权限集合，
-  // 它不来自本例显式申请的业务权限，也不对应任何后端 @PreAuthorize，比较时单列。
-  const menuIdSet = new Set(menuIds.map(String))
-  const scaffoldPermissions = new Set(
-    menus
-      .filter((row) => menuIdSet.has(String(row.id)) && Number(row.type) === 1 && row.permission)
-      .map((row) => String(row.permission))
+  const tenant = dataOf(await api.get(`/system/tenant/get?id=${numericId(settings.tenantId)}`), '当前租户回读')
+  const packageId = numericId(tenant?.packageId)
+  const tenantPackage = dataOf(
+    await api.get(`/system/tenant-package/get?id=${packageId}`), '当前租户套餐回读'
+  )
+  if (tenantPackage?.status !== 0 || !Array.isArray(tenantPackage.menuIds)) {
+    throw new Error('BLOCKED: 当前租户套餐未启用或 menu_ids 无效；未创建专属账号')
+  }
+  const menuIds = selectOwnedMenuIds(
+    menus,
+    tenantPackage.menuIds.map((id) => ({ id })),
+    permissions
+  )
+  const navigationQueryPermissions = new Set(
+    collectOwnedNavigationQueryPermissions(menus, menuIds, permissions)
   )
   const marker = `E2E-WBF-${caseId.slice(-3)}-${randomBytes(5).toString('hex').toUpperCase()}`
   const registry = createOwnedRegistry(marker, caseRecord)
@@ -720,22 +959,133 @@ export async function runOwnedWorkbenchCase (context, tools = {}) {
   let account
   let handle
   let result
+  let dailyFixture
+  let dailyReport
   try {
     account = await createOwnedAccount({ api, registry, marker, menuIds, tag: 'owner', caseRecord })
+    if (dailyClosure) {
+      dailyFixture = await prepareWorkbenchDailyProject({
+        adminApi: api, account, marker, caseRecord, registry
+      })
+    }
     let portal
     const sections = ['quick-actions', 'schedule', 'report', 'contact']
-    if (caseId === 'WBF-009') {
+    if (!dailyGapsOnly && caseId === 'WBF-009') {
       portal = await createPortal({ api, registry, marker, account, sections, caseRecord })
     }
     handle = await newOwnedBrowser({ account, record, outputDir, caseRecord, tools })
     const requiredPermissions = normalizeOwnedPermissions(permissions)
     const actualPermissions = normalizeOwnedPermissions(handle.permission.permissions)
     const unexpected = actualPermissions.filter((permission) =>
-      !requiredPermissions.includes(permission) && !scaffoldPermissions.has(permission))
+      !requiredPermissions.includes(permission) && !navigationQueryPermissions.has(permission))
     const missing = requiredPermissions.filter((permission) => !actualPermissions.includes(permission))
     if (unexpected.length || missing.length) throw new Error(
       `BLOCKED: 专属账号授权不符：额外=${unexpected.join(',')}；缺失=${missing.join(',')}`)
-    if (caseId === 'WBF-009') {
+    if (dailyClosure) {
+      const today = await handle.page.evaluate(() => {
+        const now = new Date()
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+      })
+      const crmReportIds = await createDrafts({
+        account, ownApi: handle.api, registry, marker, today, caseRecord
+      })
+      dailyReport = await createWorkbenchDailyReport({
+        adminApi: api, ownApi: handle.api, account, fixture: dailyFixture,
+        marker, caseRecord, periodKey: today
+      })
+      const captured = await (tools.captureOwnedWorkbenchReports || captureOwnedWorkbenchReports)(
+        handle.page,
+        () => navigation(tools, handle.page, '.report-panel'),
+        account.userId
+      )
+      if (captured.missing.length) {
+        throw new Error(captured.missing.join('；'))
+      }
+      if (!captured.pages.DAILY.list.some((row) =>
+        String(row.id) === dailyReport.draftId && row.status === 'SUBMITTED') ||
+        !['WEEKLY', 'MONTHLY'].every((type) => captured.pages[type].list.some((row) =>
+          crmReportIds.includes(String(row.id))))) {
+        throw new Error('所有者工作台未返回本轮创建的三类非空报告')
+      }
+      check(caseRecord, '所有者工作台返回本轮三类非空报告', true,
+        `daily=${dailyReport.draftId}; crm=${crmReportIds.join(',')}`)
+      await tools.waitForReportRendering(handle.page.locator('.report-panel').first())
+      if (caseId === 'WBF-008') {
+        await verifyPreferences({
+          account, handle, pages: captured.pages, today, caseRecord,
+          outputDir, record, tools, adminApi: api
+        })
+      } else if (caseId === 'WBF-012') {
+        const { runWorkbenchTeamClosure } = await import('../fixtures/workbench-team-closure.mjs')
+        await (tools.runWorkbenchTeamClosure || runWorkbenchTeamClosure)({
+          adminApi: api, ownerAccount: account, ownerHandle: handle,
+          fixture: dailyFixture, report: dailyReport, crmReportIds,
+          registry, marker, caseRecord, record, outputDir, tools
+        })
+      } else {
+        const checkOffset = caseRecord.checks.length
+        const noteOffset = caseRecord.notes.length
+        const child = await tools.runReadOnlyCase({
+          caseId, page: handle.page, record, caseRecord, outputDir
+        }, { env: {}, login: async () => handle.token, createApiClient: () => handle.api })
+        recordReadOnlyCoverage(caseId, caseRecord, caseRecord.checks.slice(checkOffset))
+        const observer = await createOwnedAccount({
+          api, registry, marker, menuIds, tag: 'observer', caseRecord
+        })
+        let observerHandle
+        try {
+          observerHandle = await newOwnedBrowser({
+            account: observer, record, outputDir, caseRecord, tools
+          })
+          await verifyReportIsolation({
+            observerApi: observerHandle.api, ownerId: account.userId,
+            fixture: dailyFixture, report: dailyReport, crmReportIds, caseRecord
+          })
+          await verifyDatedReportIsolation({
+            adminApi: api, observerApi: observerHandle.api, observer, registry,
+            ownerId: account.userId, fixture: dailyFixture, report: dailyReport,
+            crmReportIds, today, caseRecord
+          })
+          const observerPages = await (tools.captureOwnedWorkbenchReports || captureOwnedWorkbenchReports)(
+            observerHandle.page,
+            () => navigation(tools, observerHandle.page, '.report-panel'),
+            observer.userId
+          )
+          if (observerPages.missing.length) throw new Error(observerPages.missing.join('；'))
+          if (!['DAILY', 'WEEKLY', 'MONTHLY'].every((type) =>
+            observerPages.pages[type]?.total === 0 &&
+            observerPages.pages[type]?.list?.length === 0)) {
+            throw new Error('旁观账号工作台显示了其他用户的报告')
+          }
+          await tools.waitForReportRendering(observerHandle.page.locator('.report-panel').first())
+          await screenshot(tools, observerHandle.page, outputDir, 'wbf004-observer-isolated', record)
+          check(caseRecord, '旁观账号工作台三类报告均与非空所有者隔离', true,
+            `owner=${account.userId}; observer=${observer.userId}; report=${dailyReport.draftId}`)
+          caseRecord.notes = caseRecord.notes.filter((note, index) =>
+            index < noteOffset || note !== child.note)
+          caseRecord.evidence.push('只读阶段的跨用户缺口已由本轮非空所有者、受限旁观账号和日期边界反例补齐。')
+        } finally {
+          if (observerHandle) await closeOwnedBrowser(observerHandle, outputDir, observer.username, caseRecord)
+        }
+      }
+      await approveWorkbenchDailyReport({
+        adminApi: api, report: dailyReport, fixture: dailyFixture, caseRecord
+      })
+      result = { token, api }
+    } else if (dailyGapsOnly) {
+      const observation = await inspectWorkbenchDailyGap({
+        adminApi: api, ownApi: handle.api, reference, userId: account.userId
+      })
+      caseRecord.dailyGapObservation = observation
+      caseRecord.referencedEvidence = [reference.source, env.CFOR_E2E_WORKBENCH_PRIOR_RESULT].filter(Boolean)
+      caseRecord.evidence.push(JSON.stringify(observation))
+      check(caseRecord, '专属 PM 项目交接/角色/分页正式回读（不等于权限策略通过）', true,
+        `project=${reference.projectId}；member=false；DAILY=${observation.pages.adminDaily.total}；foreignWEEKLY=${observation.foreignReportsVisible.length}`)
+      await navigation(tools, handle.page, '.report-panel')
+      await tools.waitForReportRendering(handle.page.locator('.report-panel').first())
+      await screenshot(tools, handle.page, outputDir, `${caseId.toLowerCase()}-daily-gap-only`, record)
+      result = { token, api, ...dailyGapConclusion(caseId, caseRecord, observation) }
+    } else if (caseId === 'WBF-009') {
       await verifyPortal({ handle, portal, marker, sections, caseRecord, outputDir, record, tools })
       // This account deliberately has no report-query grant. Never widen it.
       const denied = await expectPermissionDenied(handle.api, '/crm/work-report/page?pageNo=1&pageSize=100&reportType=WEEKLY')
@@ -743,7 +1093,9 @@ export async function runOwnedWorkbenchCase (context, tools = {}) {
         JSON.stringify(denied).slice(0, 500))
       result = { token, api }
     } else if (caseId === 'WBF-005') {
-      await verifyPurchase({ account, handle, caseRecord, outputDir, record, tools })
+      await verifyPurchase({
+        account, handle, caseRecord, outputDir, record, tools, adminApi: api
+      })
       result = { token, api }
     } else {
       const today = await handle.page.evaluate(() => {
@@ -751,7 +1103,7 @@ export async function runOwnedWorkbenchCase (context, tools = {}) {
         return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
       })
       await createDrafts({ account, ownApi: handle.api, registry, marker, today, caseRecord })
-      gaps.push('增强验收未覆盖：PMS 日报非空/状态反例需要合法专属项目；不建 PB-001~005 规则、不写既有项目、不伪造 projectId。该规则不是 catalog UI 原断言共同门禁')
+      gaps.push('增强验收未覆盖：PMS 日报非空/状态反例需要合法专属项目；当前日报保存/读取未见项目成员、填报人归属或数据权限校验，不能只凭 projectId/reporterId 造单作为隔离证据；不建 PB-001~005 规则、不写既有项目、不伪造 projectId。该规则不是 catalog UI 原断言共同门禁')
       const checkOffset = caseRecord.checks.length
       const child = await tools.runReadOnlyCase({
         caseId, page: handle.page, record, caseRecord, outputDir
@@ -779,5 +1131,5 @@ export async function runOwnedWorkbenchCase (context, tools = {}) {
       if (handle) await closeOwnedBrowser(handle, outputDir, account.username, caseRecord)
     }
   }
-  return { ...result, ...ownedCaseConclusion(caseId, caseRecord, gaps) }
+  return dailyGapsOnly ? result : { ...result, ...ownedCaseConclusion(caseId, caseRecord, gaps) }
 }

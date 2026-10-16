@@ -10,6 +10,7 @@ import {
   createSalesFixture,
   createSalesSettlementAccount,
   createSalesTypeDictionary,
+  cleanupTypeSalesFixtures,
   disableSalesTypeDictionary,
   expectSalesRejection,
   openingSalesEvidenceRoute,
@@ -17,9 +18,12 @@ import {
   salesCatalogEvidence,
   salesBootstrapCredential,
   salesContractOrders,
+  salesFinancialDetail,
+  salesFinancialSnapshotMatches,
   salesMaterialBody,
   salesOpeningInvoiceBody,
   salesOrderBody,
+  salesOrderHasContractSource,
   salesPlanSnapshot,
   salesPriceFixtureBodies,
   salesPriceSnapshot,
@@ -33,7 +37,8 @@ import { caseFailureAction, parseRunnerArgs } from '../lib/runner-options.mjs'
 import { caseErrorStatus } from '../lib/report.mjs'
 import { config } from '../config/index.mjs'
 
-const record = () => ({ checks: [], notes: [], evidence: [] })
+const record = (checks = []) => ({ checks, notes: [], evidence: [] })
+const fact = (name, passed = true) => ({ name, passed })
 const local = {
   target: 'local', tenantId: '1', tenantName: 'CFOR 标准平台',
   webBase: 'http://127.0.0.1:9151', apiBase: 'http://127.0.0.1:48083',
@@ -51,6 +56,96 @@ const order = () => ({
   id: '501', customerId: '101', contractId: '401', srcBillType: 'CRM_CONTRACT',
   srcBillId: '401', totalPrice: 177.6,
   items: [{ id: '511', productId: '201', productUnitId: '301', count: 2, productPrice: 88.8 }]
+})
+
+test('contract sources use official source fields and reject conflicting optional contract IDs', () => {
+  const contractId = '2108229190466129921'
+  const source = { srcBillId: contractId, srcBillType: 'CRM_CONTRACT' }
+  assert.equal(salesOrderHasContractSource(source, contractId), true)
+  assert.equal(salesOrderHasContractSource({ ...source, contractId }, contractId), true)
+  for (const candidate of [
+    null, {}, { contractId },
+    { ...source, srcBillId: '2108229190466129922' },
+    { ...source, srcBillType: 'SalOrder' },
+    { ...source, contractId: '2108229190466129922' },
+    { ...source, srcBillId: Number(contractId) }
+  ]) {
+    assert.equal(salesOrderHasContractSource(candidate, contractId), false)
+  }
+  assert.equal(salesOrderHasContractSource(source, Number(contractId)), false)
+})
+
+test('financial evidence reads separate official header/entry APIs and verifies every entry owner', async () => {
+  for (const [kind, endpoint, field] of [
+    ['finReceivable', 'queryFinReceivableEntryByMainId', 'finReceivableEntryList'],
+    ['finReceivableCheck', 'queryEntryByMainId', 'finReceivableCheckEntryList']
+  ]) {
+    const calls = []
+    const detail = await salesFinancialDetail({
+      getBusiness: async (path) => {
+        calls.push(path)
+        return { code: 200, success: true, data: path.includes('/queryById?')
+          ? { id: '501', amt: 177.6 }
+          : [{ id: '511', mid: '501', amt: 177.6, checkedAmt: 0 }] }
+      }
+    }, kind, '501')
+    assert.deepEqual(calls, [
+      `/finance/${kind}/queryById?id=501`, `/finance/${kind}/${endpoint}?id=501`
+    ])
+    assert.equal(detail[field][0].id, '511')
+    assert.equal(detail[field][0].amt, detail.amt)
+    for (const entries of [[{ id: '511', mid: '999' }], [{ mid: '501' }],
+      [{ id: Number.MAX_SAFE_INTEGER + 1, mid: '501' }], null, {}]) {
+      await assert.rejects(salesFinancialDetail({
+        getBusiness: async (path) => ({ code: 0, data: path.includes('/queryById?')
+          ? { id: '501' } : entries })
+      }, kind, '501'))
+    }
+  }
+})
+
+test('financial evidence never substitutes API or header identity failures with empty entries', async () => {
+  for (const response of [{ code: 500, msg: '系统异常' }, { code: 0, data: { id: '999' } }]) {
+    let calls = 0
+    await assert.rejects(salesFinancialDetail({
+      getBusiness: async () => { calls++; return response }
+    }, 'finReceivable', '501'))
+    assert.equal(calls, 1)
+  }
+  let calls = 0
+  for (const [kind, id] of [['unknown', '501'], ['finReceivable', 'unsafe'],
+    ['finReceivable', Number.MAX_SAFE_INTEGER + 1]]) {
+    await assert.rejects(salesFinancialDetail({
+      getBusiness: async () => { calls++; throw new Error('unexpected API') }
+    }, kind, id))
+  }
+  assert.equal(calls, 0)
+})
+
+test('financial SQL evidence compares exact string/numeric IDs and verifies both source sides and amounts', () => {
+  const rows = [
+    ['receivable', '601', 'SalOrder', '501', '101', '177.60', '177.60'],
+    ['receivable_entry', '611', '601', '501', '511', '177.60000000', '177.60000000'],
+    ['receipt', '701', 'SalOrder', '501', '101', '177.60', '1'],
+    ['check', '801', 'FinReceipt:102', '701', '1', '177.60'],
+    ['check_entry', '811', '801', 'FinReceivable:101', '601', '611', '177.60'],
+    ['check_entry', '812', '801', 'FinReceipt:102', '701', '711', '177.60']
+  ]
+  const expected = { order: { ...order(), id: 501 }, entry: { id: 611, amt: 177.6 },
+    receivableId: 601, receiptId: 701, checkId: 801 }
+  assert.equal(salesFinancialSnapshotMatches(rows, expected), true)
+  assert.equal(salesFinancialSnapshotMatches(rows.toReversed(), expected), true)
+  for (const [row, field, value] of [
+    [0, 1, '999'], [0, 4, '999'], [1, 2, '999'], [1, 4, '999'],
+    [1, 6, '187.60'], [2, 3, '999'], [3, 3, '999'], [3, 4, '0'],
+    [4, 2, '999'], [4, 4, '999'], [5, 4, '999'], [5, 6, '178.60']
+  ]) {
+    const bad = structuredClone(rows)
+    bad[row][field] = value
+    assert.equal(salesFinancialSnapshotMatches(bad, expected), false)
+  }
+  assert.equal(salesFinancialSnapshotMatches(rows.slice(0, 5), expected), false)
+  assert.equal(salesFinancialSnapshotMatches(rows, { ...expected, checkId: '999' }), false)
 })
 
 const snapshotHelpers = [
@@ -518,6 +613,79 @@ test('expected sales exceptions require exact domain envelope, not SQL/network/e
     'POST', '/any', {}, /failed/, record(), 'domain'), /network failed/)
 })
 
+test('type business rejections are marked expected while transport failures stay visible', async () => {
+  let options
+  const evidence = record()
+  await expectSalesRejection({
+    request: async (...args) => {
+      options = args[3]
+      return { code: 1002007002, msg: '字典数据不处于开启状态，不允许选择' }
+    }
+  }, 'POST', '/erp/sale-order/create', {}, /字典|开启/, evidence, '停用类型拒绝', {
+    code: 1002007002
+  })
+  assert.deepEqual(options.expectedBusinessRejection, {
+    code: 1002007002, message: /字典|开启/
+  })
+  await assert.rejects(() => expectSalesRejection({
+    request: async () => { throw new Error('network failed') }
+  }, 'POST', '/erp/sale-order/create', {}, /字典/, record(), '停用类型拒绝', {
+    code: 1002007002
+  }), /network failed/)
+})
+
+test('over-limit receipt proves actual capped amounts and never substitutes state rejection evidence', () => {
+  const source = fs.readFileSync(new URL('../suites/erp-sales.mjs', import.meta.url), 'utf8')
+  const financial = source.slice(source.indexOf('async function runFinancialSalesWrite('),
+    source.indexOf('export function salesPriceFixtureBodies('))
+  assert.match(financial, /if \(Number\(overReceipt\.isEffective\) !== 1\)/)
+  assert.match(financial, /Number\(checked\.checkedAmt\) === Number\(overEntry\.amt\)/)
+  assert.match(financial, /Number\(overReceipt\.checkedAmt\) === Number\(overEntry\.amt\)/)
+  assert.match(financial, /Number\(overReceipt\.amt\) - Number\(overReceipt\.checkedAmt\)/)
+  assert.doesNotMatch(financial, /overLimitContract|单据不能做该操作|matchesExpectedBusinessRejection/)
+})
+
+test('ERP-SALES-007 cleanup is tenant-owned, reverse ordered and confirms deletion', async () => {
+  const evidence = record()
+  evidence.fixtures = [
+    { kind: 'material', id: '11', tenantId: 1, owned: true, code: 'E2E-SALES-UNIT' },
+    { kind: 'base-partner', id: '12', tenantId: 1, owned: true, name: 'E2E-SALES-UNIT' },
+    { kind: 'sales-type-dictionary', id: '13', tenantId: 1, owned: true,
+      tag: 'E2E-SALES-UNIT', dictType: 'erp_sale_type', value: 'E2E-SALES-UNIT-S' },
+    { kind: 'sales-type-dictionary', id: '14', tenantId: 1, owned: true,
+      tag: 'E2E-SALES-UNIT', dictType: 'crm_sales_plan_type', value: 'E2E-SALES-UNIT-P' },
+    { kind: 'sale-order', id: '15', tenantId: 1, owned: true, tag: 'E2E-SALES-UNIT' },
+    { kind: 'sales-plan', id: '16', tenantId: 1, owned: true, tag: 'E2E-SALES-UNIT' }
+  ]
+  const calls = []
+  const api = {
+    getBusiness: async (path) => {
+      calls.push(`GETB ${path}`)
+      if (path.includes('/sales-plan/get')) return { code: 0, data: { id: '16', status: '执行中' } }
+      if (path.includes('/base/partner/get')) {
+        return { code: 0, data: {
+          id: '12', name: 'E2E-SALES-UNIT', shortName: 'E2E-SALES',
+          partnerKind: 'ORGANIZATION', status: 'ACTIVE', remark: 'E2E-SALES-UNIT'
+        } }
+      }
+      return { code: 0, data: {} }
+    },
+    putBusiness: async (path) => { calls.push(`PUT ${path}`); return { code: 0, data: true } },
+    deleteBusiness: async (path) => { calls.push(`DELETE ${path}`); return { code: 0, data: true } },
+    get: async () => { throw new Error('cleanup must verify with SQL, not detail GET') }
+  }
+  assert.deepEqual(await cleanupTypeSalesFixtures(api, evidence, {
+    salesSql: async () => [['0']]
+  }), [])
+  assert.deepEqual(calls.map((call) => call.split(' ')[0] + ' ' + call.split('/')[1]), [
+    'GETB crm', 'PUT crm', 'DELETE crm',
+    'PUT erp', 'DELETE erp', 'DELETE system', 'DELETE system', 'DELETE mes',
+    'GETB base', 'PUT base', 'DELETE base'
+  ])
+  assert.ok(evidence.fixtures.every((fixture) => fixture.cleaned === true))
+  assert.ok(evidence.checks.every((check) => check.passed))
+})
+
 test('all seven catalog assertions are preserved verbatim and gaps prevent PASS candidates', () => {
   const catalog = JSON.parse(fs.readFileSync(new URL('../cases/catalog.json', import.meta.url), 'utf8'))
   for (const definition of catalog.suites.find((suite) => suite.id === 'erp-sales').cases) {
@@ -533,6 +701,64 @@ test('all seven catalog assertions are preserved verbatim and gaps prevent PASS 
     evidence.checks.push({ passed: false })
     salesCatalogEvidence(definition.id, evidence, definition.assertions.map((_, index) => index))
     assert.equal(evidence.passCandidate, false)
+  }
+})
+
+test('ERP-SALES-007 binds original assertions to named checks and preserves plan snapshots across status changes', async () => {
+  const { salesCatalogEvidenceChecks, salesPlanTypeSnapshot, sameSalesPlanTypeSnapshot } =
+    await import('../suites/erp-sales.mjs')
+  const plan = { id: '41', name: 'E2E', planYear: 2026, planTypeCode: 'E2E-P', ownerUserId: '7',
+    contractTarget: 10, receivableTarget: 9, status: '草稿', items: [{ layerType: 'PRODUCT',
+      targetType: 'PRODUCT', targetId: '81', targetName: 'M', periodType: 'YEAR',
+      periodValue: '2026', contractTarget: 10, receivableTarget: 9 }] }
+  assert.equal(sameSalesPlanTypeSnapshot(plan, { ...plan, status: '执行中' }), true)
+  assert.equal(sameSalesPlanTypeSnapshot(plan, { ...plan, planTypeCode: 'OTHER' }), false)
+  assert.equal(salesPlanTypeSnapshot(plan).items.length, 1)
+  const originalChecks = [
+    fact('销售订单正式保存销售类型稳定编码'), fact('本轮停用销售类型拒绝新订单'),
+    fact('销售计划正式保存计划类型和目标快照'), fact('本轮停用计划类型拒绝新计划'),
+    fact('停用专属类型后历史订单/计划仍可查询且稳定编码和金额快照不变'),
+    fact('停用专属类型后销售计划完整稳定快照不回溯改写'),
+    fact('订单/计划稳定编码历史快照数据库证据完整')
+  ]
+  const bindings = {
+    0: ['销售订单正式保存销售类型稳定编码', '本轮停用销售类型拒绝新订单'],
+    1: ['销售计划正式保存计划类型和目标快照', '本轮停用计划类型拒绝新计划'],
+    2: ['停用专属类型后历史订单/计划仍可查询且稳定编码和金额快照不变',
+      '停用专属类型后销售计划完整稳定快照不回溯改写',
+      '订单/计划稳定编码历史快照数据库证据完整']
+  }
+  const cleanupChecks = [
+    fact('销售计划清理完成'), fact('销售订单清理完成'),
+    fact('erp_sale_type字典清理完成'), fact('crm_sales_plan_type字典清理完成'),
+    fact('销售物料清理完成'), fact('销售客商清理完成')
+  ]
+  const gapBindings = { 0: [...Object.values(bindings).flat(), ...cleanupChecks.map((check) => check.name)] }
+  const evidence = record([...originalChecks, ...cleanupChecks])
+  salesCatalogEvidenceChecks('ERP-SALES-007', evidence, bindings, gapBindings)
+  assert.equal(evidence.passCandidate, true)
+  assert.deepEqual(evidence.catalogAssertions[2].evidenceChecks, [
+    '停用专属类型后历史订单/计划仍可查询且稳定编码和金额快照不变',
+    '停用专属类型后销售计划完整稳定快照不回溯改写',
+    '订单/计划稳定编码历史快照数据库证据完整'
+  ])
+  assert.deepEqual(evidence.acceptanceGapAssertions, [{
+    index: 0,
+    assertion: '已补脚本，尚缺统一后端真实复验',
+    status: 'VERIFIED',
+    evidenceChecks: gapBindings[0]
+  }])
+
+  for (const checks of [
+    [...originalChecks, ...cleanupChecks.filter((check) => check.name !== '销售客商清理完成')],
+    [...originalChecks, ...cleanupChecks.map((check) =>
+      check.name === '销售客商清理完成' ? fact(check.name, false) : check)],
+    [...originalChecks, ...cleanupChecks, fact('销售客商清理完成')]
+  ]) {
+    const partial = record(checks)
+    salesCatalogEvidenceChecks('ERP-SALES-007', partial, bindings, gapBindings)
+    assert.equal(partial.acceptanceGapAssertions[0].status, 'GAP')
+    assert.equal(partial.passCandidate, false)
   }
 })
 

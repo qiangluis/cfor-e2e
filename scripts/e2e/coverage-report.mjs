@@ -7,7 +7,8 @@ const defaultCatalogPath = path.join(here, 'cases', 'catalog.json')
 const defaultTmpRoot = '/tmp'
 const actualStatuses = new Set(['PASS', 'PARTIAL', 'FAIL', 'BLOCKED', 'ERROR'])
 const catalogOnlyStatuses = new Set(['DESIGNED', 'BLOCKED'])
-const resultFileNames = new Set(['result.json', 'parallel-result.json'])
+const resultFileNames = new Set(['result.json', 'parallel-result.json', 'progress.json'])
+const environmentKeys = ['target', 'webBase', 'apiBase', 'tenantId', 'dbName']
 
 export const ACTUAL_STATUSES = [...actualStatuses]
 export const UNEXECUTED_STATUS = 'UNEXECUTED'
@@ -39,6 +40,32 @@ function readJson (filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
 
+function environmentValue (key, value) {
+  if (key === 'tenantId' && Number.isSafeInteger(value) && value >= 0) return String(value)
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+function readEnvironmentFilter (filePath) {
+  const value = readJson(filePath)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('--environment-file 必须是包含完整环境字段的 JSON 对象')
+  }
+  const invalidKeys = unique([
+    ...Object.keys(value).filter((key) => !environmentKeys.includes(key)),
+    ...environmentKeys.filter((key) => environmentValue(key, value[key]) === null)
+  ])
+  if (invalidKeys.length) {
+    throw new Error(`--environment-file 字段缺失或无效：${invalidKeys.join(', ')}`)
+  }
+  return Object.fromEntries(environmentKeys.map((key) => [key, environmentValue(key, value[key])]))
+}
+
+function environmentMismatches (environment, filter) {
+  if (!filter) return []
+  return environmentKeys.filter((key) =>
+    environmentValue(key, environment?.[key]) !== filter[key])
+}
+
 function canonicalPath (filePath) {
   const resolved = path.resolve(filePath)
   try {
@@ -55,10 +82,23 @@ function resolveEvidencePath (sourcePath, value) {
     : path.resolve(path.dirname(sourcePath), value)
 }
 
+function isResultFile (filePath) {
+  return resultFileNames.has(path.basename(filePath)) &&
+    (path.basename(filePath) !== 'progress.json' ||
+      !fs.existsSync(path.join(path.dirname(filePath), 'result.json')))
+}
+
+function isExcludedPath (filePath, excludePaths) {
+  return excludePaths.some((excludedPath) => {
+    const excluded = path.resolve(excludedPath)
+    return filePath === excluded || filePath.startsWith(`${excluded}${path.sep}`)
+  })
+}
+
 function walkResultFiles (root) {
   if (!fs.existsSync(root)) return []
   const stat = fs.statSync(root)
-  if (stat.isFile()) return resultFileNames.has(path.basename(root)) ? [root] : []
+  if (stat.isFile()) return isResultFile(root) ? [root] : []
   if (!stat.isDirectory()) return []
 
   const result = []
@@ -66,7 +106,7 @@ function walkResultFiles (root) {
   for (const entry of entries) {
     const entryPath = path.join(root, entry.name)
     if (entry.isDirectory()) result.push(...walkResultFiles(entryPath))
-    else if (entry.isFile() && resultFileNames.has(entry.name)) result.push(entryPath)
+    else if (entry.isFile() && isResultFile(entryPath)) result.push(entryPath)
   }
   return result
 }
@@ -83,12 +123,9 @@ export function findResultFiles ({
           .filter((entry) => entry.name.startsWith('cfor-e2e'))
           .map((entry) => path.join(tmpRoot, entry.name))
       : []
-  const excluded = new Set(excludePaths.map((item) => path.resolve(item)))
-  const isExcluded = (filePath) => [...excluded].some((excludedPath) =>
-    filePath === excludedPath || filePath.startsWith(`${excludedPath}${path.sep}`))
   return unique(scanRoots.flatMap((root) => walkResultFiles(root))
     .map((filePath) => path.resolve(filePath))
-    .filter((filePath) => !isExcluded(filePath)))
+    .filter((filePath) => !isExcludedPath(filePath, excludePaths)))
     .sort()
 }
 
@@ -128,7 +165,7 @@ function executionTime (run, caseResult) {
   return latestTimestamp(run?.finishedAt, run?.startedAt)
 }
 
-function evidenceFor (sourcePath, run, caseResult, sourceKind) {
+function evidenceFor (sourcePath, run, caseResult, sourceKind, progress) {
   const evidence = Array.isArray(caseResult?.evidence) ? caseResult.evidence : []
   const outputDir = typeof run?.outputDir === 'string'
     ? run.outputDir
@@ -139,6 +176,7 @@ function evidenceFor (sourcePath, run, caseResult, sourceKind) {
     evidence,
     evidencePaths: unique([
       sourcePath,
+      ...(progress ? [progress.sourcePath] : []),
       ...(outputDir ? [outputDir] : []),
       ...[caseResult?.report, caseResult?.logFile]
         .map((item) => resolveEvidencePath(sourcePath, item))
@@ -148,10 +186,10 @@ function evidenceFor (sourcePath, run, caseResult, sourceKind) {
   }
 }
 
-function candidateFrom (sourcePath, run, caseResult, fileMtimeMs, index, sourceKind) {
+function candidateFrom (sourcePath, run, caseResult, fileMtimeMs, index, sourceKind, progress) {
   const status = caseStatus(caseResult)
   const effectiveTimestamp = executionTime(run, caseResult)
-  const evidence = evidenceFor(sourcePath, run, caseResult, sourceKind)
+  const evidence = evidenceFor(sourcePath, run, caseResult, sourceKind, progress)
   const parallel = sourceKind === 'parallel-summary'
   const caseTimed = latestTimestamp(caseResult?.finishedAt, caseResult?.startedAt) !== null
   return {
@@ -168,6 +206,7 @@ function candidateFrom (sourcePath, run, caseResult, fileMtimeMs, index, sourceK
     runId: run?.runId || run?.batchId || null,
     sourceKind,
     sourcePath,
+    ...(progress ? { progress } : {}),
     fileMtimeMs,
     index,
     evidence: evidence.evidence,
@@ -249,9 +288,11 @@ export function buildCoverageReport ({
   roots = [],
   tmpRoot = defaultTmpRoot,
   since = null,
-  excludePaths = []
+  excludePaths = [],
+  environmentFile = null
 } = {}) {
   const { catalog, cases: catalogCases } = readCatalog(catalogPath)
+  const environmentFilter = environmentFile ? readEnvironmentFilter(environmentFile) : null
   const sinceTimestamp = since === null || since === undefined ? null : parseTimestamp(since)
   if (since !== null && since !== undefined && sinceTimestamp === null) {
     throw new Error(`无效 --since 时间：${since}`)
@@ -265,8 +306,12 @@ export function buildCoverageReport ({
   const orphanExecutions = []
   const documents = new Map()
   const documentsByCanonicalPath = new Map()
+  const environmentExclusions = []
 
-  for (const sourcePath of paths) {
+  for (const sourcePath of [...paths]) {
+    const isProgress = path.basename(sourcePath) === 'progress.json'
+    const finalResultPath = path.join(path.dirname(sourcePath), 'result.json')
+    if (isProgress && fs.existsSync(finalResultPath)) continue
     let run
     try {
       run = readJson(sourcePath)
@@ -284,23 +329,88 @@ export function buildCoverageReport ({
       // The file may disappear between discovery and reading.
     }
 
-    const document = { run, fileMtimeMs }
+    const caseSources = new Map()
+    let progress
+    if (isProgress) {
+      progress = {
+        sourcePath,
+        runId: run.runId || null,
+        phase: run.phase || null,
+        startedAt: run.startedAt || null,
+        updatedAt: run.updatedAt || null,
+        selectionComplete: run.selectionComplete === true,
+        selectedCases: run.selectedCases || [],
+        pendingCases: run.pendingCases || [],
+        counts: run.counts || {}
+      }
+      const outputDir = path.dirname(sourcePath)
+      const caseDir = path.join(outputDir, 'cases')
+      run = { ...run, outputDir, cases: [] }
+      // Case files are committed before progress, so the index can lag the snapshots.
+      const entries = fs.existsSync(caseDir) && fs.lstatSync(caseDir).isDirectory()
+        ? fs.readdirSync(caseDir, { withFileTypes: true }) : []
+      for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+        const casePath = path.join(caseDir, entry.name)
+        if (!entry.isFile() || !entry.name.endsWith('.json') ||
+          isExcludedPath(casePath, excludePaths)) continue
+        paths.push(casePath)
+        try {
+          const caseResult = readJson(casePath)
+          const status = normalizeStatus(caseResult?.status)
+          if (!actualStatuses.has(status) && status !== 'SKIPPED') continue
+          const caseId = caseIdOf(caseResult)
+          if (!caseId || (caseResult.id && caseResult.caseId && caseResult.id !== caseResult.caseId) ||
+            (Array.isArray(run.selectedCases) && !run.selectedCases.includes(caseId))) {
+            throw new Error('病例快照 ID 与 progress 选例不一致')
+          }
+          const finishedAt = parseTimestamp(caseResult.finishedAt)
+          const startedAt = parseTimestamp(caseResult.startedAt)
+          if (finishedAt === null || (startedAt !== null && finishedAt < startedAt)) {
+            throw new Error('终态病例快照缺少有效 finishedAt，不能计为已完成')
+          }
+          run.cases.push(caseResult)
+          caseSources.set(caseResult, { sourcePath: casePath, fileMtimeMs: fs.statSync(casePath).mtimeMs })
+        } catch (error) {
+          parseErrors.push({ resultPath: casePath, error: error.message })
+        }
+      }
+    }
+    const sourceKind = isProgress ? 'case-progress'
+      : Array.isArray(run?.cases) ? 'case' : 'parallel-summary'
+    const document = { run, sourcePath, fileMtimeMs, sourceKind, progress, caseSources, finalResultPath }
     documents.set(sourcePath, document)
     documentsByCanonicalPath.set(canonicalPath(sourcePath), document)
+    if (isProgress) documentsByCanonicalPath.set(canonicalPath(finalResultPath), document)
   }
 
   const overriddenChildren = new Set()
   const wrapperChildren = new Map()
+  const wrapperEnvironments = new Map()
   for (const [sourcePath, { run }] of documents) {
     if (Array.isArray(run?.cases) || !Array.isArray(run?.results)) continue
     for (const result of run.results) {
-      if (typeof result?.report !== 'string' || !result.report) continue
-      const childPath = resolveEvidencePath(sourcePath, result.report)
+      const childPath = resolveEvidencePath(sourcePath, result?.report)
       const childDocument = childPath
         ? documentsByCanonicalPath.get(canonicalPath(childPath))
         : null
       const childCase = childDocument?.run?.cases
         ?.find((item) => caseIdOf(item) === caseIdOf(result))
+      if (environmentFilter) {
+        // Legacy wrappers have no environment; only an in-scope scanned child can attest it.
+        const inheritChild = run.environment == null && Boolean(childCase)
+        const environmentSourcePath = inheritChild ? childDocument.sourcePath : sourcePath
+        const mismatchedFields = unique([
+          ...environmentMismatches(
+            inheritChild ? childDocument.run.environment : run.environment, environmentFilter),
+          ...(childCase ? environmentMismatches(childDocument.run.environment, environmentFilter) : []),
+          ...(childCase?.environment !== undefined
+            ? environmentMismatches(childCase.environment, environmentFilter) : []),
+          ...(result?.environment !== undefined
+            ? environmentMismatches(result.environment, environmentFilter) : [])
+        ])
+        wrapperEnvironments.set(result, { environmentSourcePath, mismatchedFields })
+        if (mismatchedFields.length) continue
+      }
       if (!childCase) continue
       wrapperChildren.set(result, childCase)
       // An abnormal worker exit invalidates its own child report, not later reruns.
@@ -310,20 +420,42 @@ export function buildCoverageReport ({
     }
   }
 
-  for (const [sourcePath, { run, fileMtimeMs }] of documents) {
-    const sourceKind = Array.isArray(run?.cases) ? 'case' : 'parallel-summary'
-    const results = sourceKind === 'case' ? run.cases : run?.results
+  for (const [sourcePath, { run, fileMtimeMs, sourceKind, progress, caseSources, finalResultPath }] of documents) {
+    const results = sourceKind === 'parallel-summary' ? run?.results : run.cases
     if (!Array.isArray(results)) continue
     results.forEach((caseResult, index) => {
-      if (sourceKind === 'case' &&
-        overriddenChildren.has(`${canonicalPath(sourcePath)}\0${caseIdOf(caseResult)}`)) return
+      if (['RUNNING', 'PENDING'].includes(normalizeStatus(caseResult?.status))) return
+      const environmentScope = sourceKind === 'parallel-summary'
+        ? wrapperEnvironments.get(caseResult)
+        : {
+            environmentSourcePath: sourcePath,
+            mismatchedFields: unique([
+              ...environmentMismatches(run.environment, environmentFilter),
+              ...(caseResult?.environment !== undefined
+                ? environmentMismatches(caseResult.environment, environmentFilter) : [])
+            ])
+          }
+      if (environmentFilter && environmentScope.mismatchedFields.length) {
+        environmentExclusions.push({
+          caseId: caseIdOf(caseResult), sourcePath,
+          environmentSourcePath: environmentScope.environmentSourcePath,
+          mismatchedFields: environmentScope.mismatchedFields
+        })
+        return
+      }
+      const childSourcePath = progress ? finalResultPath : sourcePath
+      if (sourceKind !== 'parallel-summary' &&
+        overriddenChildren.has(`${canonicalPath(childSourcePath)}\0${caseIdOf(caseResult)}`)) return
       const childCase = wrapperChildren.get(caseResult)
       if (sourceKind === 'parallel-summary' && childCase &&
         caseStatus(caseResult) !== 'ERROR' &&
         caseStatus(caseResult) === caseStatus(childCase)) return
+      const caseSource = caseSources.get(caseResult)
       const candidate = candidateFrom(
-        sourcePath, run, caseResult, fileMtimeMs, index, sourceKind
+        caseSource?.sourcePath || sourcePath, run, caseResult,
+        caseSource?.fileMtimeMs ?? fileMtimeMs, index, sourceKind, progress
       )
+      if (environmentFilter) candidate.environmentSourcePath = environmentScope.environmentSourcePath
       if (!candidate.caseId) {
         parseErrors.push({ resultPath: sourcePath, error: `case[${index}] 缺少 id/caseId` })
         return
@@ -359,8 +491,13 @@ export function buildCoverageReport ({
   return {
     generatedAt: new Date().toISOString(),
     catalogPath: path.resolve(catalogPath),
-    scannedResultPaths: paths,
+    scannedResultPaths: unique(paths),
     since: sinceTimestamp === null ? null : displayTimestamp(sinceTimestamp),
+    ...(environmentFilter ? {
+      environmentFile: path.resolve(environmentFile),
+      environmentFilter,
+      environmentExclusions
+    } : {}),
     summary: {
       totalCases: cases.length,
       executedCases: cases.filter((item) => item.executed).length,
@@ -389,6 +526,10 @@ export function renderMarkdown (report) {
     `- Catalog：${report.catalogPath}`,
     `- 扫描结果文件：${report.scannedResultPaths.length}`,
     `- since：${report.since || '未设置'}`,
+    ...(report.environmentFilter ? [
+      `- 精确环境范围：${JSON.stringify(report.environmentFilter)}`,
+      `- 环境范围排除记录：${report.environmentExclusions.length}`
+    ] : []),
     `- 用例：${report.summary.totalCases}，已执行 ${report.summary.executedCases}，未执行 ${report.summary.unexecutedCases}`,
     `- 实际状态：${JSON.stringify(report.summary.actualStatusCounts)}`,
     `- Catalog 状态：${JSON.stringify(report.summary.catalogStatusCounts)}`,
@@ -422,7 +563,16 @@ export function renderMarkdown (report) {
     lines.push('', '## 结果文件解析问题', '')
     for (const item of report.parseErrors) lines.push(`- ${item.resultPath}：${item.error}`)
   }
-  lines.push('', '说明：同时扫描 result.json 与 parallel-result.json；并行 ERROR 不被关联子报告掩盖。缺少案例时间的并行记录只用批次窗口排序，不冒充精确案例时间。SKIPPED 不替代实际执行；无执行记录不会升级为 PASS；DESIGNED/BLOCKED 的 Catalog 状态不会被实际结果提升为可验收 PASS。')
+  if (report.environmentExclusions?.length) {
+    lines.push('', '## 环境范围排除', '')
+    for (const item of report.environmentExclusions) {
+      lines.push(`- ${markdownCell(item.caseId)}；${markdownCell(item.sourcePath)}；不匹配或缺失：${item.mismatchedFields.join(', ')}`)
+    }
+  }
+  if (report.environmentFilter) {
+    lines.push('', '环境范围按五字段精确匹配；缺少字段不能匹配。无环境的 parallel 包装记录仅可采用扫描范围内关联子报告的完整环境，包装与子报告已声明的环境均须匹配；progress 快照使用索引环境，显式快照环境也须匹配。')
+  }
+  lines.push('', '说明：扫描 result.json 与 parallel-result.json；无最终 result.json 时读取 progress.json 和 cases/*.json，仅纳入有有效完成时间的终态快照，不以 progress 更新时间替代病例时间。RUNNING/PENDING 不计已执行，并行 ERROR 不被关联子报告掩盖。缺少案例时间的并行记录只用批次窗口排序，不冒充精确案例时间。SKIPPED 不替代实际执行；无执行记录不会升级为 PASS；DESIGNED/BLOCKED 的 Catalog 状态不会被实际结果提升为可验收 PASS。')
   return `${lines.join('\n')}\n`
 }
 
@@ -434,6 +584,7 @@ function parseArgs (argv) {
     excludePaths: [],
     out: null,
     since: null,
+    environmentFile: null,
     format: 'both'
   }
   for (let index = 0; index < argv.length; index += 1) {
@@ -451,6 +602,11 @@ function parseArgs (argv) {
     }
     else if (arg === '--out') args.out = argv[++index]
     else if (arg === '--since') args.since = argv[++index]
+    else if (arg === '--environment-file') {
+      const value = argv[++index]
+      if (!value || value.startsWith('--')) throw new Error('--environment-file 缺少参数')
+      args.environmentFile = value
+    }
     else if (arg === '--format') args.format = argv[++index]
     else if (arg === '--help' || arg === '-h') args.help = true
     else throw new Error(`未知参数：${arg}`)
@@ -511,6 +667,7 @@ function printHelp () {
     '  --root PATH          scan only this evidence root (repeatable)',
     '  --exclude-root PATH  exclude this file or evidence tree (repeatable)',
     '  --since ISO          only include executions at or after ISO timestamp',
+    '  --environment-file PATH  exact JSON scope: target, webBase, apiBase, tenantId, dbName',
     '  --out PATH           write PATH.json and PATH.md (extension may be supplied)',
     '  --format FORMAT      json, markdown, or both (default: json on stdout, both with --out)',
     '  --help               show this help'

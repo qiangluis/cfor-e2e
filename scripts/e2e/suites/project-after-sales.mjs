@@ -1,9 +1,87 @@
 import { createApiClient } from '../lib/api.mjs'
+import { runReadOnlySql } from '../lib/db.mjs'
+import {
+  assertProjectBusinessMenus,
+  PROJECT_MENU_ROOT_IDS,
+  verifyProjectBusinessMenuInBrowser
+} from '../fixtures/project-menu.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
+import {
+  assertProjectChangeLifecycle,
+  assertProjectReportExportMatches,
+  assertProjectTaskFactsUnchanged,
+  planMilestoneWeightUpdates
+} from '../fixtures/project-core-evidence.mjs'
+import {
+  assertProjectReportPageText,
+  verifyProjectReportPages
+} from '../fixtures/project-report-browser.mjs'
+import { EVALUATION_ACCEPTANCE_GAPS } from '../fixtures/project-after-sales-evaluation-closure.mjs'
+import { runEvaluationClosureCase } from '../fixtures/project-after-sales-evaluation-cases.mjs'
+import {
+  assertInspectionSnapshotUnchanged,
+  assertInspectionTaskSnapshot,
+  queryInspectionTaskInBrowser,
+  readOtherInspectionFacts
+} from '../fixtures/project-after-sales-inspection-closure.mjs'
+import {
+  assertPmClosureLocalTarget,
+  cleanupDedicatedModelingConfigs,
+  createDedicatedHrmEmployee,
+  createDedicatedModelingConfig,
+  createDedicatedStaffSkill,
+  deleteDedicatedHrmEmployee,
+  deleteDedicatedStaffSkill,
+  newPmClosureFixture,
+  ORIGINAL_PROJECT_ACCEPTANCE_GAPS,
+  pmClosureDelayAdvanceDays,
+  pmClosureTaskDate,
+  PROJECT_AFTER_SALES_CATALOG_ASSERTIONS,
+  PROJECT_AFTER_SALES_SAFETY_BLOCKS,
+  readDedicatedModelingConfig
+} from '../fixtures/project-after-sales-pm-closure.mjs'
+import {
+  saveAssetProfileInBrowser,
+  saveIssueCategoryInBrowser,
+  verifyDutyPageInBrowser,
+  verifyExpiredAssetInBrowser
+} from '../fixtures/project-after-sales-browser.mjs'
+import {
+  assertPb125AssetSearch,
+  assertPb125InventoryUnchanged,
+  assertPb125LocalTarget,
+  assertPb125ServicePeriod,
+  changePb125AssetStatus,
+  cleanupPb125Fixtures,
+  newPb125Fixture,
+  preparePb125Assets,
+  preparePb125Material,
+  readPb125Asset,
+  readPb125InventoryFacts,
+  verifyPb125ExpiredAcceptance,
+  verifyPb125StatusEvents
+} from '../fixtures/project-after-sales-asset-closure.mjs'
+import {
+  assertReminderLocalTarget,
+  cleanupReminderClosure,
+  createReminderClosureRule,
+  newReminderFixture,
+  prepareReminderAsset,
+  verifyReminderClosure
+} from '../fixtures/project-after-sales-reminder-closure.mjs'
+import { verifyReminderRuleQuietHoursInBrowser } from '../fixtures/project-after-sales-reminder-browser.mjs'
+import {
+  assertKnowledgeReadinessLocalContext,
+  runProjectAfterSalesKnowledgeReadiness
+} from '../fixtures/project-after-sales-knowledge-readiness.mjs'
+import { runProjectMilestoneClosure } from '../fixtures/project-milestone-closure.mjs'
+import { config } from '../config/index.mjs'
+import path from 'node:path'
 import * as XLSX from 'xlsx'
 
 export const cases = [
   'PB111-001',
+  'PB111-002',
   'PB112-001',
   'PB113-001',
   'PB114-001',
@@ -30,6 +108,376 @@ export const cases = [
   'PB953-001',
   'PB955-001'
 ]
+
+export { PROJECT_AFTER_SALES_CATALOG_ASSERTIONS }
+
+const PERIOD_EVIDENCE_CHECKS = ['DAILY', 'WEEKLY', 'MONTHLY']
+  .map((type) => `${type} 生成周期范围并由服务端构造只读来源快照`)
+const REPORT_EVIDENCE_CHECKS = [
+  'PROJECT_PROGRESS', 'TASK_EXECUTION', 'RESEARCH', 'RISK_ISSUE_BUG', 'PLAN_CHANGE',
+  'RELEASE', 'GO_LIVE_ISSUE', 'ACCEPTANCE_RECTIFICATION', 'PROJECT_REVIEW',
+  'AFTER_SALES_HANDOVER', 'PROJECT_CLOSEOUT'
+].map((type) => `${type} 报表返回统一口径和同一筛选上下文`)
+const EXPORT_EVIDENCE_CHECKS = ['PROJECT_PROGRESS', 'TASK_EXECUTION']
+  .map((type) => `${type} 导出复用相同筛选并生成可解析 Excel`)
+const REPORT_EXPORT_UI_EVIDENCE_CHECKS = [
+  '十一类Excel导出逐项匹配列表项目日期版本和全部非空标量指标',
+  '十一类项目报表真实页面按专属项目日期逐项展示且指标匹配正式查询'
+]
+const DUPLICATE_CHANGE_EVIDENCE_CHECKS = [
+  '重复幂等键被领域拒绝，不产生第二次执行',
+  '重复执行拒绝后第二条变更仍停留在 APPROVED'
+]
+const MILESTONE_GATE_EVIDENCE_CHECKS = [
+  'PB951 缺门禁负例在合法HRM工作日且确认状态和其它条件完整',
+  '里程碑缺少准出条件或必需交付物时不能完成'
+]
+
+const PROJECT_AFTER_SALES_ASSERTION_EVIDENCE = Object.freeze({
+  'PB111-001': [
+    { checks: ['项目建模配置沿用设置主菜单下的项目建模入口'] },
+    { checks: ['项目建模树形条目和分类来自真实配置接口'] },
+    { checks: ['项目基础建模工作区真实渲染，不新建平行页面'] },
+    { checks: ['模块定义写入后可回读分类、版本和启用状态'] },
+    { checks: ['模块定义停用后回读为 DISABLED'] }
+  ],
+  'PB111-002': [
+    { checks: ['项目根只保留工作台、项目协作、项目执行、项目研发、报表五个可见入口'] },
+    { checks: ['旧项目根和旧执行/报表目录隐藏，但按钮权限与深链仍保留'] },
+    { checks: ['项目配置入口只在设置导航保留一份'] },
+    { checks: ['真实浏览器菜单不展示交付项目、项目执行规划、统计查询和AI助手'] },
+    { checks: ['旧项目深链仍可打开'] },
+    { checks: ['执行研发报表子菜单完整且浏览器逐项可见'] },
+    { checks: ['套餐不下发旧目录且新入口祖先完整'] }
+  ],
+  'PB112-001': [
+    { checks: ['人员能力标签引用 HRM 员工并维护技能历史'] },
+    { checks: ['派研保存 HRM 员工有效能力标签快照并可回读'] }
+  ],
+  'PB113-001': [
+    { checks: ['日报只读来源按项目带出任务/风险/里程碑'] },
+    { checks: ['日报填报人使用当前登录用户，不伪造固定用户编号'] },
+    { checks: ['日报来源快照由服务端按事实源生成，忽略客户端伪造值'] },
+    { checks: ['退回后生成新的修订版本，任务状态只作建议'] },
+    { checks: ['退回版本不把任务状态建议反写到任务事实源'] }
+  ],
+  'PB114-001': [
+    { checks: ['预警规则求值命中并保存规则版本、指标与证据'] },
+    { checks: ['预警求值不修改项目状态与计划日期'],
+      gap: '只证明项目事实不变；当前求值未关联真实 todoId，不能声明待办闭环。' },
+    { checks: ['同一规则与触发窗口重复求值保持幂等'] }
+  ],
+  'PB115-001': [
+    { checks: ['里程碑模板复用项目建模配置且不另建主档'] },
+    { checks: ['里程碑模板保留版本号以支持发布后新版本变更'] },
+    { checks: ['里程碑模板返回完整阶段快照供工作台回读'] },
+    { checks: ['启用里程碑模板前阻断缺少必经阶段交付物'] },
+    { checks: ['草稿经启用接口发布仍执行里程碑门禁，不能绕过保存校验'] },
+    { checks: ['里程碑模板创建并发布 V1 后回读版本号'] },
+    { checks: ['同编码发布新版本后版本号递增且旧版本自动停用'] }
+  ],
+  'PB116-001': [
+    { checks: ['任务库复用建模配置键 taskLibrary/taskCategory 并返回引用计数'] },
+    { checks: ['任务库真实条目保存标准工时、产出物、验收标准和前置关系'] },
+    { checks: ['启用任务库前阻断前置任务循环依赖'] },
+    { checks: ['草稿经启用接口发布仍执行任务库门禁，不能绕过验收标准校验'] }
+  ],
+  'PB117-001': [
+    { checksPrefix: '发布项目类型时拒绝未启用的 ' },
+    { checks: ['项目类型草稿经状态接口启用不能绕过依赖校验'] },
+    { checks: ['项目主档切换项目类型时固化服务端依赖配置快照'] }
+  ],
+  'PB118-001': [
+    { check: '交付项目分页可读' },
+    { check: '非法健康状态被拒绝，核心状态与健康状态解耦' },
+    { check: '健康状态可独立切换为 DELAYED 且核心状态不变' }
+  ],
+  'PB119-001': [
+    { checks: ['售后设置复用现有建模页读取 SLA/提醒/评价，不建平行主档'] },
+    { checks: ['SLA 策略写入后回读分类、响应/解决时限和暂停口径'] },
+    { checks: ['SLA 策略停用后回读为 DISABLED'] },
+    { checks: ['售后设置页可进入且复用页面内维护 SLA/提醒/评价'] }
+  ],
+  'PB120-001': [
+    { checks: ['分类主档写入后回读产品类型/资产类型/服务状态适用范围'] },
+    { checks: ['售后问题分类与 CRM 客户标签是相互独立的事实源'] },
+    { checks: ['售后问题分类停用后回读为 DISABLED'] },
+    { checks: ['售后设置页全部建模数据均从正式接口读取'] },
+    { checks: ['售后设置页已接入真实数据且不再展示虚拟数据标识'] }
+  ],
+  'PB121-001': [
+    { checks: ['暂停规则可分别控制客户侧SLA与内部责任计时'] },
+    { checks: ['等待研发原因禁止暂停内部责任计时'] },
+    { checks: ['暂停规则停用后回读为 DISABLED，停止参与 SLA 暂停计算'] }
+  ],
+  'PB122-001': [
+    { checks: ['售后巡检方案发布记录版本'] },
+    { checks: ['被方案引用的巡检项目禁止删除'] },
+    { checks: ['巡检方案可分配到在保客户资产并作为任务快照来源'] }
+  ],
+  'PB125-001': [
+    { checks: ['手工客户资产可在分页中按 assetNo 独立检索'] },
+    { checks: ['客户资产详情统一回读服务期、责任人和存货档案引用'] },
+    { checks: ['客户资产不是存货余额载体，不含库存数量字段'] },
+    { checks: ['资产退役后状态回读为 RETIRED，不改动存货档案'] }
+  ],
+  'PB126-001': [
+    { checks: ['AI不得自动受理/关闭/改写客户事实'] },
+    { checks: ['置信度阈值越界被拒绝'] }
+  ],
+  'PB127-001': [
+    { checks: ['客户资产来源类型与来源项目/验收引用可回读'] },
+    { checks: ['服务期来源关联项目验收单且资产处于在保状态'] },
+    { checks: ['来源验收单真实存在且状态为 APPROVED'] },
+    { checks: ['项目验收资产退役后仍保留来源引用'] }
+  ],
+  'PB128-001': [
+    { checks: ['评价项目主档写入后回读稳定编码与分类引用'] },
+    { checks: ['评价项目停用后回读为 DISABLED 且编码不变'] }
+  ],
+  'PB129-001': [
+    { checks: ['评价模板启用后回读项目快照与总分'] },
+    { checks: ['已启用模板保留创建时快照，不随评价项目主档漂移'] }
+  ],
+  'PB130-001': [
+    { checks: ['HRM 提供值班角色目录，售后不做角色主档'] },
+    { checks: ['值班名册人员来自 HRM/OA 排班，电话来自售后转接规则'] },
+    { checks: ['值班设置页不再出现示例人员与固定日期'] }
+  ],
+  'PB945-001': [
+    { checks: PERIOD_EVIDENCE_CHECKS },
+    { checks: PERIOD_EVIDENCE_CHECKS },
+    { checks: ['日报来源按当天过滤，周期外任务不进入快照'] },
+    { checks: ['报告生成不修改内外周期任务的完整正式事实和全部日期'] }
+  ],
+  'PB947-001': [
+    { checks: ['风险可关联任务且保留责任人和期限'] },
+    { checks: ['风险等级变化写前值、变化时间和结构化历史'] },
+    { checks: ['风险关闭缺少验证人时按领域错误拒绝'] },
+    { checks: ['风险验证后关闭并回读关闭时间、验证人和验证时间'] },
+    { checks: ['风险、问题、Bug 使用独立记录和编号，不通过转化删除原记录'] }
+  ],
+  'PB949-001': [
+    { checks: ['变更七个状态逐步正式回读且身份版本和全链路时间保持一致'] },
+    { checks: ['变更审批通过冻结对象版本并记录下游处理策略'] },
+    { checks: ['服务端一次性执行写入幂等键、执行人和执行时间'] },
+    { checks: DUPLICATE_CHANGE_EVIDENCE_CHECKS },
+    { checks: ['变更七个状态逐步正式回读且身份版本和全链路时间保持一致'] }
+  ],
+  'PB951-001': [
+    { checks: MILESTONE_GATE_EVIDENCE_CHECKS },
+    { checks: ['具备准出条件和交付物的里程碑可人工确认完成'] },
+    { checks: ['具备准出条件和交付物的里程碑可人工确认完成'] },
+    { checks: ['里程碑人工完成不代替任务责任人确认或改写任务状态'] }
+  ],
+  'PB953-001': [
+    { checks: REPORT_EVIDENCE_CHECKS },
+    { checks: REPORT_EVIDENCE_CHECKS },
+    { checks: EXPORT_EVIDENCE_CHECKS },
+    { checks: REPORT_EXPORT_UI_EVIDENCE_CHECKS }
+  ],
+  'PB955-001': [
+    { checks: ['绩效公式、数据来源、剔除规则和可见角色公开可读'] },
+    { checks: ['绩效汇总按正式已验收任务和已完成里程碑计算权重与完成率'] },
+    { checks: ['个人绩效明细返回任务、里程碑和统一公式口径'] },
+    { checks: ['风险趋势保留等级变化和验证关闭后的处置时长'] }
+  ]
+})
+
+const CATALOG_ASSERTION_GAP_NOTES = Object.freeze({
+  'PB123-001': 'PB-123 缺少企业知识中枢启用型 EMBEDDING 模型和真实 PARSED+INDEXED 文档，保留 BLOCKED/PARTIAL，未伪造通过。',
+  'PB124-001': 'PB-124 原 catalog 未定义可执行断言，既有页面/API 证据不自动升级为 VERIFIED。'
+})
+
+export const PROJECT_AFTER_SALES_ACCEPTANCE_GAPS = Object.freeze({
+  'PB122-001': [
+    {
+      assertion: 'PB-122：尚未按周期真实生成既有 after_sales_inspection_task，验证未另建平行任务事实',
+      check: 'PB122/GAP1 白名单真实季度生成既有任务且其他资产事实不变'
+    },
+    {
+      assertion: '尚未结构化核对任务的方案/项目/周期/资产、客户合同权益、预约、确认和签字规则完整快照',
+      check: 'PB122/GAP2 完整方案项目周期资产合同权益及执行规则快照'
+    },
+    {
+      assertion: '尚未发布新项目/方案版本后回读旧巡检任务，证明历史快照不变；发布及资产分配成功不能替代执行闭环',
+      check: 'PB122/GAP3 项目主档及方案V2发布后历史任务完整快照不变'
+    }
+  ],
+  'PB120-001': [
+    {
+      assertion: 'PB-120：尚未真实创建/转派服务单，验证只可选末级分类及产品/资产/服务状态/服务范围准入',
+      check: 'PB120/GAP1 服务单末级分类与全部适用范围准入'
+    },
+    {
+      assertion: '尚未在分类停用后验证新建和转派拒绝、历史服务单仍可查询',
+      check: 'PB120/GAP2 分类停用后新建转派精确拒绝且历史服务单可查'
+    },
+    {
+      assertion: '尚未验证分类稳定编码、树形层级和真实页面保存刷新；配置 API 回读不能替代服务单领域门禁',
+      check: 'PB120/GAP3 分类稳定编码树层级与真实页面保存刷新'
+    }
+  ],
+  'PB125-001': [
+    {
+      assertion: 'PB-125/127：尚未比较资产创建/退役前后的真实 WMS 库存与存货事实，证明数量和主档不变；VO 不含库存数量字段不能证明未写库存',
+      check: 'PB125/GAP1 资产创建维护状态变更退役前后完整WMS与存货事实不变'
+    },
+    {
+      assertion: '尚未验证服务状态由服务期与正式状态事件计算，以及到期仅提示续费/风险、不自动拒绝服务单受理',
+      check: 'PB125/GAP2 服务期与正式状态历史计算且到期风险不阻断受理'
+    },
+    {
+      assertion: '尚未从售后设置页保存服务期、负责人和联系人，清本地状态后刷新核对持久化值',
+      check: 'PB125/GAP3 真实页面保存服务期责任人联系人并清状态刷新'
+    }
+  ],
+  'PB128-001': EVALUATION_ACCEPTANCE_GAPS['PB128-001'],
+  'PB129-001': EVALUATION_ACCEPTANCE_GAPS['PB129-001'],
+  'PB130-001': [
+    {
+      assertion: 'PB-130：尚未分别核对原班和替班的 employeeId/姓名一致，并验证 HRM 调班、离职与无排班真实生效',
+      check: 'PB130/GAP1 原班替班人员身份与调班离职无排班生效'
+    },
+    {
+      assertion: '尚未验证无有效排班时生成配置缺失告警并进入受控兜底队列，不生成示例值班人',
+      check: 'PB130/GAP2 无有效排班告警与受控兜底队列正式落库'
+    },
+    {
+      assertion: '尚未确保值班页签实际存在并刷新回读人员/日期/转接规则；空白页不含示例姓名不能证明页面已接入 HRM/OA',
+      check: 'PB130/GAP3 真实值班页签保存刷新HRM人员日期与转接规则'
+    }
+  ]
+})
+
+const addSameCaseGapEvidence = (caseRecord, name, sourceNames) => {
+  const sources = sourceNames.map((sourceName) => caseRecord.checks.filter((check) =>
+    check.name === sourceName))
+  caseRecord.checks.push({
+    name,
+    passed: sourceNames.length > 0 && sources.every((matches) =>
+      matches.length === 1 && matches[0].passed === true),
+    details: sources.map((matches, index) =>
+      `${sourceNames[index]}: ${matches.length === 1 ? matches[0].details : '缺少唯一证据'}`).join('; ')
+  })
+}
+
+export const initializeProjectAfterSalesCatalogAssertions = (caseRecord, caseId) => {
+  const assertions = PROJECT_AFTER_SALES_CATALOG_ASSERTIONS[caseId] || []
+  caseRecord.catalogAssertions = assertions.map((assertion, index) => ({
+    index,
+    assertion,
+    status: 'GAP',
+    evidenceChecks: [],
+    details: '本轮尚未执行该原断言'
+  }))
+  caseRecord.remainingAssertions = [...assertions]
+  caseRecord.catalogComplete = false
+  return caseRecord.catalogAssertions
+}
+
+export const markProjectAfterSalesCatalogAssertion = (
+  caseRecord,
+  index,
+  evidenceChecks,
+  gap = ''
+) => {
+  const row = caseRecord.catalogAssertions?.[index]
+  if (!row) return false
+  const names = Array.isArray(evidenceChecks) ? [...evidenceChecks] : []
+  const matches = names.map((name) => caseRecord.checks.filter((check) => check.name === name))
+  const checks = matches.map((items) => items.length === 1 ? items[0] : undefined)
+  const missing = names.filter((name, position) => !checks[position])
+  const failed = checks.filter((check) => check && check.passed !== true)
+  row.evidenceChecks = names
+  row.status = !gap && names.length > 0 && new Set(names).size === names.length &&
+    names.every((name) => typeof name === 'string' && name.trim().length > 0) &&
+    missing.length === 0 && failed.length === 0
+    ? 'VERIFIED'
+    : 'GAP'
+  row.details = [
+    gap,
+    ...checks.map((check, position) => check
+      ? `${check.name}: ${check.details}`
+      : `缺证: ${names[position]}`)
+  ].filter(Boolean).join('; ')
+  return row.status === 'VERIFIED'
+}
+
+const applyProjectAfterSalesCatalogEvidence = (caseRecord, caseId) => {
+  const mappings = PROJECT_AFTER_SALES_ASSERTION_EVIDENCE[caseId] || []
+  mappings.forEach((mapping, index) => {
+    const names = mapping.check
+      ? [mapping.check]
+      : mapping.checks || caseRecord.checks
+        .filter((check) =>
+          mapping.checksPrefix && String(check.name).startsWith(mapping.checksPrefix))
+        .map((check) => check.name)
+    markProjectAfterSalesCatalogAssertion(
+      caseRecord,
+      index,
+      names,
+      mapping.gap || (names.length ? '' : `缺少可闭环证据：${PROJECT_AFTER_SALES_CATALOG_ASSERTIONS[caseId]?.[index]}`)
+    )
+  })
+}
+
+export const finalizeProjectAfterSalesCatalogAssertions = (caseRecord, caseId, result = {}) => {
+  if (!Array.isArray(caseRecord.catalogAssertions)) {
+    initializeProjectAfterSalesCatalogAssertions(caseRecord, caseId)
+  }
+  applyProjectAfterSalesCatalogEvidence(caseRecord, caseId)
+  const acceptanceGaps = (ORIGINAL_PROJECT_ACCEPTANCE_GAPS[caseId] || []).map((assertion, index) =>
+    PROJECT_AFTER_SALES_ACCEPTANCE_GAPS[caseId]?.find((gap) => gap.assertion === assertion) ||
+    { assertion, check: `${caseId.slice(0, 5)}/GAP${index + 1} 完整原验收证据` })
+  for (const gap of acceptanceGaps) {
+    let index = caseRecord.catalogAssertions.findIndex((row) => row.assertion === gap.assertion)
+    if (index < 0) {
+      index = caseRecord.catalogAssertions.length
+      caseRecord.catalogAssertions.push({
+        index, assertion: gap.assertion, status: 'GAP', evidenceChecks: [], details: ''
+      })
+    }
+    markProjectAfterSalesCatalogAssertion(caseRecord, index, [gap.check])
+    if (caseRecord.catalogAssertions[index].status === 'VERIFIED') {
+      caseRecord.notes = caseRecord.notes.filter((note) => note !== `GAP: ${gap.assertion}`)
+    }
+  }
+  caseRecord.acceptanceGapAssertions = caseRecord.catalogAssertions.filter((row) =>
+    acceptanceGaps.some((gap) => gap.assertion === row.assertion))
+  const gaps = caseRecord.catalogAssertions.filter((row) => row.status !== 'VERIFIED')
+  caseRecord.remainingAssertions = gaps.map((row) => row.assertion)
+  caseRecord.catalogComplete = caseRecord.catalogAssertions.length > 0 &&
+    caseRecord.remainingAssertions.length === 0
+  const notes = gaps.map((row, index) => {
+    const caseGap = CATALOG_ASSERTION_GAP_NOTES[caseId]
+    return caseGap || `catalog 断言未验证：${row.assertion}（${row.details || '缺少精确证据'}）`
+  })
+  if (caseRecord.catalogAssertions.length === 0) {
+    notes.push(
+      CATALOG_ASSERTION_GAP_NOTES[caseId] ||
+      'catalog 未定义可执行断言，保留 PARTIAL，未伪造通过。'
+    )
+  }
+  for (const note of notes) {
+    if (!caseRecord.notes.includes(note)) caseRecord.notes.push(note)
+  }
+  const catalogPartial = !caseRecord.catalogComplete
+  caseRecord.passCandidate = caseRecord.catalogComplete &&
+    !result?.partial && !result?.notImplemented && !result?.designed &&
+    !result?.blocked && !result?.skipped &&
+    caseRecord.checks.length > 0 && caseRecord.checks.every((check) => check.passed === true)
+  return {
+    partial: Boolean(result?.partial || result?.notImplemented || result?.designed ||
+      result?.blocked || result?.skipped || catalogPartial),
+    note: notes.join('；'),
+    catalogAssertions: caseRecord.catalogAssertions,
+    remainingAssertions: caseRecord.remainingAssertions,
+    catalogComplete: caseRecord.catalogComplete,
+    passCandidate: caseRecord.passCandidate,
+    acceptanceComplete: caseRecord.passCandidate
+  }
+}
 
 const unique = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}`
 const dataOf = (response) => response?.data ?? response
@@ -97,6 +545,18 @@ export const isoWeekKey = (dateText) => {
   return `${year}-W${String(week).padStart(2, '0')}`
 }
 
+export const futureQuarterFixture = (daysAhead = 30) => {
+  const date = new Date()
+  date.setDate(date.getDate() + daysAhead)
+  const year = date.getFullYear()
+  const quarter = Math.floor(date.getMonth() / 3) + 1
+  const dateText = date.toISOString().slice(0, 10)
+  return {
+    quarterCode: `${year}Q${quarter}`,
+    requiredFinishTime: `${dateText} 18:00:00`
+  }
+}
+
 export const PROJECT_REPORT_DEFINITIONS = [
   { reportType: 'PROJECT_PROGRESS', path: 'project-progress' },
   { reportType: 'TASK_EXECUTION', path: 'task-execution' },
@@ -120,7 +580,6 @@ export const parseRiskLevelHistory = (value) => {
   }
 }
 
-const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 const cleanup = async (caseRecord, name, operation) => {
   try {
@@ -193,7 +652,9 @@ const confirmDedicatedProjectBaselines = async (api, fixture) => {
   return project
 }
 
-const createDedicatedProject = async ({ api, caseId, projectType, caseRecord, activate = false }) => {
+const createDedicatedProject = async ({
+  api, caseId, projectType, caseRecord, activate = false, plannedWindow
+}) => {
   const ownerId = await resolveProjectOwnerId(api)
   const marker = unique(`E2E_${caseId.replace(/[^A-Z0-9]+/gi, '_')}_PROJECT`)
   const handoverId = numericId(dataOf(await api.postBusiness(
@@ -209,12 +670,28 @@ const createDedicatedProject = async ({ api, caseId, projectType, caseRecord, ac
     developmentManagerId: ownerId,
     consultantId: ownerId
   })), '专属 PM 项目')
-  const project = dataOf(await api.getBusiness(`/pm/project/get?id=${projectId}`))
+  let project = dataOf(await api.getBusiness(`/pm/project/get?id=${projectId}`))
   if (!isDedicatedProject(project, { projectId, handoverId, marker }) ||
       project?.projectType !== projectType) {
     throw new Error(`专属 PM 项目归属回读失败：${JSON.stringify({ projectId, handoverId, marker, project })}`)
   }
   caseRecord.evidence.push(`创建并回读本轮专属空项目 projectId=${projectId}, handoverId=${handoverId}, marker=${marker}`)
+  if (plannedWindow) {
+    assertPmClosureLocalTarget()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(plannedWindow.plannedStartDate || '') ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(plannedWindow.plannedEndDate || '') ||
+        plannedWindow.plannedEndDate < plannedWindow.plannedStartDate) {
+      throw new Error('专属新项目初始计划窗口不合法')
+    }
+    await api.putBusiness('/pm/project/update', projectUpdatePayload(project, plannedWindow))
+    project = dataOf(await api.getBusiness(`/pm/project/get?id=${projectId}`))
+    if (!isDedicatedProject(project, { projectId, handoverId, marker }) ||
+        project.plannedStartDate !== plannedWindow.plannedStartDate ||
+        project.plannedEndDate !== plannedWindow.plannedEndDate) {
+      throw new Error('专属新项目初始计划窗口未正式回读')
+    }
+    caseRecord.evidence.push(`仅初始化本轮新建项目 ${projectId} 的计划 ${project.plannedStartDate} 至 ${project.plannedEndDate}，测试后保持该初始窗口`)
+  }
   caseRecord.notes.push('PM 正式项目域当前无回收/删除接口；本轮仅恢复专属项目基线并严格回读，不调用另一套 /pms/pm/project API。')
   const fixture = { projectId, handoverId, ownerId, marker, projectType, project }
   if (activate) {
@@ -237,6 +714,22 @@ const restoreDedicatedProject = async (api, fixture, overrides = {}) => {
   return after
 }
 
+const verifyDedicatedProjectUnchanged = async (api, fixture, caseRecord) => {
+  const project = dataOf(await api.getBusiness(`/pm/project/get?id=${fixture.projectId}`))
+  const fields = ['projectType', 'status', 'healthStatus', 'riskLevel', 'plannedStartDate', 'plannedEndDate']
+  caseRecord.checks.push({
+    name: '本轮专属项目归属、状态与原计划日期回读不变',
+    passed: isDedicatedProject(project, fixture) &&
+      fields.every((field) => project?.[field] === fixture.project[field]),
+    details: JSON.stringify({
+      projectId: fixture.projectId,
+      before: Object.fromEntries(fields.map((field) => [field, fixture.project[field]])),
+      after: Object.fromEntries(fields.map((field) => [field, project?.[field]]))
+    })
+  })
+  caseRecord.evidence.push(`专属项目 ${fixture.projectId} 及其自动展开的里程碑/任务按正式域保留；未调整原计划日期`)
+}
+
 export const buildDedicatedProjectHandoverPayload = ({ marker, projectType }) => ({
   sourceType: 'MANUAL',
   sourceBusinessNo: marker,
@@ -250,6 +743,8 @@ export const buildDedicatedProjectHandoverPayload = ({ marker, projectType }) =>
 })
 
 export const isDedicatedProject = (project, fixture) =>
+  Boolean(fixture?.marker && /^[1-9]\d*$/.test(String(fixture.projectId)) &&
+    /^[1-9]\d*$/.test(String(fixture.handoverId))) &&
   String(project?.id) === String(fixture?.projectId) &&
   String(project?.handoverId) === String(fixture?.handoverId) &&
   project?.customerNameSnapshot === fixture?.marker
@@ -421,7 +916,9 @@ const createMilestoneFixture = async ({
   marker,
   withGates = true,
   plannedStartDate,
-  plannedEndDate
+  plannedEndDate,
+  exitCondition = withGates ? `${marker} 准出条件` : null,
+  requiredDeliverablesJson = withGates ? JSON.stringify([`${marker}-deliverable`]) : null
 }) => {
   await reserveMilestoneWeight(api, projectId, 10)
   const milestoneId = dataOf(await api.postBusiness('/pm/milestone/save', {
@@ -432,12 +929,13 @@ const createMilestoneFixture = async ({
     plannedStartDate,
     plannedEndDate,
     weightRate: 10,
-    exitCondition: withGates ? `${marker} 准出条件` : null,
-    requiredDeliverablesJson: withGates ? JSON.stringify([`${marker}-deliverable`]) : null,
+    exitCondition,
+    requiredDeliverablesJson,
     healthStatus: withGates ? 'NORMAL' : null,
     warningStatus: withGates ? 'NONE' : null
   }))
   return {
+    marker,
     milestoneId,
     detail: await getMilestone(api, projectId, milestoneId)
   }
@@ -446,24 +944,7 @@ const createMilestoneFixture = async ({
 // 专属项目建项时会按模板展开里程碑并占满 100 权重，新增里程碑前先等比下调已有权重腾出空间。
 const reserveMilestoneWeight = async (api, projectId, newWeight) => {
   const existing = listOf(await api.getBusiness(`/pm/milestone/list?projectId=${projectId}`))
-  if (!existing.length) return
-  const total = existing.reduce((sum, item) => sum + Number(item?.weightRate ?? 0), 0)
-  if (total + newWeight <= 100) return
-  // 已确认里程碑锁定不可改，只能从仍可编辑的里程碑中腾出权重。
-  const adjustable = existing.filter((item) => item?.confirmed !== true)
-  const lockedWeight = existing
-    .filter((item) => item?.confirmed === true)
-    .reduce((sum, item) => sum + Number(item?.weightRate ?? 0), 0)
-  const budget = 100 - newWeight - lockedWeight
-  if (!adjustable.length || budget < adjustable.length) {
-    throw new Error(`BLOCKED: 无法为新增里程碑预留权重 ${newWeight}（已确认权重 ${lockedWeight}）`)
-  }
-  const base = Math.floor(budget / adjustable.length)
-  let remainder = budget - base * adjustable.length
-  for (const item of adjustable) {
-    const weight = base + (remainder > 0 ? 1 : 0)
-    if (remainder > 0) remainder -= 1
-    if (Number(item.weightRate) === weight) continue
+  for (const { item, weight } of planMilestoneWeightUpdates(existing, newWeight)) {
     const snappedStart = await findWorkingDate(api, item.plannedStartDate)
     const snappedEnd = await findWorkingDate(api, item.plannedEndDate || item.plannedStartDate)
     await api.postBusiness('/pm/milestone/save', {
@@ -643,24 +1124,6 @@ const projectDateRange = (project) => {
   return configuredEnd < start ? [start, start] : [start, configuredEnd]
 }
 
-const readDocument = async (api, documentId) =>
-  dataOf(await api.getBusiness(`/ai/knowledge/document/get?id=${documentId}`))
-
-const waitForIndexedDocument = async (api, documentId) => {
-  let latest = null
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    latest = await readDocument(api, documentId)
-    if (latest?.parseStatus === 'PARSED' && latest?.indexStatus === 'INDEXED') return latest
-    if (typeof latest?.indexStatus === 'string' && latest.indexStatus.startsWith('ERROR')) return latest
-    if (typeof latest?.parseStatus === 'string' && latest.parseStatus.startsWith('ERROR')) return latest
-    await api.postBusiness(
-      '/system/ai-runtime/admin/async-tasks/knowledge-index/run?limit=20&workerId=e2e-project-after-sales&lockTimeoutMinutes=15'
-    )
-    await sleep(1000)
-  }
-  return latest
-}
-
 export const isBusinessRejected = (response, code, message) =>
   Boolean(response?.code === code && response.success !== true &&
     typeof response.msg === 'string' && response.msg.includes(message))
@@ -682,7 +1145,7 @@ export const validTaskLibraryConfig = (config) => {
   )
 }
 
-export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+const runCaseCore = async ({ caseId, page, record, caseRecord, outputDir }) => {
   const token = await login(page)
   const api = createApiClient({ token, record })
   caseRecord.checks.push({
@@ -810,114 +1273,210 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     return { token, api }
   }
 
-  if (caseId === 'PB112-001') {
-    const employeePage = await api.getBusiness(
-      '/hrm/employee/simple-page?pageNo=1&pageSize=100&entryStatus=1'
-    )
-    const employee = (employeePage?.data?.list || employeePage?.list || [])[0]
-    if (!employee?.id) {
-      caseRecord.notes.push('当前租户无在职 HRM 员工，PB112 派研快照以模块单测为当前证据')
-      return { token, api }
+  if (caseId === 'PB111-002') {
+    const rootRows = await runReadOnlySql(`
+      SELECT id, name, type, CAST(visible AS UNSIGNED), sort
+      FROM system_menu
+      WHERE parent_id = 29612001 AND deleted = 0 AND type <> 3
+      ORDER BY sort, id
+    `)
+    const legacyRows = await runReadOnlySql(`
+      WITH RECURSIVE legacy_tree AS (
+        SELECT id, name, type, visible FROM system_menu
+        WHERE deleted = 0 AND id IN (
+          29300000, 29612003, 29612005, 29612009, 29612019, 29612026,
+          29612039, 29612044, 29612046, 29612090, 29612126, 29612129
+        )
+        UNION DISTINCT
+        SELECT child.id, child.name, child.type, child.visible FROM system_menu child
+        INNER JOIN legacy_tree parent ON child.parent_id = parent.id
+        WHERE child.deleted = 0
+      )
+      SELECT id, name, type, CAST(visible AS UNSIGNED)
+      FROM legacy_tree
+      ORDER BY id
+    `)
+    const businessRows = await runReadOnlySql(`
+      SELECT parent_id, id, name, path, CAST(visible AS UNSIGNED), component
+      FROM system_menu WHERE deleted = 0 AND type <> 3
+        AND parent_id IN (29612007, 29612023, 29612025)
+      ORDER BY parent_id, sort, id
+    `)
+    const packageRows = await runReadOnlySql(`
+      SELECT
+        (SELECT COUNT(*) FROM system_tenant_package package_row
+         INNER JOIN JSON_TABLE(package_row.menu_ids, '$[*]' COLUMNS(menu_id BIGINT PATH '$')) item
+         INNER JOIN system_menu menu ON menu.id = item.menu_id
+         WHERE package_row.deleted = 0 AND menu.deleted = 0 AND menu.type <> 3
+           AND menu.visible = 0 AND menu.parent_id IN (29612007, 29612023, 29612025)),
+        (SELECT COUNT(*) FROM system_tenant_package package_row
+         INNER JOIN JSON_TABLE(package_row.menu_ids, '$[*]' COLUMNS(menu_id BIGINT PATH '$')) item
+         INNER JOIN system_menu menu ON menu.id = item.menu_id
+         WHERE package_row.deleted = 0 AND menu.deleted = 0 AND menu.component_name LIKE 'PmMenu%'
+           AND (NOT JSON_CONTAINS(package_row.menu_ids, CAST(menu.parent_id AS JSON))
+                OR NOT JSON_CONTAINS(package_row.menu_ids, CAST(29612001 AS JSON))))
+    `)
+    const navigationRows = await runReadOnlySql(`
+      SELECT
+        SUM(item.source_path = '/project' AND item.deleted = 0),
+        SUM(item.source_path = '/settings/pms' AND item.deleted = 0),
+        SUM(item.source_path IN (
+          '/project/foundation', '/project/handover', '/project/management',
+          '/project/modeling', '/project/statistics', '/project/ai'
+        ) AND item.deleted = 0)
+      FROM system_navigation_group_item item
+      INNER JOIN system_navigation_group group_row ON group_row.id = item.group_id
+      WHERE group_row.group_key IN ('project', 'settings')
+    `)
+    if (![rootRows, legacyRows, navigationRows, businessRows, packageRows].every((item) => item.available)) {
+      throw new Error('BLOCKED: PB111-002 需要本地菜单数据库只读证据')
     }
-    const employeeId = employee.id
-    const skillCode = unique('SKILL')
-    const skillId = dataOf(await api.postBusiness('/pm/staff-skill/save', {
-      employeeId,
-      skillCode,
-      skillName: '现场实施',
-      projectRole: '实施顾问',
-      skillLevel: 'SENIOR',
-      applicableProjectType: 'IMPLEMENTATION',
-      loadThreshold: 80,
-      effectiveStart: '2026-01-01',
-      source: 'MANUAL',
-      proficiency: 4,
-      auditStatus: 'APPROVED',
-      status: 0
-    }))
-    const skillPage = await api.getBusiness(
-      `/pm/staff-skill/list-by-employee?employeeId=${employeeId}`
-    )
-    const skills = skillPage?.data || []
+    caseRecord.database = [
+      ...(caseRecord.database || []),
+      { stage: 'project-menu', roots: rootRows.rows, legacy: legacyRows.rows,
+        business: businessRows.rows, navigation: navigationRows.rows, packages: packageRows.rows }
+    ]
+
+    const visibleRootIds = rootRows.rows
+      .filter((row) => row[3] === '1')
+      .map((row) => Number(row[0]))
     caseRecord.checks.push({
-      name: '人员能力标签引用 HRM 员工并维护技能历史',
-      passed:
-        Boolean(skillId) &&
-        Array.isArray(skills) &&
-        skills.some((skill) => skill.id === skillId && skill.employeeId === employeeId),
-      details: `skillId=${skillId}, count=${Array.isArray(skills) ? skills.length : 'n/a'}`
+      name: '项目根只保留工作台、项目协作、项目执行、项目研发、报表五个可见入口',
+      passed: JSON.stringify(visibleRootIds) === JSON.stringify(PROJECT_MENU_ROOT_IDS),
+      details: `visibleRootIds=${visibleRootIds.join(',')}`
     })
 
-    const projectPage = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=100')
-    const project = (projectPage?.data?.list || projectPage?.list || []).find(
-      (item) => !['CLOSED', 'TERMINATED'].includes(item?.status)
-    )
-    if (project?.id) {
-      const toStart = (date) => `${date || new Date().toISOString().slice(0, 10)}T00:00:00`
-      const toEnd = (date) => `${date || new Date().toISOString().slice(0, 10)}T23:59:59`
-      const today = new Date().toISOString().slice(0, 10)
-      const plannedStart = project.plannedStartDate || today
-      const plannedEnd = project.plannedEndDate || today
-      const researchId = dataOf(
-        await api.postBusiness('/pm/research/create-detailed', {
-          projectId: project.id,
-          topic: 'PB112 能力快照自动化验证'
-        })
-      )
+    const legacyVisibleRows = legacyRows.rows.filter((row) => row[2] !== '3' && row[3] === '1')
+    caseRecord.checks.push({
+      name: '旧项目根和旧执行/报表目录隐藏，但按钮权限与深链仍保留',
+      passed: legacyVisibleRows.length === 0,
+      details: `visibleLegacy=${JSON.stringify(legacyVisibleRows)}`
+    })
+
+    const navigation = navigationRows.rows[0] || []
+    caseRecord.checks.push({
+      name: '项目配置入口只在设置导航保留一份',
+      passed: navigation[0] === '1' && navigation[1] === '1' && navigation[2] === '0',
+      details: `projectSource=${navigation[0]}, settingsPms=${navigation[1]}, legacySources=${navigation[2]}`
+    })
+
+    await openRoute(page, '/project/workbench')
+    const sidebar = page.locator('[id$="-menu"]:not([id$="-top-menu"])')
+    const menuText = await sidebar.innerText()
+    const legacyLabels = ['交付项目', '项目执行规划', '统计查询', 'AI助手', '基础建模', '业务管理']
+    caseRecord.checks.push({
+      name: '真实浏览器菜单不展示交付项目、项目执行规划、统计查询和AI助手',
+      passed: legacyLabels.every((label) => !menuText.includes(label)),
+      details: `forbiddenLabels=${legacyLabels.filter((label) => menuText.includes(label)).join(',') || 'none'}`
+    })
+    assertProjectBusinessMenus(businessRows.rows)
+    caseRecord.projectMenuBrowser = await verifyProjectBusinessMenuInBrowser(page, businessRows.rows)
+    caseRecord.checks.push({
+      name: '执行研发报表子菜单完整且浏览器逐项可见',
+      passed: caseRecord.projectMenuBrowser.length === 31,
+      details: `entries=${caseRecord.projectMenuBrowser.length}`
+    })
+    caseRecord.checks.push({
+      name: '套餐不下发旧目录且新入口祖先完整',
+      passed: packageRows.rows[0]?.every((count) => count === '0'),
+      details: JSON.stringify(packageRows.rows)
+    })
+    await saveScreenshot(page, outputDir, 'pb111-project-menu-governance', record)
+
+    await openRoute(page, '/project/management/handover/list')
+    const deepLinkText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '旧项目深链仍可打开',
+      passed:
+        page.url().includes('/project/management/handover/list') &&
+        !/页面不存在|Page Not Found|\b404\b/.test(deepLinkText),
+      details: `url=${page.url()}`
+    })
+    await saveScreenshot(page, outputDir, 'pb111-project-legacy-handover', record)
+    return { token, api }
+  }
+
+  if (caseId === 'PB112-001') {
+    const owned = newPmClosureFixture(caseId)
+    const projectType = await resolveEnabledProjectType(api)
+    let fixture
+    try {
+      const employee = await createDedicatedHrmEmployee(api, owned)
+      const employeeId = owned.employee.id
+      caseRecord.evidence.push(`本轮专属 HRM 员工 employeeId=${employeeId}, marker=${owned.marker}，未创建系统账号`)
+      fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+      const skill = await createDedicatedStaffSkill(api, owned, projectType)
+      const skills = listOf(await api.getBusiness(
+        `/pm/staff-skill/list-by-employee?employeeId=${employeeId}`
+      ))
+      caseRecord.checks.push({
+        name: '人员能力标签引用 HRM 员工并维护技能历史',
+        passed: skills.some((row) =>
+          String(row.id) === skill.id && String(row.employeeId) === employeeId &&
+          row.skillCode === skill.body.skillCode && row.source === 'MANUAL' &&
+          row.auditStatus === 'APPROVED' && Number(row.status) === 0),
+        details: `skillId=${skill.id}, employeeId=${employeeId}, count=${skills.length}`
+      })
+      const project = fixture.project
+      const plannedStart = project.plannedStartDate || dateOffset(0)
+      const plannedEnd = project.plannedEndDate || plannedStart
+      const researchId = numericId(dataOf(await api.postBusiness('/pm/research/create-detailed', {
+        projectId: fixture.projectId,
+        topic: `${owned.marker} 能力快照自动化验证`
+      })), '本轮专属派研任务')
       await api.putBusiness('/pm/research/dispatch', {
         id: researchId,
         assigneeId: employeeId,
         assigneeName: employee.name,
-        topic: 'PB112 能力快照自动化验证',
+        topic: `${owned.marker} 能力快照自动化验证`,
         researchMode: '远程',
         researchAddress: 'E2E',
         participantRequirement: '自动化验证',
         deliverableRequirement: '能力标签快照',
         dispatchNote: '验证派研时固化有效能力标签',
-        plannedStartTime: toStart(plannedStart),
-        plannedEndTime: toEnd(plannedEnd)
+        plannedStartTime: `${plannedStart}T00:00:00`,
+        plannedEndTime: `${plannedEnd}T23:59:59`
       })
-      const dispatched = (await api.getBusiness(`/pm/research/get?id=${researchId}`))?.data
+      const dispatched = dataOf(await api.getBusiness(`/pm/research/get?id=${researchId}`))
+      const snapshot = parseJson(dispatched?.assigneeSkillSnapshotJson, [])
       caseRecord.checks.push({
         name: '派研保存 HRM 员工有效能力标签快照并可回读',
         passed:
-          typeof dispatched?.assigneeSkillSnapshotJson === 'string' &&
-          dispatched.assigneeSkillSnapshotJson.includes(skillCode),
-        details: dispatched?.assigneeSkillSnapshotJson?.slice(0, 200) || 'n/a'
+          String(dispatched?.projectId) === fixture.projectId &&
+          String(dispatched?.assigneeId) === employeeId &&
+          Array.isArray(snapshot) && snapshot.some((row) =>
+            String(row.id) === skill.id && String(row.employeeId) === employeeId &&
+            row.skillCode === skill.body.skillCode && row.auditStatus === 'APPROVED'),
+        details: `projectId=${fixture.projectId}, researchId=${researchId}, snapshot=${JSON.stringify(snapshot).slice(0, 500)}`
       })
       caseRecord.evidence.push(
-        `PB-112 派研研究任务 ${researchId} 固化员工 ${employeeId} 的 ${skillCode} 能力标签`
+        `PB-112 本轮专属项目 ${fixture.projectId} 派研 ${researchId} 固化专属员工 ${employeeId} 的 ${skill.body.skillCode}；项目与派研保留为标记审计数据，正式域无删除接口`
       )
-    } else {
-      caseRecord.notes.push('当前租户无未结束项目，PB112 仅验证能力标签主档契约')
+    } finally {
+      await cleanup(caseRecord, '删除并回读本轮专属能力标签', () => deleteDedicatedStaffSkill(api, owned))
+      await cleanup(caseRecord, '删除并回读本轮专属 HRM 员工', () => deleteDedicatedHrmEmployee(api, owned))
+      if (fixture) await cleanup(caseRecord, '回读本轮专属项目归属与基线', () =>
+        verifyDedicatedProjectUnchanged(api, fixture, caseRecord))
     }
-    await api.delete(`/pm/staff-skill/delete?id=${skillId}`)
     return { token, api }
   }
 
   if (caseId === 'PB113-001') {
-    const projectPage = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=10')
-    const project = listOf(projectPage).find(
-      (item) => !['CLOSED', 'TERMINATED'].includes(item?.status)
-    )
-    if (!project?.id) {
-      caseRecord.notes.push('当前租户无交付项目，报告规则契约以接口存在性验证')
-      return { token, api }
-    }
-    const projectId = project.id
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord })
+    const projectId = fixture.projectId
+    try {
+    const project = fixture.project
     const permission = await api.get('/system/auth/get-permission-info')
     const reporterId = permission?.user?.id ?? permission?.data?.user?.id
     if (reporterId === undefined || reporterId === null) {
       caseRecord.notes.push('BLOCKED：无法取得当前登录用户编号，不能创建真实日报填报人。')
       return { token, api, partial: true }
     }
-    // 行政任务日期同样受工作日和项目计划窗口双门禁，必须在项目窗口内取真实工作日。
-    const projectEnd = project.plannedEndDate || dateOffset(7)
-    const taskStart = await findWorkingDate(api, project.plannedStartDate || dateOffset(0))
-    let taskEnd = await findWorkingDate(api, taskStart)
-    if (taskEnd > projectEnd) {
-      taskEnd = taskStart
-    }
+    // Keep auto-expanded milestones inside the original project window.
+    const taskStart = pmClosureTaskDate(project, await findWorkingDate(
+      api, project.plannedStartDate || dateOffset(0)))
+    const taskEnd = taskStart
     const taskId = dataOf(await api.postBusiness('/pm/task/create-administrative', {
       projectId,
       taskName: `${unique('E2E_REPORT_TASK')} 周报任务状态建议`,
@@ -938,7 +1497,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     caseRecord.checks.push({
       name: '日报只读来源按项目带出任务/风险/里程碑',
       passed:
-        source?.projectId === projectId &&
+        String(source?.projectId) === projectId &&
         Array.isArray(source?.tasks) &&
         Array.isArray(source?.risks) &&
         Array.isArray(source?.milestones) &&
@@ -950,7 +1509,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: reporterId !== undefined && reporterId !== null,
       details: `reporterId=${reporterId ?? 'n/a'}`
     })
-    const periodKey = unique('E2E_WEEK')
+    const periodKey = isoWeekKey(taskStart)
     const draftResponse = await api.postBusiness('/pm/daily-report/save-draft', {
       reportType: 'WEEKLY',
       projectId,
@@ -971,8 +1530,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         savedDraftData.sourceSnapshotJson.includes('generatedAt'),
       details: savedDraftData?.sourceSnapshotJson?.slice(0, 160) || 'n/a'
     })
-    await api.put(`/pm/daily-report/submit?id=${draftId}`)
-    await api.put(`/pm/daily-report/review?id=${draftId}&approved=false&remark=E2E退回`)
+    await api.putBusiness(`/pm/daily-report/submit?id=${draftId}`)
+    await api.putBusiness(`/pm/daily-report/review?id=${draftId}&approved=false&remark=E2E退回`)
     const reportPage = await api.getBusiness(
       `/pm/daily-report/page?pageNo=1&pageSize=100&projectId=${projectId}&reportType=WEEKLY&reporterId=${reporterId}&periodKey=${encodeURIComponent(periodKey)}`
     )
@@ -993,51 +1552,41 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: `before=${taskBefore?.status}, after=${taskAfter?.status}, taskId=${taskId}`
     })
     caseRecord.evidence.push(
-      `PB-113 创建行政任务 ${taskId}、周报草稿 ${draftId}，退回后版本 ${versions.join(',')}，任务状态保持 ${taskAfter?.status}`
+      `PB-113 专属项目 ${projectId} 创建行政任务 ${taskId}、周报草稿 ${draftId}，退回后版本 ${versions.join(',')}，任务状态保持 ${taskAfter?.status}；标记数据保留，正式域无删除接口`
     )
     return { token, api }
+    } finally {
+      await verifyDedicatedProjectUnchanged(api, fixture, caseRecord)
+    }
   }
 
   if (caseId === 'PB114-001') {
-    const projectPage = await api.getBusiness('/pm/project/page?pageNo=1&pageSize=20')
-    const project = listOf(projectPage).find(
-      (item) =>
-        item?.plannedEndDate &&
-        !['CLOSED', 'TERMINATED'].includes(item?.status)
-    )
-    if (!project?.id) {
-      caseRecord.notes.push(
-        'BLOCKED：当前租户无带计划结束日期且未关闭的交付项目，无法在不改项目日期事实的前提下验证延期预警。'
-      )
-      return { token, api, partial: true }
-    }
-    const ruleCode = unique('E2E_WARNING_DELAY')
-    let ruleId
+    const owned = newPmClosureFixture(caseId)
+    const projectType = await resolveEnabledProjectType(api)
+    const fixture = await createDedicatedProject({
+      api, caseId, projectType, caseRecord,
+      plannedWindow: { plannedStartDate: dateOffset(0), plannedEndDate: dateOffset(90) }
+    })
+    const projectId = fixture.projectId
     try {
-      const ruleResponse = await api.postBusiness('/pm/modeling/save', {
-        configKey: 'warningRule',
-        configCode: ruleCode,
-        configName: 'E2E 当天延期预警',
-        configJson: JSON.stringify({
-          warningType: '延期',
-          metric: 'PLANNED_END_DATE',
-          // 提前天数取足够大的窗口，使任意未关闭项目都命中，无需修改项目计划结束日期。
-          advanceDays: 36500,
-          warningLevel: 'HIGH',
-          windowKey: 'DAY',
-          dueHours: 24,
-          title: 'E2E 项目即将延期',
-          detail: '合同计划结束日期已到期'
-        }),
-        status: 'ENABLED'
+      const advanceDays = pmClosureDelayAdvanceDays(fixture.project.plannedEndDate, dateOffset(0))
+      const { owned: rule } = await createDedicatedModelingConfig(api, owned, 'warningRule', 'DELAY', {
+        warningType: '延期',
+        metric: 'PLANNED_END_DATE',
+        advanceDays,
+        warningLevel: 'HIGH',
+        windowKey: 'DAY',
+        dueHours: 24,
+        title: 'E2E 项目即将延期',
+        detail: `${owned.marker} 专属项目计划结束日进入 ${advanceDays} 天提前预警窗口`
       })
-      ruleId = dataOf(ruleResponse)
-
-      const projectBefore = dataOf(await api.getBusiness(`/pm/project/get?id=${project.id}`))
-      const first = await api.postBusiness('/pm/warning/evaluate', { projectId: project.id })
+      const ruleCode = rule.body.configCode
+      const projectBefore = dataOf(await api.getBusiness(`/pm/project/get?id=${projectId}`))
+      if (!isDedicatedProject(projectBefore, fixture)) throw new Error('专属预警项目归属不匹配')
+      const first = await api.postBusiness('/pm/warning/evaluate', { projectId })
       const firstData = dataOf(first) || {}
       const warningPage = await api.getBusiness(
-        `/pm/warning/page?pageNo=1&pageSize=100&projectId=${project.id}&warningType=DELAY`
+        `/pm/warning/page?pageNo=1&pageSize=100&projectId=${projectId}&warningType=DELAY`
       )
       const warning = listOf(warningPage).find(
         (item) => item?.ruleCode === ruleCode
@@ -1048,7 +1597,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         passed:
           firstData.matchedCount >= 1 &&
           firstData.createdCount >= 1 &&
-          warning?.ruleCode === ruleCode &&
+          warning?.ruleCode === ruleCode && String(warning?.projectId) === projectId &&
           warning?.ruleVersion === 1 &&
           warning?.triggerMetric === 'PLANNED_END_DATE' &&
           Boolean(warning?.evidenceJson) &&
@@ -1057,10 +1606,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `first=${JSON.stringify(first)}, warning=${JSON.stringify(warning)}`
       })
       const afterWarningProject = dataOf(
-        await api.getBusiness(`/pm/project/get?id=${project.id}`)
+        await api.getBusiness(`/pm/project/get?id=${projectId}`)
       )
       caseRecord.checks.push({
-        name: '预警求值只落事件和待办，不修改项目状态与计划日期',
+        name: '预警求值不修改项目状态与计划日期',
         passed:
           Boolean(projectBefore) &&
           afterWarningProject?.status === projectBefore?.status &&
@@ -1069,11 +1618,11 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           afterWarningProject?.riskLevel === projectBefore?.riskLevel,
         details: `before=${projectBefore?.status}/${projectBefore?.plannedEndDate}/${projectBefore?.healthStatus}, after=${afterWarningProject?.status}/${afterWarningProject?.plannedEndDate}/${afterWarningProject?.healthStatus}`
       })
-      const second = await api.postBusiness('/pm/warning/evaluate', { projectId: project.id })
+      const second = await api.postBusiness('/pm/warning/evaluate', { projectId })
       const secondData = dataOf(second) || {}
       const warningsAfterSecond = listOf(
         await api.getBusiness(
-          `/pm/warning/page?pageNo=1&pageSize=100&projectId=${project.id}&warningType=DELAY`
+          `/pm/warning/page?pageNo=1&pageSize=100&projectId=${projectId}&warningType=DELAY`
         )
       ).filter((item) => item?.ruleCode === ruleCode)
       caseRecord.checks.push({
@@ -1087,11 +1636,37 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           ),
         details: `second=${JSON.stringify(second)}, ruleWarnings=${warningsAfterSecond.length}`
       })
+      const notifications = await runReadOnlySql(`
+        SELECT id, user_id, template_code, template_params
+        FROM system_notify_message WHERE tenant_id=1 AND deleted=0
+          AND template_code='pm_project_warning'
+          AND JSON_UNQUOTE(JSON_EXTRACT(template_params,'$.route'))=
+            '/project-management/project-list?projectId=${projectId}'
+        ORDER BY id
+      `)
+      if (!notifications.available) throw new Error(`BLOCKED: ${notifications.reason}`)
+      const ruleNotification = notifications.rows.filter((row) => {
+        const params = JSON.parse(row[3])
+        return String(row[1]) === String(fixture.ownerId) &&
+          params.detail?.includes(owned.marker) && params.warningType === 'DELAY'
+      })
+      caseRecord.database = [...(caseRecord.database || []),
+        { stage: 'owned-project-warning-notifications-after-repeat', ...notifications }]
+      caseRecord.checks.push({
+        name: '延期预警站内通知正式落库且重复求值不重复通知',
+        passed: ruleNotification.length === 1,
+        details: `notificationIds=${ruleNotification.map((row) => row[0]).join(',')}, todoId=${warning?.todoId ?? 'null'}`
+      })
+      caseRecord.notes.push(`真实待办缺口：预警 ${warningId} 的 todoId=${warning?.todoId ?? 'null'}；通知落库不能替代待办创建与责任人处置审计。`)
     } finally {
-      if (ruleId) {
-        await api.post(`/pm/modeling/status?id=${ruleId}&status=DISABLED`).catch(() => undefined)
-      }
+      await cleanup(caseRecord, '停用并回读本轮专属预警规则', () =>
+        cleanupDedicatedModelingConfigs(api, owned, caseRecord))
+      await cleanup(caseRecord, '回读本轮专属预警项目原计划不变', () =>
+        verifyDedicatedProjectUnchanged(api, fixture, caseRecord))
     }
+    caseRecord.notes.push(
+      '产品缺口：PmWarningEvaluationServiceImpl 明确跳过 LOAD/BUDGET，按当前全局启用规则求值且无待办ID/通知结果落库契约；本轮延期证据不代表六类完整验收。'
+    )
     return { token, api }
   }
 
@@ -1174,11 +1749,21 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   if (caseId === 'PB120-001') {
     const categoryCode = unique('E2E_ISSUE_CATEGORY')
+    const parentCode = unique('E2E_ISSUE_PARENT')
+    const originalName = `E2E 售后问题分类 ${categoryCode}`
+    const persistedName = `${originalName} 页面已保存`
     let categoryId
+    let parentId
     try {
+      parentId = dataOf(await api.postBusiness('/after-sales/modeling/category/create', {
+        categoryCode: parentCode,
+        categoryName: `E2E 专属分类父节点 ${parentCode}`,
+        sortNo: 900
+      }))
       categoryId = dataOf(await api.postBusiness('/after-sales/modeling/category/create', {
+        parentId,
         categoryCode,
-        categoryName: `E2E 售后问题分类 ${categoryCode}`,
+        categoryName: originalName,
         defaultPriority: 'P2',
         applicableProductType: 'STANDARD',
         applicableAssetType: 'SOFTWARE',
@@ -1198,6 +1783,32 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           category?.status === 'ENABLED',
         details: `categoryId=${categoryId}, product=${category?.applicableProductType}, asset=${category?.applicableAssetType}, service=${category?.applicableServiceStatus}`
       })
+      await saveIssueCategoryInBrowser(page, {
+        categoryId, categoryCode, originalName, persistedName, parentId,
+        productType: 'STANDARD', assetType: 'SOFTWARE', serviceStatus: 'IN_SERVICE'
+      }, { capture: (name) => saveScreenshot(page, outputDir, name, record) })
+      const persisted = dataOf(await api.getBusiness(
+        `/after-sales/modeling/category/get?id=${categoryId}`
+      ))
+      const parent = dataOf(await api.getBusiness(
+        `/after-sales/modeling/category/get?id=${parentId}`
+      ))
+      caseRecord.checks.push({
+        name: '真实页面保存分类后清局部状态刷新，服务端编码、树层级与适用范围一致',
+        passed:
+          String(persisted?.id) === String(categoryId) &&
+          persisted?.categoryCode === categoryCode && persisted?.categoryName === persistedName &&
+          String(persisted?.parentId) === String(parentId) && persisted?.levelNo === 2 &&
+          persisted?.leafFlag === true && parent?.leafFlag === false &&
+          persisted?.fullPath === `${parent.categoryName}/${persistedName}` &&
+          persisted?.applicableProductType === 'STANDARD' &&
+          persisted?.applicableAssetType === 'SOFTWARE' &&
+          persisted?.applicableServiceStatus === 'IN_SERVICE',
+        details: `categoryId=${categoryId}, code=${persisted?.categoryCode}, path=${persisted?.fullPath}`
+      })
+      addSameCaseGapEvidence(caseRecord, PROJECT_AFTER_SALES_ACCEPTANCE_GAPS[caseId][2].check, [
+        '真实页面保存分类后清局部状态刷新，服务端编码、树层级与适用范围一致'
+      ])
       const crmTags = listOf(
         await api.getBusiness('/crm/customer-tag/definition/list-enabled')
       )
@@ -1226,9 +1837,22 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       })
     } finally {
       if (categoryId) {
-        await cleanup(caseRecord, `停用售后问题分类 ${categoryId}`, () =>
-          disableAfterSalesConfig(api, 'CATEGORY', categoryId)
-        )
+        await cleanup(caseRecord, `停用并回读售后问题分类 ${categoryId}`, async () => {
+          const row = dataOf(await api.getBusiness(`/after-sales/modeling/category/get?id=${categoryId}`))
+          if (row?.categoryCode !== categoryCode) throw new Error('清理分类归属不一致')
+          await disableAfterSalesConfig(api, 'CATEGORY', categoryId)
+          const after = dataOf(await api.getBusiness(`/after-sales/modeling/category/get?id=${categoryId}`))
+          if (after?.status !== 'DISABLED') throw new Error('分类清理后仍启用')
+        })
+      }
+      if (parentId) {
+        await cleanup(caseRecord, `停用并回读专属父分类 ${parentId}`, async () => {
+          const row = dataOf(await api.getBusiness(`/after-sales/modeling/category/get?id=${parentId}`))
+          if (row?.categoryCode !== parentCode) throw new Error('清理父分类归属不一致')
+          await disableAfterSalesConfig(api, 'CATEGORY', parentId)
+          const after = dataOf(await api.getBusiness(`/after-sales/modeling/category/get?id=${parentId}`))
+          if (after?.status !== 'DISABLED') throw new Error('父分类清理后仍启用')
+        })
       }
     }
     const settingsCollections = await Promise.all([
@@ -1246,7 +1870,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: settingsCollections.every((item) => Array.isArray(listOf(item))),
       details: `优先级=${listOf(settingsCollections[0]).length}, SLA=${listOf(settingsCollections[1]).length}, 升级=${listOf(settingsCollections[2]).length}, 评价项目=${listOf(settingsCollections[4]).length}, 评价模板=${listOf(settingsCollections[5]).length}, 提醒=${listOf(settingsCollections[6]).length}, AI连接=${listOf(settingsCollections[7]).length}`
     })
-    await openRoute(page, '/after-sales/settings')
+    await openRoute(page, '/after-sales/settings', { readyText: '售后建模' })
     await page.waitForTimeout(1200)
     const bodyText = await page.locator('body').innerText()
     caseRecord.checks.push({
@@ -1255,7 +1879,10 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       details: bodyText.includes('售后建模') ? '售后建模页面已渲染' : '未命中售后建模页面'
     })
     await saveScreenshot(page, outputDir, 'pb120-after-sales-modeling', record)
-    return { token, api }
+    return {
+      token, api, partial: true,
+      note: '页面保存刷新、稳定编码与分类树已补证；服务单分类准入、停用后新建/转派拒绝及历史查询仍未闭环。'
+    }
   }
 
   if (caseId === 'PB122-001') {
@@ -1264,16 +1891,33 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       itemCode: unique('ASII'),
       itemName: 'E2E 售后巡检项目',
       resultType: 'BOOLEAN',
+      execRequirement: 'E2E 依照已发布标准检查并记录结果',
+      standardHours: 0.5,
+      attachmentRequired: true,
       status: 0
     }
     let itemId
     let planId
     let assignmentId
     try {
+    const otherTasksBefore = await readOtherInspectionFacts(assetFixture.assetId)
+    const servicePeriod = assetFixture.detail.servicePeriods.find((period) => period.status === 'VALID')
+    if (!servicePeriod?.sourceNo) throw new Error('BLOCKED: 专属资产缺少真实有效服务期来源')
+    const refs = {
+      planServiceContractRef: servicePeriod.sourceNo,
+      planServiceEntitlementRef: `${assetFixture.assetNo}:PLAN`,
+      assignmentServiceContractRef: servicePeriod.sourceNo,
+      assignmentServiceEntitlementRef: `${assetFixture.assetNo}:ASSIGNMENT`
+    }
     itemId = dataOf(await api.postBusiness('/after-sales/inspection-config/item/create', itemFixture))
     const planResponse = await api.postBusiness('/after-sales/inspection-config/plan/create', {
       planCode: unique('ASIP'),
       planName: 'E2E 售后巡检方案',
+      appointmentRequired: true,
+      customerConfirmRequired: true,
+      signatureRequired: true,
+      serviceContractRef: refs.planServiceContractRef,
+      serviceEntitlementRef: refs.planServiceEntitlementRef,
       items: [{ itemId, seq: 1, standard: '目视无异常' }],
       cycles: [{ cycleType: 'TIME', cycleValue: 30, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
     })
@@ -1296,6 +1940,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       const assignmentResponse = await api.postBusiness('/after-sales/inspection-config/assignment/create', {
         assetId: inServiceAssetId,
         planId,
+        serviceContractRef: refs.assignmentServiceContractRef,
+        serviceEntitlementRef: refs.assignmentServiceEntitlementRef,
         status: 0
       })
       assignmentId = dataOf(assignmentResponse)
@@ -1309,6 +1955,151 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           listOf(assignments).some((item) => String(item.id) === String(assignmentId)),
         details: `assetId=${inServiceAssetId}, assignmentId=${assignmentId}`
       })
+      const quarter = futureQuarterFixture(30)
+      const generatePayload = {
+        assetIds: [String(inServiceAssetId)],
+        quarterCode: quarter.quarterCode,
+        requiredFinishTime: quarter.requiredFinishTime
+      }
+      const invalidScope = await api.post('/after-sales/inspection/generate-quarter-for-assets', {
+        ...generatePayload, assetIds: [String(inServiceAssetId), '9223372036854775807']
+      })
+      caseRecord.checks.push({
+        name: '白名单含不可见资产时整批拒绝且不回退全量生成',
+        passed: isBusinessRejected(invalidScope, 1030001, 'whitelist'),
+        details: JSON.stringify(invalidScope)
+      })
+      const tasksBeforeGeneration = listOf(await api.getBusiness(
+        `/after-sales/inspection/list?quarterCode=${quarter.quarterCode}`
+      )).filter((item) => String(item.assetId) === String(inServiceAssetId))
+      caseRecord.checks.push({
+        name: '白名单整批拒绝后本轮资产没有提前生成任务',
+        passed: tasksBeforeGeneration.length === 0,
+        details: `tasks=${tasksBeforeGeneration.length}`
+      })
+      const generatedCount = dataOf(await api.postBusiness(
+        '/after-sales/inspection/generate-quarter-for-assets', generatePayload))
+      const readTask = async () => listOf(await api.getBusiness(
+        `/after-sales/inspection/list?quarterCode=${quarter.quarterCode}`
+      )).find((item) => String(item.assetId) === String(inServiceAssetId))
+      const generatedTask = await readTask()
+      caseRecord.checks.push({
+        name: '按季度生成既有巡检任务并保存方案/资产/周期快照',
+        passed:
+          Number(generatedCount) === 1 &&
+          generatedTask?.sourceType === 'QUARTER_AUTO' &&
+          String(generatedTask?.configPlanId) === String(planId) &&
+          Number(generatedTask?.configPlanVersion) === Number(plan.publishedVersion) &&
+          typeof generatedTask?.configSnapshot === 'string' &&
+          generatedTask.configSnapshot.includes(plan.planCode) &&
+          generatedTask.configSnapshot.includes(itemFixture.itemCode),
+        details:
+          `count=${generatedCount}, taskId=${generatedTask?.id}, ` +
+          `planVersion=${generatedTask?.configPlanVersion}, quarter=${quarter.quarterCode}`
+      })
+      const snapshot = assertInspectionTaskSnapshot(generatedTask, {
+        assetFixture, plan, item: { ...itemFixture, id: itemId }, refs, standard: '目视无异常'
+      })
+      caseRecord.checks.push({
+        name: 'PB122/GAP2 完整方案项目周期资产合同权益及执行规则快照',
+        passed: Boolean(snapshot.assetSnapshot),
+        details: `task=${generatedTask.id}, plan=${planId}/V${plan.publishedVersion}, asset=${inServiceAssetId}, period=${servicePeriod.sourceNo}`
+      })
+      const originalTaskSnapshot = generatedTask?.configSnapshot
+      const secondGeneratedCount = dataOf(await api.postBusiness(
+        '/after-sales/inspection/generate-quarter-for-assets', generatePayload))
+      const tasksAfterRepeat = listOf(await api.getBusiness(
+        `/after-sales/inspection/list?quarterCode=${quarter.quarterCode}`
+      )).filter((item) => String(item.assetId) === String(inServiceAssetId))
+      caseRecord.checks.push({
+        name: '同资产同季度重复生成保持幂等且不新增平行任务',
+        passed: Number(secondGeneratedCount) === 0 && tasksAfterRepeat.length === 1,
+        details:
+          `secondGenerated=${secondGeneratedCount}, taskCount=${tasksAfterRepeat.length}, ` +
+          `taskId=${tasksAfterRepeat[0]?.id}`
+      })
+      await api.putBusiness('/after-sales/inspection-config/item/update', {
+        ...itemFixture, id: itemId, itemName: `${itemFixture.itemName} V2`,
+        execRequirement: 'E2E V2 新执行要求', standardHours: 1, attachmentRequired: false
+      })
+      await api.putBusiness('/after-sales/inspection-config/plan/update', {
+        id: planId,
+        planCode: plan.planCode,
+        planName: `${plan.planName} V2`,
+        appointmentRequired: false,
+        customerConfirmRequired: false,
+        signatureRequired: false,
+        serviceContractRef: `${refs.planServiceContractRef}:V2`,
+        serviceEntitlementRef: `${refs.planServiceEntitlementRef}:V2`,
+        items: [{ itemId, seq: 1, standard: 'PB122 发布 V2 后的新标准' }],
+        cycles: [{ cycleType: 'TIME', cycleValue: 45, cycleUnit: 'DAY', dataSource: 'CALENDAR' }]
+      })
+      await api.putBusiness(`/after-sales/inspection-config/plan/publish?id=${planId}`)
+      const publishedV2 = dataOf(await api.getBusiness(`/after-sales/inspection-config/plan/get?id=${planId}`))
+      const itemV2 = listOf(await api.getBusiness('/after-sales/inspection-config/item/list'))
+        .find((item) => String(item.id) === String(itemId))
+      const taskAfterPlanV2 = await readTask()
+      assertInspectionSnapshotUnchanged(generatedTask, taskAfterPlanV2)
+      caseRecord.checks.push({
+        name: '发布方案 V2 后旧巡检任务仍保留原方案版本与完整快照',
+        passed:
+          String(taskAfterPlanV2?.configPlanId) === String(planId) &&
+          Number(taskAfterPlanV2?.configPlanVersion) === Number(plan.publishedVersion) &&
+          taskAfterPlanV2?.configSnapshot === originalTaskSnapshot,
+        details:
+          `oldVersion=${taskAfterPlanV2?.configPlanVersion}, ` +
+          `snapshotUnchanged=${taskAfterPlanV2?.configSnapshot === originalTaskSnapshot}`
+      })
+      caseRecord.checks.push({
+        name: 'PB122/GAP3 项目主档及方案V2发布后历史任务完整快照不变',
+        passed: publishedV2?.status === 'PUBLISHED' &&
+          Number(publishedV2?.publishedVersion) === Number(plan.publishedVersion) + 1 &&
+          itemV2?.itemName === `${itemFixture.itemName} V2` &&
+          taskAfterPlanV2.configSnapshot === originalTaskSnapshot,
+        details: `itemV2=${itemV2?.itemName}, newPlanVersion=${publishedV2?.publishedVersion}, historyVersion=${taskAfterPlanV2.configPlanVersion}`
+      })
+      const otherTasksAfter = await readOtherInspectionFacts(assetFixture.assetId)
+      const ownTasks = await runReadOnlySql(`
+        SELECT id, asset_id, config_plan_id, config_plan_version, source_type, config_snapshot
+        FROM after_sales_inspection_task WHERE tenant_id=1 AND deleted=0
+          AND asset_id='${String(inServiceAssetId)}' ORDER BY id
+      `)
+      if (!ownTasks.available) throw new Error(`BLOCKED: ${ownTasks.reason}`)
+      caseRecord.database = [...(caseRecord.database || []),
+        { stage: 'other-inspection-facts-before', ...otherTasksBefore },
+        { stage: 'other-inspection-facts-after', ...otherTasksAfter },
+        { stage: 'owned-existing-inspection-task', ...ownTasks }]
+      caseRecord.checks.push({
+        name: 'PB122/GAP1 白名单真实季度生成既有任务且其他资产事实不变',
+        passed: JSON.stringify(otherTasksBefore.rows) === JSON.stringify(otherTasksAfter.rows) &&
+          ownTasks.rows.length === 1 &&
+          String(ownTasks.rows[0]?.[0]) === String(generatedTask.id) &&
+          ownTasks.rows[0]?.[5] === originalTaskSnapshot,
+        details: `otherRows=${otherTasksAfter.rows.length}, ownedRows=${ownTasks.rows.length}, task=${generatedTask.id}`
+      })
+      await openRoute(page, '/after-sales/inspections', { readyText: '服务巡检' })
+      await queryInspectionTaskInBrowser(page, generatedTask.inspectionNo)
+      const ownedTaskRow = page.locator('.inspection-task-table .el-table__row')
+        .filter({ hasText: generatedTask.inspectionNo })
+      await ownedTaskRow.waitFor({ state: 'visible', timeout: 30000 })
+      const inspectionPageText = await page.locator('body').innerText()
+      caseRecord.checks.push({
+        name: '巡检方案真实页面可进入并展示季度任务',
+        passed: inspectionPageText.includes('服务巡检') &&
+          inspectionPageText.includes('季度巡检任务') &&
+          (await ownedTaskRow.innerText()).includes(assetFixture.detail.asset.assetName),
+        details: inspectionPageText.includes('季度巡检任务')
+          ? '命中服务巡检页面'
+          : '未命中服务巡检页面'
+      })
+      caseRecord.checks.push({
+        name: '巡检任务查询加载完成且页面不暴露接口调试提示',
+        passed: !inspectionPageText.includes('pageSize=') &&
+          await page.locator('.inspection-task-table .el-loading-mask:visible').count() === 0,
+        details: `task=${generatedTask.inspectionNo}, query complete, loading mask hidden`
+      })
+      await saveScreenshot(page, outputDir, 'pb122-inspection-plan', record)
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
     } finally {
       if (assignmentId) await cleanup(caseRecord, `删除本轮资产分配 ${assignmentId}`, () =>
         api.deleteBusiness(`/after-sales/inspection-config/assignment/delete?id=${assignmentId}`))
@@ -1342,8 +2133,8 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       return { token, api, partial: true }
     }
     const dutyRole = unique('E2E_DUTY_ROLE')
-    const phone = '400-900-1234'
-    const dutyDate = dateOffset(0)
+    const phone = '400-900-1257'
+    const dutyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date())
     let scheduleId
     let ruleId
     try {
@@ -1359,7 +2150,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       ruleId = dataOf(await api.postBusiness('/after-sales/duty/rule/save', {
         name: 'E2E 值班转接规则',
         dutyRole,
-        phone,
+        phone: '400-900-1234',
         transferOrder: 1,
         timeoutMinutes: 5,
         serviceScope: 'E2E 服务范围',
@@ -1367,6 +2158,16 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         enabled: true,
         sort: 1
       }))
+      const expected = {
+        ruleId, dutyRole, name: `E2E 页面值班 ${dutyRole}`,
+        employeeName: employee.name || employee.employeeName,
+        date: dutyDate, phone, serviceScope: `E2E 页面服务 ${dutyRole}`,
+        startTime: '09:00', endTime: '18:00',
+        timeoutMinutes: 7, transferOrder: 2, nonServiceTip: `${dutyRole} 非服务时段请留言`
+      }
+      const pageEvidence = await verifyDutyPageInBrowser(page, expected, {
+        capture: (name) => saveScreenshot(page, outputDir, name, record)
+      })
       const rules = listOf(await api.getBusiness('/after-sales/duty/rule/list'))
       const rule = rules.find((item) => String(item.id) === String(ruleId))
       caseRecord.checks.push({
@@ -1374,6 +2175,9 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         passed:
           rule?.dutyRole === dutyRole &&
           rule?.phone === phone &&
+          rule?.serviceScope === expected.serviceScope &&
+          rule?.nonServiceTip === expected.nonServiceTip &&
+          rule?.timeoutMinutes === 7 && rule?.transferOrder === 2 &&
           rule?.enabled === true,
         details: `ruleId=${ruleId}, dutyRole=${rule?.dutyRole}`
       })
@@ -1396,42 +2200,63 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           Array.isArray(roster?.roster) &&
           shift?.date === dutyDate &&
           String(shift?.employeeId) === String(employee.id) &&
+          shift?.employeeName === expected.employeeName &&
           shift?.phone === phone &&
+          shift?.serviceScope === expected.serviceScope &&
           shift?.source === 'MANUAL' &&
           !(roster?.missingRoles || []).includes(dutyRole),
         details: `dutyDate=${dutyDate}, shift=${JSON.stringify(shift)}, missing=${JSON.stringify(roster?.missingRoles)}`
       })
+      caseRecord.checks.push({
+        name: '值班页签真实保存转接规则，清局部状态刷新回读 HRM 人员、日期与规则',
+        passed:
+          pageEvidence.reloadedText.includes(expected.employeeName) &&
+          pageEvidence.reloadedText.includes(dutyDate) &&
+          pageEvidence.reloadedText.includes(expected.nonServiceTip) &&
+          rule?.name === expected.name,
+        details: `ruleId=${ruleId}, scheduleId=${scheduleId}, date=${dutyDate}, employeeId=${employee.id}`
+      })
+      const hardcoded = ['2026-07-22'].filter((value) => pageEvidence.reloadedText.includes(value))
+      caseRecord.checks.push({
+        name: '值班设置页不再出现示例人员与固定日期',
+        passed: hardcoded.length === 0 && pageEvidence.reloadedText.includes(expected.employeeName),
+        details: '真实 HRM 排班行存在，非空白页面；未发现原型固定日期'
+      })
+      addSameCaseGapEvidence(caseRecord, PROJECT_AFTER_SALES_ACCEPTANCE_GAPS[caseId][2].check, [
+        '值班页签真实保存转接规则，清局部状态刷新回读 HRM 人员、日期与规则',
+        '值班名册人员来自 HRM/OA 排班，电话来自售后转接规则',
+        '值班设置页不再出现示例人员与固定日期'
+      ])
     } finally {
       if (ruleId) {
-        await cleanup(caseRecord, `删除本轮值班规则 ${ruleId}`, () =>
-          api.deleteBusiness(`/after-sales/duty/rule/delete?id=${ruleId}`)
-        )
+        await cleanup(caseRecord, `删除并回读本轮值班规则 ${ruleId}`, async () => {
+          const before = listOf(await api.getBusiness('/after-sales/duty/rule/list'))
+            .find((row) => String(row.id) === String(ruleId))
+          if (before?.dutyRole !== dutyRole) throw new Error('值班规则清理归属不一致')
+          await api.deleteBusiness(`/after-sales/duty/rule/delete?id=${ruleId}`)
+          if (listOf(await api.getBusiness('/after-sales/duty/rule/list'))
+            .some((row) => String(row.id) === String(ruleId))) throw new Error('值班规则清理残留')
+        })
       }
       if (scheduleId) {
-        await cleanup(caseRecord, `删除本轮 HRM 值班排班 ${scheduleId}`, () =>
-          api.deleteBusiness(`/hrm/attendance/schedule/delete?id=${scheduleId}`)
-        )
+        await cleanup(caseRecord, `删除并回读本轮 HRM 值班排班 ${scheduleId}`, async () => {
+          const before = dataOf(await api.getBusiness(`/hrm/attendance/schedule/get?id=${scheduleId}`))
+          if (before?.dutyRole !== dutyRole || String(before?.employeeId) !== String(employee.id)) {
+            throw new Error('HRM 排班清理归属不一致')
+          }
+          await api.deleteBusiness(`/hrm/attendance/schedule/delete?id=${scheduleId}`)
+          const after = await api.getBusiness(`/hrm/attendance/schedule/get?id=${scheduleId}`)
+          if (after.data !== null) throw new Error('HRM 排班清理未精确回读 data=null')
+        })
       }
     }
-
-    await openRoute(page, '/after-sales/settings')
-    const dutyTab = page.locator('.el-tabs__item', { hasText: '值班服务' })
-    if (await dutyTab.count()) {
-      await dutyTab.first().click()
-      await page.waitForTimeout(500)
-    }
-    const bodyText = await page.locator('body').innerText()
-    const hardcoded = ['李工', '王敏', '张伟', '2026-07-22'].filter((name) => bodyText.includes(name))
-    caseRecord.checks.push({
-      name: '值班设置页不再出现示例人员与固定日期',
-      passed: hardcoded.length === 0,
-      details: hardcoded.length ? `仍存在：${hardcoded.join(',')}` : '未发现示例人员/固定日期'
-    })
-    await saveScreenshot(page, outputDir, 'pb130-duty', record)
     caseRecord.evidence.push(
       `PB-130 创建 HRM 值班排班 ${scheduleId}（员工 ${employee.id}, 角色 ${dutyRole}）并回读售后名册电话 ${phone}`
     )
-    return { token, api }
+    return {
+      token, api, partial: true,
+      note: '值班真实页签保存/刷新与 HRM 原班人员日期已补证；替班、调班、离职、无排班告警与受控兜底队列仍未完整验证。'
+    }
   }
 
   if (caseId === 'PB121-001') {
@@ -1488,269 +2313,41 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     return { token, api }
   }
 
-  if (caseId === 'PB123-001') {
-    const categoryCode = unique('E2E_KB_CATEGORY')
-    const title = unique('E2E_KB_CASE')
-    let categoryId
-    let libraryKey
-    let topicId
-    let documentId
-    let knowledgeCaseId
+  if (caseId === 'PB124-001') {
+    const fixture = newReminderFixture()
     try {
-      categoryId = dataOf(await api.postBusiness('/after-sales/modeling/category/create', {
-        categoryCode,
-        categoryName: `E2E 知识分类 ${categoryCode}`,
-        defaultPriority: 'P2',
-        applicableServiceStatus: 'IN_SERVICE',
-        sortNo: 902
-      }))
-      const invalidResponse = await api.post('/after-sales/knowledge/save-draft', {
-        categoryId,
-        title: `${title}-未关联`,
-        symptom: '问题',
-        solution: '方案',
-        keywords: ['E2E'],
-        sourceType: 'MANUAL',
-        desensitizationStatus: 'PASSED'
+      assertReminderLocalTarget()
+      const materialId = await firstEnabledMaterialId(api)
+      if (!materialId) {
+        throw new Error('BLOCKED: PB124 当前租户没有已启用且可采购的 Base 存货档案')
+      }
+      await prepareReminderAsset({
+        api,
+        fixture,
+        materialId,
+        caseRecord
       })
-      caseRecord.checks.push({
-        name: '未关联知识中枢文档在保存阶段即被拒绝（1040011）',
-        passed: isBusinessRejected(invalidResponse, 1040011, '知识中枢文档'),
-        details: JSON.stringify(invalidResponse)
-      })
-
-      const libraryName = unique('E2E_KB_LIBRARY')
-      // 本地知识库需绑定可用的向量模型；未启用向量能力时无法建立可索引文档。
-      let embeddingModels = []
-      try {
-        embeddingModels = listOf(await api.getBusiness('/ai/model/simple-list?type=5'))
-      } catch (error) {
-        caseRecord.notes.push(
-          `BLOCKED：查询 EMBEDDING 模型失败（/ai/model/simple-list?type=5）：${error.message}`
-        )
-        return { token, api, partial: true }
-      }
-      const embeddingModelId = embeddingModels[0]?.id
-      if (!embeddingModelId) {
-        caseRecord.notes.push(
-          'BLOCKED：当前租户没有已启用的 EMBEDDING（type=5）模型，无法创建可索引的本地知识库与真实文档版本。'
-        )
-        return { token, api, partial: true }
-      }
-      try {
-        await api.postBusiness('/system/ai-desktop/knowledge/policy/libraries', {
-          name: libraryName,
-          description: 'E2E 售后知识闭环专用本地库',
-          libraryType: 'LOCAL',
-          embeddingModelId,
-          chunkStrategy: 'SMART',
-          retrievalMode: 'HYBRID',
-          rerankEnabled: false,
-          accessScope: 'TENANT'
-        })
-      } catch (error) {
-        caseRecord.notes.push(
-          `BLOCKED：创建本地知识库失败（embeddingModelId=${embeddingModelId}）：${error.message}`
-        )
-        return { token, api, partial: true }
-      }
-      const library = listOf(
-        await api.getBusiness('/system/ai-desktop/knowledge/policy/libraries')
-      ).find((item) => item.name === libraryName)
-      libraryKey = library?.libraryKey
-      if (!libraryKey) {
-        caseRecord.notes.push('BLOCKED：知识库创建后未在可见库列表中回读到 libraryKey，无法继续创建专题与文档。')
-        return { token, api, partial: true }
-      }
-
-      const topicTitle = unique('E2E_KB_TOPIC')
-      topicId = dataOf(await api.postBusiness('/system/ai-desktop/knowledge/policy/topics', {
-        libraryKey,
-        title: topicTitle,
-        description: 'E2E 售后知识文档专题'
-      }))
-      const parsed = dataOf(
-        await api.postBusiness('/system/ai-desktop/knowledge/policy/parse', {
-          topicId,
-          topicTitle,
-          text: [
-            'E2E 售后知识闭环验证资料。',
-            '设备在运行过程中出现异常告警时，应先确认电源与网络连接是否稳定。',
-            '随后检查采集网关指示灯状态，并记录告警码与发生时间。',
-            '如现场无法恢复，应提交服务单并附上日志与截图，等待研发进一步分析。',
-            '处理完成后需要补充验证步骤与结果，确保问题确实闭环。'
-          ].join('\n')
-        })
-      )
-      documentId = parsed?.knowledgeDocumentId
-      if (!documentId) {
-        caseRecord.notes.push(
-          `BLOCKED：知识解析未返回文档编号，parsed=${JSON.stringify(parsed)}`
-        )
-        return { token, api, partial: true }
-      }
-      const document = await waitForIndexedDocument(api, documentId)
-      const documentVersion = document?.versionNo ?? 1
-      if (document?.parseStatus !== 'PARSED' || document?.indexStatus !== 'INDEXED') {
-        caseRecord.notes.push(
-          `BLOCKED：知识中枢文档未完成索引（documentId=${documentId}, parseStatus=${document?.parseStatus}, ` +
-          `indexStatus=${document?.indexStatus}, indexError=${document?.indexErrorMessage || 'n/a'}），无法验证发布闭环。`
-        )
-        caseRecord.notes.push(
-          `本轮可复核样本：分类=${categoryId}, 知识库=${libraryKey}, 专题=${topicId}, 文档=${documentId}，均带 E2E 唯一前缀。`
-        )
-        return { token, api, partial: true }
-      }
-      caseRecord.checks.push({
-        name: '知识中枢文档通过真实解析与索引任务达到 PARSED + INDEXED',
-        passed: true,
-        details: `documentId=${documentId}, parseStatus=${document?.parseStatus}, indexStatus=${document?.indexStatus}, version=${documentVersion}`
-      })
-
-      knowledgeCaseId = dataOf(
-        await api.postBusiness('/after-sales/knowledge/save-draft', {
-          categoryId,
-          title,
-          applicableScope: 'E2E 标准平台现场实施',
-          environmentSummary: '标准平台验收环境',
-          riskNote: '仅用于 E2E 验证',
-          keywords: ['E2E', '售后知识'],
-          tags: ['E2E'],
-          sourceType: 'MANUAL',
-          knowledgeDocumentId: documentId,
-          knowledgeDocumentVersion: documentVersion,
-          desensitizationStatus: 'PENDING'
-        })
-      )
-      await api.postBusiness(`/after-sales/knowledge/submit?id=${knowledgeCaseId}`)
-      await api.postBusiness(`/after-sales/knowledge/mark-desensitized?id=${knowledgeCaseId}`)
-      await api.postBusiness(
-        `/after-sales/knowledge/review?id=${knowledgeCaseId}&approved=true&comment=${encodeURIComponent('E2E 审核通过')}`
-      )
-      const published = dataOf(
-        await api.getBusiness(`/after-sales/knowledge/get?id=${knowledgeCaseId}`)
-      )
-      caseRecord.checks.push({
-        name: '关联知识中枢文档版本后发布成功并同步',
-        passed:
-          published?.status === 'PUBLISHED' &&
-          published?.syncStatus === 'SYNCED' &&
-          published?.hubPublishStatus === 'SYNCED' &&
-          String(published?.knowledgeDocumentId) === String(documentId) &&
-          Number(published?.knowledgeDocumentVersion) === Number(documentVersion),
-        details: `caseId=${knowledgeCaseId}, status=${published?.status}, syncStatus=${published?.syncStatus}, docVersion=${published?.knowledgeDocumentVersion}`
+      const rule = await createReminderClosureRule({ api, fixture })
+      const closure = await verifyReminderClosure({
+        api,
+        fixture,
+        rule,
+        caseRecord
       })
       caseRecord.evidence.push(
-        `PB-123 创建知识中枢文档 ${documentId}(v${documentVersion}) 与售后知识案例 ${knowledgeCaseId}，发布后状态 ${published?.status}/${published?.syncStatus}`
+        `PB124 受控提醒对象 ${fixture.assetId} 完成唯一索引、时间边界、重复幂等和事实快照验证`
       )
+      caseRecord.reminderBrowser = await verifyReminderRuleQuietHoursInBrowser({
+        page, api, fixture, rule, caseRecord, cleanup: 'restore',
+        capture: (name) => saveScreenshot(page, outputDir, name, record)
+      })
+      caseRecord.notes.push(
+        'PB124 免打扰配置编辑、成对校验及保存刷新已由真实页面验证；仍缺 worker 消费、通知/待办与渠道发送结果、提醒运行列表展示、升级时钟/执行日志及服务单状态不变证据，保留 PARTIAL。'
+      )
+      return { token, api, partial: true, ...closure }
     } finally {
-      if (categoryId) {
-        await cleanup(caseRecord, `停用售后知识分类 ${categoryId}`, () =>
-          disableAfterSalesConfig(api, 'CATEGORY', categoryId)
-        )
-      }
+      if (fixture.rules.length > 0) await cleanupReminderClosure({ api, fixture, caseRecord })
     }
-    caseRecord.notes.push(
-      `本轮保留可复核样本：分类=${categoryId}, 知识库=${libraryKey}, 专题=${topicId}, 文档=${documentId}, 知识案例=${knowledgeCaseId}；售后知识案例无删除接口，按唯一前缀保留。`
-    )
-    return { token, api }
-  }
-
-  if (caseId === 'PB124-001') {
-    const ruleCode = unique('REMIND')
-    const payload = {
-      ruleCode,
-      ruleName: 'E2E 提醒规则',
-      reminderScene: 'SLA_DUE',
-      applicableStatuses: ['PROCESSING'],
-      firstDelayMinutes: 30,
-      repeatEnabled: false,
-      channels: ['SYSTEM'],
-      receiverTypes: ['HANDLER'],
-      stopCondition: 'SLA_RESUMED',
-      messageTemplate: 'SLA即将到期',
-      idempotencyKeyTemplate: 'REMIND:{ruleCode}:{ticketId}',
-      quietHoursStart: '22:00',
-      quietHoursEnd: '08:00'
-    }
-    let reminderId
-    try {
-      reminderId = dataOf(await api.postBusiness('/after-sales/modeling/reminder-rule/create', payload))
-      const readRule = async () => listOf(await api.getBusiness(
-        '/after-sales/modeling/reminder-rule/list'
-      )).find((row) => String(row.id) === String(reminderId))
-      const created = await readRule()
-      caseRecord.checks.push({
-        name: '提醒规则回读保留幂等键和跨午夜免打扰时段',
-        passed: Boolean(created) && created.ruleCode === ruleCode &&
-          created.idempotencyKeyTemplate === payload.idempotencyKeyTemplate &&
-          created.quietHoursStart === payload.quietHoursStart &&
-          created.quietHoursEnd === payload.quietHoursEnd &&
-          created.repeatEnabled === false && created.repeatIntervalMinutes == null,
-        details: `reminderId=${reminderId}, status=${created?.status}`
-      })
-      const editedName = 'E2E 提醒规则已编辑'
-      const editedIdempotency = 'REMIND2:{ruleCode}:{ticketId}'
-      const editedQuietStart = '23:00'
-      const editedQuietEnd = '07:00'
-      await api.putBusiness(`/after-sales/modeling/reminder-rule/update?id=${reminderId}`, {
-        ...payload,
-        ruleName: editedName,
-        idempotencyKeyTemplate: editedIdempotency,
-        quietHoursStart: editedQuietStart,
-        quietHoursEnd: editedQuietEnd
-      })
-      const edited = await readRule()
-      caseRecord.checks.push({
-        name: '提醒规则编辑后名称回读并保持非循环无间隔',
-        passed: edited?.ruleName === editedName && edited?.repeatIntervalMinutes == null,
-        details: `reminderId=${reminderId}, name=${edited?.ruleName}`
-      })
-      const editFieldMismatch =
-        edited?.idempotencyKeyTemplate !== editedIdempotency ||
-        edited?.quietHoursStart !== editedQuietStart ||
-        edited?.quietHoursEnd !== editedQuietEnd
-      if (editFieldMismatch) {
-        caseRecord.notes.push(
-          `真实产品缺陷：AfterSalesModelingMaintenanceServiceImpl.updateReminderRule 未写回 ` +
-          `idempotencyKeyTemplate/quietHoursStart/quietHoursEnd。期望=${editedIdempotency}|${editedQuietStart}|${editedQuietEnd}，` +
-          `实际=${edited?.idempotencyKeyTemplate}|${edited?.quietHoursStart}|${edited?.quietHoursEnd}（reminderId=${reminderId}）`
-        )
-      }
-      const invalidQuiet = await api.post('/after-sales/modeling/reminder-rule/create', {
-        ...payload, ruleCode: unique('REMIND_INVALID'), quietHoursEnd: null
-      })
-      caseRecord.checks.push({
-        name: '不完整免打扰时段被业务拒绝',
-        passed: isBusinessRejected(invalidQuiet, 1020021, '免打扰'),
-        details: JSON.stringify(invalidQuiet)
-      })
-      if (invalidQuiet?.code === 0 && dataOf(invalidQuiet)) {
-        await api.postBusiness(`/after-sales/modeling/status?configType=REMINDER_RULE&id=${dataOf(invalidQuiet)}&enabled=false`)
-      }
-    } finally {
-      if (reminderId) {
-        await api.postBusiness(`/after-sales/modeling/status?configType=REMINDER_RULE&id=${reminderId}&enabled=false`)
-        const disabled = listOf(await api.getBusiness('/after-sales/modeling/reminder-rule/list'))
-          .find((row) => String(row.id) === String(reminderId))
-        caseRecord.checks.push({
-          name: '本轮提醒规则停用清理并回读',
-          passed: disabled?.status === 'DISABLED',
-          details: `reminderId=${reminderId}`
-        })
-      }
-    }
-    await openRoute(page, '/after-sales/settings')
-    await page.getByRole('tab', { name: /提醒规则/ }).click()
-    await page.locator('.reminder-table').waitFor({ state: 'visible' })
-    caseRecord.checks.push({
-      name: '真实 Chrome 提醒规则页签和配置表渲染',
-      passed: await page.locator('.reminder-table').getByText('提醒场景', { exact: true }).isVisible(),
-      details: page.url()
-    })
-    await saveScreenshot(page, outputDir, 'pb124-reminder-settings', record)
-    caseRecord.notes.push('配置层创建、编辑、回读和停用已执行；运行时重复通知/升级幂等仍未验证。')
-    return { token, api, partial: true }
   }
 
   if (caseId === 'PB115-001') {
@@ -1883,178 +2480,121 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         )
       }
     }
+    await openRoute(page, '/project/modeling/project-base/list?modeling=milestoneTemplate', {
+      readyText: '里程碑模板'
+    })
+    const milestonePageText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '里程碑模板真实菜单页渲染并可回读阶段快照',
+      passed: milestonePageText.includes('项目基础建模') &&
+        milestonePageText.includes('里程碑模板'),
+      details: milestonePageText.includes('里程碑模板')
+        ? '命中里程碑模板菜单工作区'
+        : '未命中里程碑模板菜单工作区'
+    })
+    await saveScreenshot(page, outputDir, 'pb115-milestone-template', record)
     return { token, api }
   }
 
   if (caseId === 'PB116-001') {
-    const [taskLibrary, taskCategory] = await Promise.all([
-      api.getBusiness('/pm/modeling/list?configKey=taskLibrary'),
-      api.getBusiness('/pm/modeling/list?configKey=taskCategory')
-    ])
-    caseRecord.checks.push({
-      name: '任务库复用建模配置键 taskLibrary/taskCategory 并返回引用计数',
-      passed:
-        listOf(taskLibrary).every((item) => item.referenceCount === undefined || typeof item.referenceCount === 'number') &&
-        listOf(taskCategory).every((item) => item.referenceCount === undefined || typeof item.referenceCount === 'number'),
-      details: `任务库=${listOf(taskLibrary).length}, 任务分类=${listOf(taskCategory).length}`
-    })
-    caseRecord.checks.push({
-      name: '任务库真实条目保存标准工时、产出物、验收标准和前置关系',
-      passed: listOf(taskLibrary).every((item) => {
-        try {
-          const config = JSON.parse(item.configJson || '{}')
-          return item.status !== 'ENABLED' || validTaskLibraryConfig(config)
-        } catch {
-          return false
-        }
-      }),
-      details: '已校验 taskLibrary.configJson.tasks 的 PB-116 结构字段'
-    })
-    let invalidCycleRejected = false
+    const owned = newPmClosureFixture(caseId)
     try {
-      await api.postBusiness('/pm/modeling/save', {
-        configKey: 'taskLibrary',
-        configCode: unique('TASK_INVALID'),
-        configName: 'E2E 循环任务库',
-        configJson: JSON.stringify({
-          tasks: [
-            {
-              code: 'TASK-A',
-              name: '任务A',
-              standardHours: 4,
-              deliverable: '交付物A',
-              acceptanceCriteria: '验收A',
-              predecessorIds: ['TASK-B']
-            },
-            {
-              code: 'TASK-B',
-              name: '任务B',
-              standardHours: 4,
-              deliverable: '交付物B',
-              acceptanceCriteria: '验收B',
-              predecessorIds: ['TASK-A']
-            }
-          ]
-        }),
-        status: 'ENABLED'
-      })
-    } catch (error) {
-      invalidCycleRejected = true
-    }
-    caseRecord.checks.push({
-      name: '启用任务库前阻断前置任务循环依赖',
-      passed: invalidCycleRejected,
-      details: '后端版本发布校验已执行'
-    })
-    const invalidDraftId = dataOf(await api.postBusiness('/pm/modeling/save', {
-      configKey: 'taskLibrary',
-      configCode: unique('TASK_INVALID_DRAFT'),
-      configName: 'E2E 无验收标准草稿',
-      configJson: JSON.stringify({
-        tasks: [{ code: 'TASK-A', name: '任务A', standardHours: 4, deliverable: '交付物A' }]
-      }),
-      status: 'DRAFT'
-    }))
-    let invalidStatusRejected = false
-    try {
-      await api.postBusiness(`/pm/modeling/status?id=${invalidDraftId}&status=ENABLED`)
-    } catch (error) {
-      invalidStatusRejected = true
-    }
-    caseRecord.checks.push({
-      name: '草稿经启用接口发布仍执行任务库门禁，不能绕过验收标准校验',
-      passed: invalidStatusRejected,
-      details: `draftId=${invalidDraftId}`
-    })
-    await api.postBusiness(`/pm/modeling/status?id=${invalidDraftId}&status=DISABLED`)
-    let categoryFixture = listOf(taskCategory)[0]
-    let createdCategoryId = null
-    if (!categoryFixture) {
-      const categoryCode = unique('E2E_TASK_CATEGORY')
-      createdCategoryId = dataOf(await api.postBusiness('/pm/modeling/save', {
-        configKey: 'taskCategory',
-        configCode: categoryCode,
-        configName: 'E2E 任务分类',
-        configJson: JSON.stringify({}),
-        status: 'ENABLED'
-      }))
-      categoryFixture = listOf(
-        await api.getBusiness('/pm/modeling/list?configKey=taskCategory')
-      ).find((item) => String(item.id) === String(createdCategoryId))
-    }
-    const taskLibraryCode = unique('E2E_TASK_LIBRARY')
-    let taskLibraryId
-    try {
-      taskLibraryId = dataOf(await api.postBusiness('/pm/modeling/save', {
-        configKey: 'taskLibrary',
-        configCode: taskLibraryCode,
-        configName: 'E2E 可执行任务库',
-        configJson: JSON.stringify({
-          categoryId: categoryFixture?.configCode,
-          tasks: [
-            {
-              code: 'T1',
-              name: '现场勘查',
-              standardHours: 4,
-              deliverable: '勘查记录',
-              acceptance: '客户确认'
-            },
-            {
-              code: 'T2',
-              name: '方案实施',
-              standardHours: 8,
-              deliverable: '实施报告',
-              acceptance: '验收通过',
-              predecessorIds: ['T1']
-            }
-          ]
-        }),
-        status: 'ENABLED'
-      }))
-      const created = listOf(
-        await api.getBusiness('/pm/modeling/list?configKey=taskLibrary')
-      ).find((item) => String(item.id) === String(taskLibraryId))
-      const config = parseJson(created?.configJson)
+      const category = await createDedicatedModelingConfig(api, owned, 'taskCategory', 'CATEGORY', {})
+      const libraryValue = {
+        categoryId: category.row.configCode,
+        tasks: [
+          { code: 'T1', name: '现场勘查', standardHours: 4, deliverable: '勘查记录', acceptance: '客户确认' },
+          { code: 'T2', name: '方案实施', standardHours: 8, deliverable: '实施报告',
+            acceptance: '验收通过', predecessorIds: ['T1'] }
+        ]
+      }
+      const library = await createDedicatedModelingConfig(api, owned, 'taskLibrary', 'LIBRARY', libraryValue)
+      const created = library.row
+      const categoryAfter = await readDedicatedModelingConfig(api, owned, category.owned)
+      const config = parseJson(created.configJson)
       caseRecord.checks.push({
-        name: '任务库写入标准工时、产出物、验收标准和前置关系',
+        name: '任务库复用建模配置键 taskLibrary/taskCategory 并返回引用计数',
+        passed: created.configKey === 'taskLibrary' && categoryAfter.configKey === 'taskCategory' &&
+          typeof created.referenceCount === 'number' && typeof categoryAfter.referenceCount === 'number',
+        details: `本轮 libraryId=${created.id}, categoryId=${categoryAfter.id}, referenceCount=${categoryAfter.referenceCount}`
+      })
+      caseRecord.checks.push({
+        name: '任务库真实条目保存标准工时、产出物、验收标准和前置关系',
         passed:
           created?.status === 'ENABLED' &&
           created?.versionNo === 1 &&
           validTaskLibraryConfig(config) &&
           config.tasks?.[1]?.predecessorIds?.[0] === 'T1' &&
-          config.categoryId === categoryFixture?.configCode,
-        details: `taskLibraryId=${taskLibraryId}, tasks=${config.tasks?.length ?? 'n/a'}`
+          config.categoryId === category.row.configCode,
+        details: `taskLibraryId=${created.id}, tasks=${config.tasks?.length ?? 'n/a'}`
       })
-      const categoryAfter = listOf(
-        await api.getBusiness('/pm/modeling/list?configKey=taskCategory')
-      ).find((item) => String(item.id) === String(categoryFixture?.id))
       caseRecord.checks.push({
         name: '任务库引用使 taskCategory 引用计数真实增加',
-        passed:
-          Number(categoryAfter?.referenceCount) >=
-          Number(categoryFixture?.referenceCount || 0) + 1,
-        details: `before=${categoryFixture?.referenceCount}, after=${categoryAfter?.referenceCount}`
+        passed: Number(categoryAfter.referenceCount) === Number(category.row.referenceCount) + 1,
+        details: `before=${category.row.referenceCount}, after=${categoryAfter.referenceCount}`
       })
       const rejected = await api.post(
-        `/pm/modeling/status?id=${categoryFixture.id}&status=DISABLED`
+        `/pm/modeling/status?id=${category.owned.id}&status=DISABLED`,
+        undefined,
+        { expectedBusinessRejection: { code: 1055020005, message: '存在引用的建模配置不能停用' } }
       )
       caseRecord.checks.push({
         name: '被任务库引用的任务分类禁止直接停用',
-        passed: Number(rejected?.code) !== 0,
+        passed: isBusinessRejected(rejected, 1055020005, '存在引用的建模配置不能停用') &&
+          (await readDedicatedModelingConfig(api, owned, category.owned)).status === 'ENABLED',
         details: JSON.stringify(rejected)
       })
+      const cyclic = {
+        tasks: [
+          { code: 'TASK-A', name: '任务A', standardHours: 4, deliverable: '交付物A',
+            acceptanceCriteria: '验收A', predecessorIds: ['TASK-B'] },
+          { code: 'TASK-B', name: '任务B', standardHours: 4, deliverable: '交付物B',
+            acceptanceCriteria: '验收B', predecessorIds: ['TASK-A'] }
+        ]
+      }
+      const cycleMessage = '项目规则配置无效：任务库前置任务存在循环依赖：TASK-A'
+      const cycleResponse = await api.post('/pm/modeling/save', {
+        configKey: 'taskLibrary',
+        configCode: `${owned.marker}_CYCLE`,
+        configName: `${owned.marker}_CYCLE`,
+        configJson: JSON.stringify(cyclic),
+        status: 'ENABLED'
+      }, { expectedBusinessRejection: { code: 1055020011, message: cycleMessage } })
+      caseRecord.checks.push({
+        name: '启用任务库前阻断前置任务循环依赖',
+        passed: isBusinessRejected(cycleResponse, 1055020011, cycleMessage),
+        details: JSON.stringify(cycleResponse)
+      })
+      const draft = await createDedicatedModelingConfig(api, owned, 'taskLibrary', 'DRAFT', {
+        tasks: [{ code: 'TASK-A', name: '任务A', standardHours: 4, deliverable: '交付物A' }]
+      }, 'DRAFT')
+      const draftMessage = '项目规则配置无效：任务库条目必须填写验收标准：TASK-A'
+      const draftResponse = await api.post(
+        `/pm/modeling/status?id=${draft.owned.id}&status=ENABLED`, undefined,
+        { expectedBusinessRejection: { code: 1055020011, message: draftMessage } })
+      caseRecord.checks.push({
+        name: '草稿经启用接口发布仍执行任务库门禁，不能绕过验收标准校验',
+        passed: isBusinessRejected(draftResponse, 1055020011, draftMessage) &&
+          (await readDedicatedModelingConfig(api, owned, draft.owned)).status === 'DRAFT',
+        details: JSON.stringify(draftResponse)
+      })
+      caseRecord.evidence.push(`PB116 本轮专属 ${owned.marker}: 分类 ${category.owned.id}, 任务库 ${library.owned.id}, 草稿 ${draft.owned.id}`)
     } finally {
-      if (taskLibraryId) {
-        await cleanup(caseRecord, `停用任务库 ${taskLibraryId}`, () =>
-          api.postBusiness(`/pm/modeling/status?id=${taskLibraryId}&status=DISABLED`)
-        )
-      }
-      if (createdCategoryId) {
-        await cleanup(caseRecord, `停用本轮任务分类 ${createdCategoryId}`, () =>
-          api.postBusiness(`/pm/modeling/status?id=${createdCategoryId}&status=DISABLED`)
-        )
-      }
+      await cleanupDedicatedModelingConfigs(api, owned, caseRecord)
     }
+    await openRoute(page, '/project/modeling/project-base/list?modeling=taskLibrary', {
+      readyText: '任务库'
+    })
+    const taskLibraryPageText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: '任务库真实菜单页渲染并可回读配置',
+      passed: taskLibraryPageText.includes('项目基础建模') &&
+        taskLibraryPageText.includes('任务库'),
+      details: taskLibraryPageText.includes('任务库')
+        ? '命中任务库菜单工作区'
+        : '未命中任务库菜单工作区'
+    })
+    await saveScreenshot(page, outputDir, 'pb116-task-library', record)
     return { token, api }
   }
 
@@ -2292,6 +2832,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       passed: settingsText.includes('售后建模'),
       details: settingsText.includes('售后建模') ? '售后建模设置页已渲染' : '未命中售后建模设置页'
     })
+    await saveScreenshot(page, outputDir, 'pb119-after-sales-settings', record)
     return { token, api }
   }
 
@@ -2367,33 +2908,49 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB125-001') {
-    const fixture = await createManualAssetFixture(api, 'PB125')
+    assertPb125LocalTarget()
+    const fixture = newPb125Fixture()
+    let active
+    let beforeFacts
+    let cleanupComplete = false
+    const stages = []
+    const verifyFacts = async (stage) => {
+      const after = await readPb125InventoryFacts(api, fixture)
+      assertPb125InventoryUnchanged(beforeFacts, after)
+      stages.push(stage)
+      caseRecord.evidence.push(`PB125 ${stage}: materialId=${fixture.materialId}, WMS报表total=0，完整物理库存行=0，存货主档逐字段不变`)
+    }
     try {
-      const assetPage = listOf(
-        await api.getBusiness('/after-sales/asset/page?pageNo=1&pageSize=100')
+      await preparePb125Material(api, fixture)
+      beforeFacts = await readPb125InventoryFacts(api, fixture)
+      const assets = await preparePb125Assets(api, fixture)
+      active = assets[0]
+      await verifyFacts('创建在保及到期资产')
+      const listed = assertPb125AssetSearch(
+        await api.getBusiness(`/after-sales/asset/page?pageNo=1&pageSize=100&customerId=${fixture.customerId}&keyword=${active.assetNo}`),
+        fixture, active
       )
-      const listed = assetPage.find((asset) => String(asset.id) === String(fixture.assetId))
       caseRecord.checks.push({
         name: '手工客户资产可在分页中按 assetNo 独立检索',
         passed:
-          listed?.assetNo === fixture.assetNo &&
+          listed?.assetNo === active.assetNo &&
           String(listed?.customerId) === String(fixture.customerId) &&
           Object.prototype.hasOwnProperty.call(listed || {}, 'serviceStatus'),
-        details: `assetId=${fixture.assetId}, assetNo=${fixture.assetNo}`
+        details: `assetId=${active.assetId}, assetNo=${active.assetNo}, customerId=${fixture.customerId}`
       })
-      const detail = fixture.detail
+      const detail = active.detail
       const managers = detail?.managers || []
       const periods = detail?.servicePeriods || []
       caseRecord.checks.push({
         name: '客户资产详情统一回读服务期、责任人和存货档案引用',
         passed:
-          detail?.asset?.id === fixture.assetId &&
+          String(detail?.asset?.id) === active.assetId &&
           detail?.asset?.serviceStatus === 'IN_SERVICE' &&
           String(detail?.asset?.materialId) === String(fixture.materialId) &&
-          managers.some((manager) => manager.managerName?.includes('PB125')) &&
+          managers.some((manager) => manager.managerName === `${fixture.marker}-MANAGER`) &&
           periods.some((period) => period.sourceType === 'MANUAL') &&
           String(detail?.customer?.id) === String(fixture.customerId),
-        details: `assetId=${fixture.assetId}, materialId=${detail?.asset?.materialId}, managers=${managers.length}, periods=${periods.length}`
+        details: `assetId=${active.assetId}, materialId=${detail?.asset?.materialId}, managers=${managers.length}, periods=${periods.length}`
       })
       caseRecord.checks.push({
         name: '客户资产不是存货余额载体，不含库存数量字段',
@@ -2403,23 +2960,100 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           Boolean(detail?.asset?.materialId),
         details: `assetKeys=${Object.keys(detail?.asset || {}).join(',')}`
       })
+      await changePb125AssetStatus(api, fixture, active, 'SERVICE_SUSPENDED')
+      await verifyFacts('正式停服事件')
+      await changePb125AssetStatus(api, fixture, active, 'IN_SERVICE')
+      await verifyFacts('正式恢复事件')
+      const contactName = `${fixture.marker}-PAGE-CONTACT`
+      const contactMobile = '13800000125'
+      const contactId = dataOf(await api.postBusiness('/after-sales/asset/contact/create', {
+        customerId: fixture.customerId, contactName, mobile: contactMobile, primary: false
+      }))
+      const expected = {
+        customerId: fixture.customerId, assetId: active.assetId, assetNo: active.assetNo,
+        contactId, contactName, managerName: `${fixture.marker}-PAGE-MANAGER`,
+        managerMobile: '13800000126', servicePeriod: fixture.pagePeriod
+      }
+      await saveAssetProfileInBrowser(page, expected, {
+        capture: (name) => saveScreenshot(page, outputDir, name, record)
+      })
+      const after = await readPb125Asset(api, fixture, active)
+      const persistedPeriod = after?.servicePeriods?.find((row) =>
+        row.sourceNo === expected.servicePeriod.sourceNo)
+      caseRecord.checks.push({
+        name: '售后设置页保存服务期、责任人和联系人后清局部状态刷新，与服务端一致',
+        passed:
+          String(after?.asset?.id) === active.assetId &&
+          after.asset.assetNo === active.assetNo &&
+          String(after.asset.customerId) === String(fixture.customerId) &&
+          after.managers?.length === 1 &&
+          after.managers[0].managerName === expected.managerName &&
+          after.managers[0].managerMobile === expected.managerMobile &&
+          after.assetContacts?.length === 1 &&
+          String(after.assetContacts[0].contactId) === String(contactId) &&
+          after.assetContacts[0].contactNameSnapshot === contactName &&
+          after.assetContacts[0].mobileSnapshot === contactMobile &&
+          persistedPeriod?.startDate === expected.servicePeriod.startDate &&
+          persistedPeriod?.endDate === expected.servicePeriod.endDate &&
+          persistedPeriod?.sourceName === expected.servicePeriod.sourceName &&
+          after.servicePeriods.length === periods.length + 1 &&
+          periods.every((before) => after.servicePeriods.some((period) =>
+            String(period.id) === String(before.id) &&
+            period.startDate === before.startDate && period.endDate === before.endDate)),
+        details: `assetId=${active.assetId}, contactId=${contactId}, manager=${after?.managers?.[0]?.managerName}, newPeriod=${persistedPeriod?.id}`
+      })
+      addSameCaseGapEvidence(caseRecord, PROJECT_AFTER_SALES_ACCEPTANCE_GAPS[caseId][2].check, [
+        '售后设置页保存服务期、责任人和联系人后清局部状态刷新，与服务端一致'
+      ])
+      assertPb125ServicePeriod(after, fixture.pagePeriod, 'IN_SERVICE', {
+        startDate: active.period.startDate, endDate: fixture.pagePeriod.endDate,
+      })
+      await verifyFacts('真实页面保存追加服务期责任人联系人')
+      await verifyExpiredAssetInBrowser(page, {
+        assetNo: assets[1].assetNo, ...fixture.expiredPeriod
+      }, { capture: (name) => saveScreenshot(page, outputDir, name, record) })
+      const accepted = await verifyPb125ExpiredAcceptance(api, fixture)
+      caseRecord.checks.push({
+        name: 'PB125 到期资产真实风险提示且服务单匹配到期SLA正式受理',
+        passed: true,
+        details: `assetId=${accepted.assetId}, ticketId=${accepted.ticketId}, policyId=${accepted.policyId}；服务到期风险行真实存在，正式创建后进入PROCESSING，资产仍SERVICE_EXPIRED`
+      })
+      await verifyFacts('到期资产创建服务单并正式受理')
+      await changePb125AssetStatus(api, fixture, active, 'RETIRED')
+      await changePb125AssetStatus(api, fixture, assets[1], 'RETIRED')
+      const statusEvents = await verifyPb125StatusEvents(fixture, active)
+      caseRecord.checks.push({
+        name: 'PB125 服务期计算与正式停服恢复退役历史精确回读',
+        passed: true,
+        details: `在保/到期由各自专属服务期计算；${active.assetId}状态日志=${JSON.stringify(statusEvents)}`
+      })
+      addSameCaseGapEvidence(caseRecord, PROJECT_AFTER_SALES_ACCEPTANCE_GAPS[caseId][1].check, [
+        'PB125 服务期计算与正式停服恢复退役历史精确回读',
+        'PB125 到期资产真实风险提示且服务单匹配到期SLA正式受理'
+      ])
+      await verifyFacts('两项专属资产正式退役')
     } finally {
-      await cleanup(caseRecord, `退役本轮专属资产 ${fixture.assetId}`, () =>
-        retireAsset(api, fixture.assetId)
-      )
+      await cleanup(caseRecord, `PB125 专属服务单关闭、资产退役和分类SLA停用回读 ${fixture.marker}`, async () => {
+        await cleanupPb125Fixtures(api, fixture)
+        cleanupComplete = true
+      })
     }
-    const retired = dataOf(await api.getBusiness(`/after-sales/asset/get?id=${fixture.assetId}`))
+    const retired = await readPb125Asset(api, fixture, active)
+    await verifyFacts('正式服务单关闭与配置清理完成')
     caseRecord.checks.push({
       name: '资产退役后状态回读为 RETIRED，不改动存货档案',
       passed:
         retired?.asset?.serviceStatus === 'RETIRED' &&
-        String(retired?.asset?.materialId) === String(fixture.materialId),
-      details: `assetId=${fixture.assetId}, status=${retired?.asset?.serviceStatus}`
+        String(retired?.asset?.materialId) === String(fixture.materialId) && cleanupComplete,
+      details: `assetId=${active.assetId}, status=${retired?.asset?.serviceStatus}；已对比资产创建前与退役后完整WMS及存货事实`
     })
-    await openRoute(page, '/after-sales/settings')
-    await saveScreenshot(page, outputDir, 'pb125-asset', record)
+    caseRecord.checks.push({
+      name: PROJECT_AFTER_SALES_ACCEPTANCE_GAPS[caseId][0].check,
+      passed: cleanupComplete && stages.length === 7,
+      details: `专属materialId=${fixture.materialId}；全部阶段=${stages.join('、')}；API现存量与mes_stk_inventory完整维度只读回查，不借PB127证据`
+    })
     caseRecord.evidence.push(
-      `PB-125 创建手工客户资产 ${fixture.assetNo}（assetId=${fixture.assetId}）并完成服务期/责任人/状态回读与退役`
+      `PB125 ${fixture.marker}：资产 ${fixture.assets.map((asset) => asset.assetId).join(',')} 已退役，服务单 ${fixture.ticketId} 已按处理→专属测试客户确认→正式关闭流程回读CLOSED，分类 ${fixture.categoryId}/SLA ${fixture.policyId} 已停用。客户、联系人、服务期、关闭服务单及所引用专属物料无资产删除链，保留所有权明确的审计历史，不改共享数据。`
     )
     return { token, api }
   }
@@ -2497,197 +3131,25 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB128-001') {
-    const categoryCode = unique('E2E_EVAL_CATEGORY')
-    const itemCode = unique('E2E_EVAL_ITEM')
-    let categoryId
-    let itemId
-    try {
-      categoryId = dataOf(
-        await api.postBusiness('/after-sales/modeling/evaluation-item-category/create', {
-          categoryCode,
-          categoryName: `E2E 评价分类 ${categoryCode}`,
-          sortNo: 900
-        })
-      )
-      itemId = dataOf(await api.postBusiness('/after-sales/modeling/evaluation-item/create', {
-        categoryId,
-        itemCode,
-        itemName: 'E2E 现场服务评分',
-        evaluationType: 'STAR',
-        maxScore: 5,
-        required: true,
-        sortNo: 1
-      }))
-      const item = listOf(
-        await api.getBusiness('/after-sales/modeling/evaluation-item/list')
-      ).find((row) => String(row.id) === String(itemId))
-      caseRecord.checks.push({
-        name: '评价项目主档写入后回读稳定编码与分类引用',
-        passed:
-          item?.itemCode === itemCode &&
-          item?.evaluationType === 'STAR' &&
-          String(item?.categoryId) === String(categoryId) &&
-          item?.status === 'ENABLED' &&
-          Number(item?.maxScore) === 5 &&
-          item?.requiredFlag === true,
-        details: `itemId=${itemId}, itemCode=${item?.itemCode}`
-      })
-      await disableAfterSalesConfig(api, 'EVALUATION_ITEM', itemId)
-      const disabledItem = await readAfterSalesConfig(
-        api,
-        '/after-sales/modeling/evaluation-item/list',
-        itemId
-      )
-      caseRecord.checks.push({
-        name: '评价项目停用后回读为 DISABLED 且编码不变',
-        passed: disabledItem?.status === 'DISABLED' && disabledItem?.itemCode === itemCode,
-        details: `itemId=${itemId}, status=${disabledItem?.status}`
-      })
-    } finally {
-      if (itemId) {
-        await cleanup(caseRecord, `停用评价项目 ${itemId}`, () =>
-          disableAfterSalesConfig(api, 'EVALUATION_ITEM', itemId)
-        )
-      }
-      if (categoryId) {
-        await cleanup(caseRecord, `停用评价分类 ${categoryId}`, () =>
-          disableAfterSalesConfig(api, 'EVALUATION_ITEM_CATEGORY', categoryId)
-        )
-      }
-    }
-    await openRoute(page, '/after-sales/settings')
-    await saveScreenshot(page, outputDir, 'pb128-evaluation-item', record)
+    const closure = await runEvaluationClosureCase({
+      caseId, api, page, caseRecord,
+      capture: (label) => saveScreenshot(page, outputDir, label, record)
+    })
     caseRecord.evidence.push(
-      `PB-128 创建评价分类 ${categoryId} 与评价项目 ${itemCode}（itemId=${itemId}）并回读稳定编码`
+      `PB128 独立夹具 ${closure.fixture.marker} 完成真实页面保存刷新、编码/引用保护及正式评价版本回读；ticketId=${closure.fixture.ticketId}`
     )
-    return { token, api }
+    return { token, api, partial: closure.partial }
   }
 
   if (caseId === 'PB129-001') {
-    const categoryCode = unique('E2E_EVAL_TPL_CATEGORY')
-    const starCode = unique('E2E_EVAL_STAR')
-    const resolutionCode = unique('E2E_EVAL_RESOLUTION')
-    const templateCode = unique('E2E_EVAL_TEMPLATE')
-    let categoryId
-    let starItemId
-    let resolutionItemId
-    let templateId
-    const originalItemName = 'E2E 服务评分（模板快照原值）'
-    try {
-      categoryId = dataOf(
-        await api.postBusiness('/after-sales/modeling/evaluation-item-category/create', {
-          categoryCode,
-          categoryName: `E2E 模板评价分类 ${categoryCode}`,
-          sortNo: 901
-        })
-      )
-      resolutionItemId = dataOf(
-        await api.postBusiness('/after-sales/modeling/evaluation-item/create', {
-          categoryId,
-          itemCode: resolutionCode,
-          itemName: '问题是否解决',
-          evaluationType: 'RESOLUTION_CONFIRM',
-          maxScore: 0,
-          required: true,
-          sortNo: 1
-        })
-      )
-      starItemId = dataOf(await api.postBusiness('/after-sales/modeling/evaluation-item/create', {
-        categoryId,
-        itemCode: starCode,
-        itemName: originalItemName,
-        evaluationType: 'STAR',
-        maxScore: 5,
-        required: true,
-        sortNo: 2
-      }))
-      templateId = dataOf(
-        await api.postBusiness('/after-sales/modeling/evaluation-template/create', {
-          templateCode,
-          templateName: `E2E 客户评价模板 ${templateCode}`,
-          versionNo: 'V1',
-          items: [
-            { itemId: resolutionItemId, score: 0, required: true, sortNo: 1 },
-            { itemId: starItemId, score: 100, required: true, sortNo: 2 }
-          ]
-        })
-      )
-      await api.postBusiness(`/after-sales/modeling/evaluation-template/enable?id=${templateId}`)
-      const readTemplate = async () =>
-        listOf(await api.getBusiness('/after-sales/modeling/evaluation-template/list')).find(
-          (row) => String(row.id) === String(templateId)
-        )
-      const enabled = await readTemplate()
-      const starSnapshot = enabled?.items?.find(
-        (item) => String(item.itemId) === String(starItemId)
-      )
-      caseRecord.checks.push({
-        name: '评价模板启用后回读项目快照与总分',
-        passed:
-          enabled?.status === 'ENABLED' &&
-          Number(enabled?.totalScore) === 100 &&
-          Array.isArray(enabled?.items) &&
-          enabled.items.length === 2 &&
-          starSnapshot?.itemNameSnapshot === originalItemName &&
-          starSnapshot?.evaluationTypeSnapshot === 'STAR',
-        details: `templateId=${templateId}, totalScore=${enabled?.totalScore}, snapshots=${enabled?.items?.length ?? 'n/a'}`
-      })
-      const renamed = 'E2E 服务评分（主档已改名）'
-      await api.putBusiness(
-        `/after-sales/modeling/evaluation-item/update?id=${starItemId}`,
-        {
-          categoryId,
-          itemCode: starCode,
-          itemName: renamed,
-          evaluationType: 'STAR',
-          maxScore: 5,
-          required: true,
-          sortNo: 2
-        }
-      )
-      const afterMainChange = await readTemplate()
-      const frozenSnapshot = afterMainChange?.items?.find(
-        (item) => String(item.itemId) === String(starItemId)
-      )
-      const mainItem = listOf(
-        await api.getBusiness('/after-sales/modeling/evaluation-item/list')
-      ).find((row) => String(row.id) === String(starItemId))
-      caseRecord.checks.push({
-        name: '已启用模板保留创建时快照，不随评价项目主档漂移',
-        passed:
-          mainItem?.itemName === renamed &&
-          frozenSnapshot?.itemNameSnapshot === originalItemName &&
-          frozenSnapshot?.itemNameSnapshot !== mainItem?.itemName,
-        details: `mainItem=${mainItem?.itemName}, templateSnapshot=${frozenSnapshot?.itemNameSnapshot}`
-      })
-    } finally {
-      if (templateId) {
-        await cleanup(caseRecord, `停用评价模板 ${templateId}`, () =>
-          disableAfterSalesConfig(api, 'EVALUATION_TEMPLATE', templateId)
-        )
-      }
-      for (const [label, id] of [
-        ['评价项目-问题是否解决', resolutionItemId],
-        ['评价项目-服务评分', starItemId]
-      ]) {
-        if (id) {
-          await cleanup(caseRecord, `停用${label} ${id}`, () =>
-            disableAfterSalesConfig(api, 'EVALUATION_ITEM', id)
-          )
-        }
-      }
-      if (categoryId) {
-        await cleanup(caseRecord, `停用评价模板分类 ${categoryId}`, () =>
-          disableAfterSalesConfig(api, 'EVALUATION_ITEM_CATEGORY', categoryId)
-        )
-      }
-    }
-    await openRoute(page, '/after-sales/settings')
-    await saveScreenshot(page, outputDir, 'pb129-evaluation-template-snapshot', record)
+    const closure = await runEvaluationClosureCase({
+      caseId, api, page, caseRecord,
+      capture: (label) => saveScreenshot(page, outputDir, label, record)
+    })
     caseRecord.evidence.push(
-      `PB-129 创建评价模板 ${templateCode}（templateId=${templateId}），修改主档后快照保持 ${originalItemName}`
+      `PB129 独立夹具 ${closure.fixture.marker} 完成完整 V1/V2 快照、正式评价及历史统计回读；ticketId=${closure.fixture.ticketId}`
     )
-    return { token, api }
+    return { token, api, partial: closure.partial }
   }
 
   if (caseId === 'PB945-001') {
@@ -2739,6 +3201,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         relatedId: insideTaskId
       })
       const beforeTask = dataOf(await api.getBusiness(`/pm/task/get?id=${insideTaskId}`))
+      const beforeOutsideTask = dataOf(await api.getBusiness(`/pm/task/get?id=${outsideTaskId}`))
       const generated = []
       for (const [reportType, periodKey] of [
         ['DAILY', workingDate],
@@ -2790,6 +3253,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `inside=${insideTaskId}, outside=${outsideTaskId}, snapshot=${daily?.sourceTaskIds.join(',')}`
       })
       const afterTask = dataOf(await api.getBusiness(`/pm/task/get?id=${insideTaskId}`))
+      const afterOutsideTask = dataOf(await api.getBusiness(`/pm/task/get?id=${outsideTaskId}`))
+      assertProjectTaskFactsUnchanged(beforeTask, afterTask)
+      assertProjectTaskFactsUnchanged(beforeOutsideTask, afterOutsideTask)
+      caseRecord.projectTaskFacts = [
+        { before: beforeTask, after: afterTask },
+        { before: beforeOutsideTask, after: afterOutsideTask }
+      ]
+      caseRecord.checks.push({
+        name: '报告生成不修改内外周期任务的完整正式事实和全部日期',
+        passed: true,
+        details: `inside=${insideTaskId}, outside=${outsideTaskId}; complete API facts compared`
+      })
       caseRecord.checks.push({
         name: '报告生成只读取任务和工时，不反写任务状态',
         passed:
@@ -2872,6 +3347,46 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           String(dataOf(issue)?.id) !== String(dataOf(bug)?.id),
         details: `riskNo=${risk.detail?.riskNo}, issueNo=${dataOf(issue)?.issueNo}, bugNo=${dataOf(bug)?.bugNo}`
       })
+      const convertedBugId = numericId(
+        dataOf(await api.postBusiness(`/pm/issue/convert-to-bug?id=${issueId}`)),
+        '问题转化 Bug'
+      )
+      const repeatedConvertedBugId = numericId(
+        dataOf(await api.postBusiness(`/pm/issue/convert-to-bug?id=${issueId}`)),
+        '问题重复转化 Bug'
+      )
+      const convertedIssueId = numericId(
+        dataOf(await api.postBusiness(`/pm/bug/convert-to-issue?id=${bugId}`)),
+        'Bug 转化问题'
+      )
+      const repeatedConvertedIssueId = numericId(
+        dataOf(await api.postBusiness(`/pm/bug/convert-to-issue?id=${bugId}`)),
+        'Bug 重复转化问题'
+      )
+      const [convertedBug, convertedIssue, issueAfterConversion, bugAfterConversion] =
+        await Promise.all([
+          api.getBusiness(`/pm/bug/get?id=${convertedBugId}`),
+          api.getBusiness(`/pm/issue/get?id=${convertedIssueId}`),
+          api.getBusiness(`/pm/issue/get?id=${issueId}`),
+          api.getBusiness(`/pm/bug/get?id=${bugId}`)
+        ])
+      caseRecord.checks.push({
+        name: '问题与 Bug 可双向转化，来源记录保留且重复转化幂等',
+        passed:
+          convertedBugId === repeatedConvertedBugId &&
+          convertedIssueId === repeatedConvertedIssueId &&
+          dataOf(convertedBug)?.sourceType === 'ISSUE' &&
+          String(dataOf(convertedBug)?.sourceId) === String(issueId) &&
+          String(dataOf(convertedBug)?.convertedFromId) === String(issueId) &&
+          dataOf(convertedIssue)?.sourceType === 'BUG' &&
+          String(dataOf(convertedIssue)?.sourceId) === String(bugId) &&
+          String(dataOf(convertedIssue)?.convertedFromId) === String(bugId) &&
+          Boolean(dataOf(issueAfterConversion)?.issueNo) &&
+          Boolean(dataOf(bugAfterConversion)?.bugNo),
+        details:
+          `issue=${issueId}->bug=${convertedBugId}, bug=${bugId}->issue=${convertedIssueId}, ` +
+          `repeated=${repeatedConvertedBugId}/${repeatedConvertedIssueId}`
+      })
       await api.postBusiness('/pm/risk/save', riskUpdatePayload(risk.detail, { level: 'HIGH' }))
       const leveled = dataOf(await api.getBusiness(`/pm/risk/get?id=${risk.riskId}`))
       const history = parseRiskLevelHistory(leveled?.levelHistoryJson)
@@ -2941,8 +3456,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
     return {
       token,
       api,
-      partial: true,
-      note: 'PB-947 已验证风险关联/等级历史/验证关闭及问题、Bug 独立记录；问题/Bug 的关联、转化来源字段尚未接入 Do、ReqVO 和 Controller，保留 PARTIAL。'
+      acceptanceComplete: caseRecord.checks.every((check) => check.passed !== false)
     }
   }
 
@@ -2973,14 +3487,23 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         relatedId: taskId
       })
       const idempotencyKey = unique('E2E_CHANGE_EXEC')
+      const history = []
+      const captureChange = async () => {
+        const snapshot = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+        history.push(structuredClone(snapshot))
+        return snapshot
+      }
+      await captureChange()
       await setChangeStatus(api, changeId, 'ASSESSING')
+      await captureChange()
       await setChangeStatus(api, changeId, 'PENDING_APPROVAL')
+      await captureChange()
       await setChangeStatus(api, changeId, 'APPROVED', {
         objectVersion: 1,
         downstreamStrategy: 'MANUAL',
         approvalOpinion: 'E2E 审批通过并冻结对象版本'
       })
-      const approved = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+      const approved = await captureChange()
       caseRecord.checks.push({
         name: '变更审批通过冻结对象版本并记录下游处理策略',
         passed:
@@ -2991,7 +3514,7 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         details: `changeId=${changeId}, version=${approved?.objectVersion}, strategy=${approved?.downstreamStrategy}`
       })
       await setChangeStatus(api, changeId, 'EXECUTING', { executionIdempotencyKey: idempotencyKey })
-      const executing = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+      const executing = await captureChange()
       caseRecord.checks.push({
         name: '服务端一次性执行写入幂等键、执行人和执行时间',
         passed:
@@ -3005,10 +3528,18 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
       await setChangeStatus(api, changeId, 'VERIFIED', {
         approvalOpinion: 'E2E 执行结果已验证'
       })
+      await captureChange()
       await setChangeStatus(api, changeId, 'CLOSED', {
         approvalOpinion: 'E2E 变更闭环'
       })
-      const closed = dataOf(await api.getBusiness(`/pm/change/get?id=${changeId}`))
+      const closed = await captureChange()
+      assertProjectChangeLifecycle(history)
+      caseRecord.projectChangeHistory = history
+      caseRecord.checks.push({
+        name: '变更七个状态逐步正式回读且身份版本和全链路时间保持一致',
+        passed: true,
+        details: `change=${changeId}; states=${history.map((item) => item.status).join('->')}; create=${closed.createTime}, executed=${closed.executedTime}, verified=${closed.verifiedTime}, closed=${closed.closedTime}`
+      })
       caseRecord.checks.push({
         name: '变更经执行、验证后关闭且全链路时间可回读',
         passed:
@@ -3073,99 +3604,15 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
   }
 
   if (caseId === 'PB951-001') {
-    const projectType = await resolveEnabledProjectType(api)
-    const fixture = await createDedicatedProject({ api, caseId, projectType, caseRecord, activate: true })
-    try {
-      const workingDate = await findWorkingDate(api, dateOffset(-14))
-      await api.putBusiness('/pm/project/update', projectUpdatePayload(fixture.project, {
-        status: 'EXECUTING',
-        plannedStartDate: dateOffsetFrom(workingDate, -7),
-        plannedEndDate: dateOffsetFrom(workingDate, 90)
-      }))
-      const taskId = await createTaskFixture({
-        api,
-        projectId: fixture.projectId,
-        ownerId: fixture.ownerId,
-        marker: fixture.marker,
-        plannedStartDate: workingDate,
-        plannedEndDate: workingDate
+    assertPmClosureLocalTarget()
+    const result = await runProjectMilestoneClosure({
+      api, page, record, caseRecord, outputDir,
+      createProject: async (plannedWindow) => createDedicatedProject({
+        api, caseId, projectType: await resolveEnabledProjectType(api), caseRecord,
+        activate: true, plannedWindow
       })
-      const missingGate = await createMilestoneFixture({
-        api,
-        projectId: fixture.projectId,
-        ownerId: fixture.ownerId,
-        marker: `${fixture.marker}_NO_GATE`,
-        withGates: false,
-        plannedStartDate: workingDate,
-        plannedEndDate: workingDate
-      })
-      await api.putBusiness(`/pm/milestone/confirm?id=${missingGate.milestoneId}`, undefined)
-      const invalidComplete = await api.put(
-        `/pm/milestone/complete?id=${missingGate.milestoneId}` +
-        `&manualConclusion=${encodeURIComponent('E2E 缺少准出条件')}`,
-        undefined,
-        {
-          expectedBusinessRejection: {
-            code: 1055004003,
-            message: '里程碑日期超出项目计划窗口或结束日期早于开始日期'
-          }
-        }
-      )
-      caseRecord.checks.push({
-        name: '里程碑缺少准出条件或必需交付物时不能完成',
-        passed: isBusinessRejected(
-          invalidComplete,
-          1055004003,
-          '里程碑日期超出项目计划窗口或结束日期早于开始日期'
-        ),
-        details: JSON.stringify(invalidComplete)
-      })
-
-      const milestone = await createMilestoneFixture({
-        api,
-        projectId: fixture.projectId,
-        ownerId: fixture.ownerId,
-        marker: fixture.marker,
-        withGates: true,
-        plannedStartDate: workingDate,
-        plannedEndDate: workingDate
-      })
-      const taskBefore = dataOf(await api.getBusiness(`/pm/task/get?id=${taskId}`))
-      await api.putBusiness(`/pm/milestone/confirm?id=${milestone.milestoneId}`, undefined)
-      await api.putBusiness(
-        `/pm/milestone/complete?id=${milestone.milestoneId}` +
-        `&manualConclusion=${encodeURIComponent('E2E 人工确认准出条件和交付物已满足')}`,
-        undefined
-      )
-      const completed = await getMilestone(api, fixture.projectId, milestone.milestoneId)
-      caseRecord.checks.push({
-        name: '具备准出条件和交付物的里程碑可人工确认完成',
-        passed:
-          completed?.confirmed === true &&
-          completed?.status === 'COMPLETED' &&
-          completed?.exitCondition === `${fixture.marker} 准出条件` &&
-          parseJson(completed?.requiredDeliverablesJson, []).length === 1 &&
-          completed?.manualConclusion === 'E2E 人工确认准出条件和交付物已满足' &&
-          Boolean(completed?.actualFinishDate),
-        details: `milestoneId=${milestone.milestoneId}, status=${completed?.status}, conclusion=${completed?.manualConclusion}`
-      })
-      const taskAfter = dataOf(await api.getBusiness(`/pm/task/get?id=${taskId}`))
-      caseRecord.checks.push({
-        name: '里程碑人工完成不代替任务责任人确认或改写任务状态',
-        passed:
-          taskAfter?.status === taskBefore?.status &&
-          String(taskAfter?.plannedEndDate) === String(taskBefore?.plannedEndDate),
-        details: `taskId=${taskId}, before=${taskBefore?.status}, after=${taskAfter?.status}`
-      })
-      caseRecord.evidence.push(
-        `PB-951 缺门禁里程碑 ${missingGate.milestoneId} 被拒绝；达标里程碑 ${milestone.milestoneId} 完成并保留人工结论`
-      )
-      await openRoute(page, '/project/execution/milestone-confirm/list')
-      await saveScreenshot(page, outputDir, 'pb951-milestone-complete', record)
-    } finally {
-      await restoreDedicatedProject(api, fixture)
-    }
-    return { token, api }
+    })
+    return { token, api, ...result }
   }
 
   if (caseId === 'PB953-001') {
@@ -3198,10 +3645,12 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
         startDate: dateOffset(-1),
         endDate: dateOffset(1)
       }
+      const reports = new Map()
       for (const definition of PROJECT_REPORT_DEFINITIONS) {
         const report = dataOf(await api.getBusiness(
           `/pm/report/${definition.path}?${pushReportQuery({}, query)}`
         ))
+        reports.set(definition.reportType, report)
         caseRecord.checks.push({
           name: `${definition.reportType} 报表返回统一口径和同一筛选上下文`,
           passed:
@@ -3217,13 +3666,19 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
             `mode=${report?.calculationMode}, filters=${JSON.stringify(report?.appliedFilters)}`
         })
       }
-      for (const definition of PROJECT_REPORT_DEFINITIONS.slice(0, 2)) {
+      caseRecord.projectReportExports = []
+      for (const definition of PROJECT_REPORT_DEFINITIONS) {
         const exportFile = await api.download(
           `/pm/report/export-excel?${pushReportQuery({ reportType: definition.reportType }, query)}`
         )
         const workbook = XLSX.read(exportFile.buffer, { type: 'buffer' })
         const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {
           defval: null
+        })
+        if (rows.length !== 1) throw new Error(`PB953 ${definition.reportType} export expected one aggregate row`)
+        assertProjectReportExportMatches(reports.get(definition.reportType), rows[0], query)
+        caseRecord.projectReportExports.push({
+          report: reports.get(definition.reportType), exportRow: rows[0]
         })
         caseRecord.checks.push({
           name: `${definition.reportType} 导出复用相同筛选并生成可解析 Excel`,
@@ -3235,11 +3690,40 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
           details: `contentType=${exportFile.contentType}, rows=${rows.length}, sheet=${workbook.SheetNames[0]}`
         })
       }
+      caseRecord.checks.push({
+        name: '十一类Excel导出逐项匹配列表项目日期版本和全部非空标量指标',
+        passed: caseRecord.projectReportExports.length === 11,
+        details: `project=${fixture.projectId}, range=${query.startDate}~${query.endDate}, types=${caseRecord.projectReportExports.map((item) => item.report.reportType).join(',')}`
+      })
       caseRecord.evidence.push(
-        `PB-953 对专属项目 ${fixture.projectId} 校验 11 类报表统一 projectId/startDate/endDate，并验证前两类 Excel 与查询口径一致`
+        `PB-953 对专属项目 ${fixture.projectId} 校验 11 类报表统一 projectId/startDate/endDate，并逐项验证全部 Excel 与查询口径一致`
       )
-      await openRoute(page, '/project/statistics/overview')
-      await saveScreenshot(page, outputDir, 'pb953-project-reports', record)
+      caseRecord.projectReportBrowser = await verifyProjectReportPages({
+        page, api, project: fixture.project, query, reports,
+        capture: (name) => saveScreenshot(page, outputDir, name, record)
+      })
+      caseRecord.checks.push({
+        name: '十一类项目报表真实页面按专属项目日期逐项展示且指标匹配正式查询',
+        passed: caseRecord.projectReportBrowser.length === 11,
+        details: caseRecord.projectReportBrowser.map((item) =>
+          `${item.path}: route=${item.route}; project=${item.projectId}`).join('; ')
+      })
+      for (const route of ['/project/statistics/workspace', '/project/statistics/overview']) {
+        await openRoute(page, route)
+        const overview = page.locator('.module-overview')
+        await overview.waitFor({ state: 'visible', timeout: 15000 })
+        assertProjectReportPageText(await page.locator('body').innerText())
+        const title = await overview.locator('h1').innerText()
+        if (title !== '过程报告' || new URL(page.url()).pathname !== route) {
+          throw new Error(`PB953 report overview context mismatch: ${route}`)
+        }
+        caseRecord.checks.push({
+          name: `旧统计入口模块上下文正常:${route}`,
+          passed: true,
+          details: '旧菜单未携带 moduleKey 时解析为 reporting；仅验证入口配置，不作为业务指标证据'
+        })
+        await saveScreenshot(page, outputDir, `pb953-statistics-${route.split('/').at(-1)}`, record)
+      }
     } finally {
       await restoreDedicatedProject(api, fixture)
     }
@@ -3392,4 +3876,72 @@ export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) =
 
   caseRecord.notes.push(`未识别的案例：${caseId}`)
   return { token, api }
+}
+
+export const runCase = async (args) => {
+  const { caseId, caseRecord } = args
+  initializeProjectAfterSalesCatalogAssertions(caseRecord, caseId)
+  let result
+  try {
+    if (caseId === 'PB123-001') {
+      if (process.env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+        throw new Error('BLOCKED: PB123 安全负例需要 CFOR_E2E_WRITE_FIXTURES=true；全局知识索引 worker 仍禁止。')
+      }
+      assertKnowledgeReadinessLocalContext(config, config.tenantId)
+      const { token, tenantId } = await login(args.page, { returnContext: true })
+      caseRecord.checks.push({ name: 'PB123 复用真实租户1登录会话', passed: Boolean(token) && tenantId === '1' })
+      const knowledgePage = await args.page.context().newPage()
+      try {
+        const screenshotPath = path.join(args.outputDir, 'pb123-knowledge-readiness.png')
+        result = await runProjectAfterSalesKnowledgeReadiness({
+          token, tenantId, runId: args.record.runId, caseRecord,
+          page: knowledgePage, screenshotPath
+        })
+        caseRecord.checks.push({ name: 'PB123 安全就绪审计各执行阶段无异常',
+          passed: result.auditSucceeded, details: JSON.stringify(result.failures) })
+        if (result.negative) {
+          caseRecord.checks.push({ name: 'PB123 缺真实文档版本按1040011精确拒绝且案例/事件全字段不变',
+            passed: result.negative.matched && result.negative.unchanged })
+          caseRecord.checks.push({ name: 'PB123 专属知识分类创建回读及正式停用回读',
+            passed: Boolean(result.category) && result.categoryCleanup?.readback === true })
+        }
+        if (result.page?.loaded) {
+          args.record.screenshots.push(screenshotPath)
+          caseRecord.checks.push({ name: 'PB123 正式知识页面只读加载、真实列表请求及脱敏截图',
+            passed: true, details: result.page.route })
+        }
+        for (const item of result.gaps) caseRecord.notes.push(`PB123 ${item.code}: ${item.reason}`)
+        caseRecord.evidence.push(`PB123 原需求 ${result.requirementSource.sheet}/${result.requirementSource.range}；
+          可用索引文档=${result.readiness?.candidates?.length ?? '未核实'}；未调用全局worker、搜索或policy副作用接口。`)
+      } finally {
+        await knowledgePage.close()
+      }
+      return { ...result, ...finalizeProjectAfterSalesCatalogAssertions(caseRecord, caseId, result) }
+    }
+    if (caseId === 'PB124-001') {
+      if (process.env.CFOR_E2E_WRITE_FIXTURES !== 'true') {
+        caseRecord.notes.push(
+          'PB124 受控对象夹具需要显式设置 CFOR_E2E_WRITE_FIXTURES=true；本轮未创建客户、资产、提醒规则或待发送事件。'
+        )
+        result = { partial: true }
+        return { ...result, ...finalizeProjectAfterSalesCatalogAssertions(caseRecord, caseId, result) }
+      }
+      assertReminderLocalTarget()
+    }
+    if (PROJECT_AFTER_SALES_SAFETY_BLOCKS[caseId] && caseId !== 'PB124-001') {
+      throw new Error(`BLOCKED: ${PROJECT_AFTER_SALES_SAFETY_BLOCKS[caseId]}`)
+    }
+    if (['PB112-001', 'PB113-001', 'PB114-001', 'PB116-001', 'PB122-001'].includes(caseId)) {
+      assertPmClosureLocalTarget()
+    }
+    result = await runCaseCore(args)
+  } catch (error) {
+    finalizeProjectAfterSalesCatalogAssertions(caseRecord, caseId, { partial: true })
+    throw error
+  }
+  const catalogResult = finalizeProjectAfterSalesCatalogAssertions(caseRecord, caseId, result)
+  return {
+    ...result,
+    ...catalogResult
+  }
 }

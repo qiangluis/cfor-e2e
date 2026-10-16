@@ -75,6 +75,21 @@ test('successful and failed operations preserve their result without timeout cle
   assert.equal(closes, 0)
 })
 
+test('finalized case records tolerate runtime API functions and circular fixture references', () => {
+  const fixture = { marker: 'owned-fixture', request: async () => ({}) }
+  fixture.self = fixture
+  const report = finalizeCaseRecord({
+    status: 'PASS',
+    checks: [],
+    notes: [],
+    fixture
+  })
+
+  assert.equal(report.fixture.request, '[Function]')
+  assert.equal(report.fixture.self, '[Circular]')
+  assert.throws(() => { report.fixture.marker = 'changed' }, TypeError)
+})
+
 test('cleanup failure still waits for the underlying fixture to settle', async () => {
   const release = deferred()
   const closing = deferred()
