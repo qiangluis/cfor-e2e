@@ -2293,7 +2293,9 @@ const runCostCase = async ({
       `/cost/periods?accountingOrgId=${accountingOrgId}&pageNo=1&pageSize=100`
     )
     const periods = periodsResult?.data?.list || []
-    const publishedPeriods = periods.filter((row) => row.status === 'PUBLISHED' && nonEmpty(row.id))
+    const publishedPeriods = periods.filter(
+      (row) => ['PUBLISHED', 'COST_PUBLISHED'].includes(String(row.status)) && nonEmpty(row.id)
+    )
     let reportSample = null
     let blockedSample = null
     for (const period of publishedPeriods) {

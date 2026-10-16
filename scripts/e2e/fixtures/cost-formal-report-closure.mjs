@@ -811,8 +811,44 @@ export const runCostFormalReportClosure = async (input, dependencies = {}) => {
           return { positive: report, model: publishedTrade.model, negativePeriodId: idOf(unpublishedTrade.facts.period.id), body }
         })
         await check('retained', async () => {
-          // A far-future month alone cannot prove that it was originally empty or exclusively allocated.
-          requireSample(false, 'GAP: read-only current facts cannot prove allocateCostMonth original empty-month ownership; retained allocation provenance must be supplied by the main fixture')
+          // A far-future month alone cannot prove that it was originally empty or exclusively
+          // allocated, so the run-owned fixture records the month census taken *before* it
+          // allocated the month, plus the period/model it created for that exact month.
+          const records = Array.isArray(ctx.record?.cases) ? ctx.record.cases : []
+          const proven = records.flatMap((entry) => {
+            const fixture = entry?.fixtures?.costScenario
+            const provenance = fixture?.allocationProvenance
+            if (!provenance || fixture.runId !== ctx.record.runId || fixture.tenantId !== '1' ||
+                !fixture.periodId || !fixture.modelId) return []
+            return [{ fixture, provenance }]
+          }).filter((item) => item.provenance.allocatedAfterEveryExistingMonth === true)
+          requireSample(proven.length > 0,
+            'GAP: no run-owned far-future allocation provenance recorded before the month census changed')
+          const sample = proven.at(-1)
+          const period = await ctx.get(`/cost/periods/${idOf(sample.fixture.periodId)}`)
+          assert.equal(String(period.period), sample.provenance.allocatedMonth,
+            'Allocation provenance month must match the owned period')
+          assert.equal(idOf(period.modelVersionId), idOf(sample.fixture.modelId),
+            'Allocated far-future month must stay bound to the owned fixture model')
+          const model = await ctx.get(`/cost/model-versions/${idOf(period.modelVersionId)}`)
+          assert.equal(idOf(model.id), idOf(sample.fixture.modelId))
+          assert.equal(String(model.effectiveMonth), sample.provenance.allocatedMonth,
+            'Owned model effective month must equal the allocated month')
+          const ownedMonths = records.filter((entry) =>
+            entry?.fixtures?.costScenario?.periodId)
+            .map((entry) => entry.fixtures.costScenario.allocationProvenance?.allocatedMonth)
+            .filter((month) => typeof month === 'string')
+          assert.equal(new Set(ownedMonths).size, ownedMonths.length,
+            'Run-owned far-future months must be unique across cost fixtures')
+          return {
+            runId: ctx.record.runId,
+            caseId: sample.fixture.caseId,
+            allocatedMonth: sample.provenance.allocatedMonth,
+            latestExistingMonthBeforeAllocation: sample.provenance.latestExistingMonth,
+            periodId: idOf(period.id),
+            modelId: idOf(model.id),
+            ownedMonthCensus: ownedMonths.sort()
+          }
         })
         await check('page', async () => {
           requireSample(production, 'Missing formally published MANUFACTURING page period')

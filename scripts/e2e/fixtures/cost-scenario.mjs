@@ -152,6 +152,9 @@ const allocateMonths = async (api, count, { afterExisting = false } = {}) => {
     ...models.map((row) => row.effectiveMonth),
     ...periods.map((row) => row.period)
   ])
+  // 分配时既有的最新月份：COST-036 用它证明所选远期月份在分配前确实是空月。
+  const latestExisting = [...used].filter((month) => /^\d{4}-\d{2}$/.test(String(month)))
+    .sort().at(-1) || null
   const available = new Set()
   for (let year = 2200; year < 2260; year++) {
     for (let index = 1; index <= 12; index++) {
@@ -165,7 +168,6 @@ const allocateMonths = async (api, count, { afterExisting = false } = {}) => {
       const month = `${year}-${String(index).padStart(2, '0')}`
       if (!available.has(month)) continue
       if (afterExisting) {
-        const latestExisting = [...used].sort().at(-1)
         if (latestExisting && month <= latestExisting) continue
       }
       const candidate = [month]
@@ -174,7 +176,7 @@ const allocateMonths = async (api, count, { afterExisting = false } = {}) => {
         if (!available.has(next)) break
         candidate.push(next)
       }
-      if (candidate.length === count) return candidate
+      if (candidate.length === count) return { months: candidate, latestExisting }
     }
   }
   throw new Error(`No ${count} consecutive unused far-future months for the cost scenario fixture`)
@@ -759,7 +761,7 @@ export async function prepareCostScenario (
     throw new Error(`未知成本场景：${scenarioUnderTest}`)
   }
   const suffix = randomUUID().replaceAll('-', '').slice(0, 12).toUpperCase()
-  const months = await allocateMonths(
+  const allocation = await allocateMonths(
     api,
     scenarioUnderTest === 'carryover' ? 2 : 1,
     {
@@ -768,12 +770,21 @@ export async function prepareCostScenario (
         caseRecord.id === 'COST-023'
     }
   )
+  const months = allocation.months
   const month = months[0]
   const remark = `CFOR-E2E:costScenario:${scenarioUnderTest}:${record.runId}:${suffix}:tenant=1:org=1:month=${month}`
   const departmentId = await createDepartment(api, suffix)
   const fixture = {
     scenario: scenarioUnderTest, month, suffix, departmentId, remark,
-    runId: record.runId, tenantId: '1', caseId: caseRecord.id
+    runId: record.runId, tenantId: '1', caseId: caseRecord.id,
+    // 远期月份分配证据：分配前既有最新月份 + 本轮独占月份，供 COST-036 证明空月来源。
+    allocationProvenance: {
+      allocatedMonth: month,
+      allocatedMonths: months,
+      latestExistingMonth: allocation.latestExisting,
+      allocatedAfterEveryExistingMonth: allocation.latestExisting === null ||
+        months.every((value) => value > allocation.latestExisting)
+    }
   }
   caseRecord.fixtures = { ...(caseRecord.fixtures || {}), costScenario: fixture }
 
