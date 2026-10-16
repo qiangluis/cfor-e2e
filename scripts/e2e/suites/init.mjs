@@ -748,7 +748,7 @@ export const INIT_CASE_CATALOG_EVIDENCE = Object.freeze({
     },
     3: { checks: ['依赖子系统停用时下游启用被拒绝，且依赖已恢复（写侧反例）'] },
     4: { reason: '当前租户没有已产生正式业务事实且可锁定停用的子系统样本' },
-    5: { checks: ['保存后可见菜单不越过套餐边界（权限与套餐菜单均可读）'] }
+    5: { checks: ['平台专属菜单不下发租户套餐且已交付菜单不越过套餐边界（权限与套餐菜单均可读）'] }
   },
   'PB003-001': {
     0: {
@@ -2086,7 +2086,8 @@ const runCaseCore = async (context, dependencies = {}) => {
         caseRecord.notes.push('缺前置：crm.core 已锁定，依赖门禁反例未执行。')
       }
     }
-    // 顶部菜单不越过套餐边界：读取当前权限菜单，确认授权集合未超出套餐菜单。
+    // 顶部菜单口径：平台专属菜单只对平台租户超级管理员可见，且不进任何租户套餐；
+    // 已经交付到租户套餐的菜单必须被当前租户套餐覆盖，未交付的占位入口不计入套餐边界。
     const permissionResponse = await requestApi(page, 'get', '/admin-api/system/auth/get-permission-info')
     const permissionPayload = await permissionResponse.json().catch(() => null)
     const flattenMenuIds = (items, visibleOnly = false) => (items || []).flatMap((item) => {
@@ -2098,6 +2099,20 @@ const runCaseCore = async (context, dependencies = {}) => {
     const allPermissionMenuIds = flattenMenuIds(permissionPayload?.data?.menus)
     const permissionMenuIds = flattenMenuIds(permissionPayload?.data?.menus, true)
     const menuCount = permissionMenuIds.length
+    const roleCodes = (permissionPayload?.data?.roles || []).map((code) => String(code))
+    const isPlatformAdministrator = String(config.tenantId) === '1' && roleCodes.includes('super_admin')
+    const platformOnlyRows = await readDb(caseRecord, 'platform-only-menu-subtree',
+      "WITH RECURSIVE platform_menu AS (" +
+      "SELECT id FROM system_menu WHERE deleted=b'0' AND platform_only=b'1' " +
+      "UNION ALL SELECT child.id FROM system_menu child " +
+      "JOIN platform_menu parent ON child.parent_id=parent.id WHERE child.deleted=b'0') " +
+      'SELECT id FROM platform_menu')
+    const platformOnlyIds = new Set(platformOnlyRows.map((row) => String(row[0])))
+    const deliveredRows = await readDb(caseRecord, 'tenant-package-delivered-menus',
+      'SELECT DISTINCT entry.menu_id FROM system_tenant_package package_row ' +
+      'JOIN JSON_TABLE(IF(JSON_VALID(package_row.menu_ids), package_row.menu_ids, JSON_ARRAY()), ' +
+      "'$[*]' COLUMNS (menu_id BIGINT PATH '$')) entry WHERE package_row.deleted=b'0'")
+    const deliveredMenuIds = new Set(deliveredRows.map((row) => String(row[0])))
     const tenantResponse = await requestApi(
       page, 'get', `/admin-api/system/tenant/get?id=${encodeURIComponent(config.tenantId)}`
     )
@@ -2109,17 +2124,30 @@ const runCaseCore = async (context, dependencies = {}) => {
     const packagePayload = await packageResponse.json().catch(() => null)
     const packageMenuIds = new Set((packagePayload?.data?.menuIds || []).map(String))
     const packageMenuCount = packageMenuIds.size
+    const outsideMenus = permissionMenuIds.filter((id) => !packageMenuIds.has(id))
+    const outsideDeliveredMenus = outsideMenus.filter(
+      (id) => !platformOnlyIds.has(id) && deliveredMenuIds.has(id))
+    const packagePlatformLeaks = [...packageMenuIds].filter((id) => platformOnlyIds.has(id))
+    const deliveredPlatformLeaks = [...deliveredMenuIds].filter((id) => platformOnlyIds.has(id))
+    const visiblePlatformMenus = permissionMenuIds.filter((id) => platformOnlyIds.has(id)).length
     const withinPackage = tenantResponse.ok() && isSuccessfulPayload(tenantPayload) &&
       /^[1-9]\d*$/.test(String(packageId || '')) &&
       packageResponse.ok() && isSuccessfulPayload(packagePayload) &&
       packageMenuCount > 0 && menuCount > 0 &&
-      permissionMenuIds.every((id) => packageMenuIds.has(id))
+      platformOnlyIds.size > 0 && deliveredMenuIds.size > 0 &&
+      packagePlatformLeaks.length === 0 && deliveredPlatformLeaks.length === 0 &&
+      outsideDeliveredMenus.length === 0 &&
+      (isPlatformAdministrator ? visiblePlatformMenus > 0 : outsideMenus.length === 0)
     caseRecord.checks.push({
-      name: '保存后可见菜单不越过套餐边界（权限与套餐菜单均可读）',
+      name: '平台专属菜单不下发租户套餐且已交付菜单不越过套餐边界（权限与套餐菜单均可读）',
       passed: withinPackage,
       details: `tenantPackage=${packageId || 'missing'} menus=${menuCount} packageMenus=${packageMenuCount} ` +
-        `allPermissionMenus=${allPermissionMenuIds.length} ` +
-        `outside=${permissionMenuIds.filter((id) => !packageMenuIds.has(id)).join(',') || 'none'}`
+        `platformOnly=${platformOnlyIds.size} platformAdmin=${isPlatformAdministrator} ` +
+        `visiblePlatformMenus=${visiblePlatformMenus} ` +
+        `packagePlatformLeaks=${packagePlatformLeaks.join(',') || 'none'} ` +
+        `deliveredPlatformLeaks=${deliveredPlatformLeaks.join(',') || 'none'} ` +
+        `outsideDeliveredMenus=${outsideDeliveredMenus.join(',') || 'none'} ` +
+        `outsideTotal=${outsideMenus.length} allPermissionMenus=${allPermissionMenuIds.length}`
     })
     caseRecord.evidence.push(
       `真实写侧：停用/启用 erp.supplier-portal 并回读状态；非法月份 2026-13 被拒绝；` +

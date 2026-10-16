@@ -32,3 +32,52 @@ WHERE deleted = 0 AND execution_status IS NULL AND name LIKE 'E2E-SALES-%';
 ```
 
 - 影响行数：8；执行后标准租户内 `E2E-SALES-%` 的 NULL 计数为 0。
+
+## 2026-10-17 平台/租户菜单边界与期初口径验收（本地一次性修正）
+
+本轮验收「平台管理只对平台管理员可见」与「ERP 期初基准日按启用月份推导」时，对本地标准库
+（`cfor_admin_standard`）做了以下一次性处理，均不属于主线结构变更。
+
+### 1. Flyway 校验和修复（`V202610181200`）
+
+- 现象：后端启动报 `Migration checksum mismatch for migration version 202610181200`，
+  库内记录 `148906153`，本地文件解析值 `909587217`。根因是该迁移文件在 14:30 应用后又被编辑并提交，
+  库内校验和停留在旧内容上，属于历史遗留。
+- 处理（等价于 Flyway `repair`，只改库内记录，不改迁移文件）：
+
+```sql
+UPDATE cfor_admin_standard.flyway_schema_history
+SET checksum = 909587217
+WHERE version = '202610181200' AND success = 1;
+```
+
+- 影响行数：1。修复后 `V202610181500__complete_tenant_package_delivered_menus` 正常应用。
+
+### 2. 租户套餐补齐
+
+- 由主线迁移 `V202610181500__complete_tenant_package_delivered_menus.sql` 完成，不在本文件重复登记。
+  标准套餐 111 菜单数 2874 → 2876（补入「编码管理」「模板设置」）；159 个套餐均无平台专属菜单。
+
+### 3. Grok 走查租户管理员密码重置
+
+- 背景：租户「Grok走查-1009」（`tenant_id=2108246701542690817`）的 `grokadmin` 密码无记录，
+  无法用于「业务租户看不到平台管理」的反向验收。
+- 处理：把 `grokadmin.password` 重置为标准租户 `admin` 的 bcrypt 值，即密码与本地 `admin` 一致。
+- 影响行数：1。该租户为本地走查用测试租户，不涉及真实客户数据。
+
+### 4. 期初口径验收产生的临时单据
+
+- 验收过程中通过真实接口创建了 4 条期初单据（2 条期初销售出库、2 条期初采购入库，均为 `status=10` 草稿）。
+- 验收后按逻辑删除清理（主表与明细同时置 `deleted=1`），未触发任何库存/结算回写：
+
+```sql
+UPDATE erp_sale_out SET deleted=b'1' WHERE id IN (2111135302526832641,2111135321044684802,2111136824996392961);
+UPDATE erp_sale_out_items SET deleted=b'1' WHERE out_id IN (2111135302526832641,2111135321044684802,2111136824996392961);
+UPDATE erp_purchase_in SET deleted=b'1' WHERE id IN (2111135375918764034,2111135376208171009,2111136825482932225);
+UPDATE erp_purchase_in_items SET deleted=b'1' WHERE in_id IN (2111135375918764034,2111135376208171009,2111136825482932225);
+```
+
+### 5. 本地运行包快照清理
+
+- `/Users/liuqiang/.cfor/runtime/local-server/run.*` 每启动一次复制一份 1.4G 运行包，
+  累积 80 个目录占满磁盘导致启动失败；已全部清理（脚本每次启动会重新复制）。
