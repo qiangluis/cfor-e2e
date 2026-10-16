@@ -503,15 +503,18 @@ export async function login (page, { check, dumpDir, credentials, returnContext 
     }
     // Authentication completes before the dynamic menu and route scope finish mounting.
     // Wait for the admin shell to settle so deep-link checks do not race route registration.
+    // The shell boot is shared with parallel work on the same dev server, so use the
+    // configured browser timeout instead of a hardcoded 30s.
+    const shellTimeout = config.browserTimeoutMs
     await page
       .getByText('正在加载系统中...', { exact: true })
       .first()
-      .waitFor({ state: 'hidden', timeout: 30000 })
+      .waitFor({ state: 'hidden', timeout: shellTimeout })
       .catch(() => {})
     await page
       .locator('[class*="-user-info"]')
       .first()
-      .waitFor({ state: 'visible', timeout: 30000 })
+      .waitFor({ state: 'visible', timeout: shellTimeout })
     check?.step('page', '登录后离开 /login', true, page.url())
     check?.step('page', '本地 token 已写入', Boolean(token), keys.slice(0, 10).join(','))
     if (!token) throw new Error('登录成功后未读取到 token')

@@ -611,8 +611,18 @@ export const hasCostFormalReportEvidence = (caseRecord, caseId = caseRecord?.id)
         '/cost-management/results/enterprise-full-cost', '/reports/cost/results/enterprise-full-cost'
       ])
     } else if (caseId === 'COST-036') {
-      // Original allocated-empty-month provenance is deliberately not inferred from present-day facts.
-      return false
+      // Allocated-empty-month provenance cannot be inferred from present-day facts, so the
+      // run-owned fixture records the month census taken *before* it allocated the far-future
+      // month; re-validate that recorded provenance instead of assuming it.
+      const retained = proof.assertions[COST_FORMAL_REPORT_CHECKS['COST-036'].retained]?.data
+      assert.ok(retained?.allocatedMonth && retained.periodId && retained.modelId,
+        'Missing run-owned far-future allocation provenance')
+      assert.equal(retained.allocatedAfterEveryExistingMonth, true,
+        'Far-future month must be allocated after every month that already existed')
+      assert.ok(retained.ownedMonthCensus.includes(retained.allocatedMonth),
+        'Allocated month must be part of the run-owned month census')
+      assert.ok(String(retained.allocatedMonth) > String(retained.latestExistingMonthBeforeAllocation),
+        'Allocated month must be later than the last pre-existing month')
     } else if (caseId === 'COST-037') {
       assert.ok(proof.samples.some((item) => assertMakeBuy(item.report, item.facts) > 0))
       assert.equal(proof.pages.length, 1)
@@ -845,6 +855,7 @@ export const runCostFormalReportClosure = async (input, dependencies = {}) => {
             caseId: sample.fixture.caseId,
             allocatedMonth: sample.provenance.allocatedMonth,
             latestExistingMonthBeforeAllocation: sample.provenance.latestExistingMonth,
+            allocatedAfterEveryExistingMonth: sample.provenance.allocatedAfterEveryExistingMonth === true,
             periodId: idOf(period.id),
             modelId: idOf(model.id),
             ownedMonthCensus: ownedMonths.sort()
