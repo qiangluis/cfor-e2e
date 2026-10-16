@@ -2,11 +2,45 @@ import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
 // PB-268～PB-271 销售对账中心自动化案例索引。
-export const cases = ['ERP-SALE-RECON-001', 'ERP-SALE-RECON-002']
+export const cases = ['ERP-SALE-RECON-001', 'ERP-SALE-RECON-002', 'ERP-SALE-RECON-003']
 
 const unwrap = (response) => response?.data
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+  if (caseId === 'ERP-SALE-RECON-003') {
+    const token = await login(page)
+    const api = createApiClient({ token, record })
+    // PB-271：导出必须走独立权限键 erp:sale-reconciliation:export，
+    // 返回真实 Excel 流而不是 DefaultController 兜底。
+    const exported = await api.download('/erp/sale-reconciliation/export-excel?pageNo=1&pageSize=100')
+    const contentType = String(exported?.contentType || '')
+    const buffer = exported?.buffer
+    const isSpreadsheet =
+      /spreadsheet|excel|octet-stream/i.test(contentType) ||
+      buffer?.subarray(0, 2).toString('latin1') === 'PK'
+    caseRecord.checks.push({
+      name: 'PB-271 销售对账导出返回真实 Excel 文件',
+      passed: Boolean(buffer?.length) && isSpreadsheet,
+      details: `contentType=${contentType}, bytes=${buffer?.length ?? 0}`
+    })
+    caseRecord.checks.push({
+      name: 'PB-271 导出响应带下载文件名',
+      passed: Boolean(exported?.contentDisposition),
+      details: String(exported?.contentDisposition || '')
+    })
+
+    await openRoute(page, '/erp/sale/reconciliation', { readyText: '销售对账' })
+    const bodyText = await page.locator('body').innerText()
+    caseRecord.checks.push({
+      name: 'PB-271 销售对账页面提供导出入口',
+      passed: page.url().includes('/erp/sale/reconciliation') && bodyText.includes('导出'),
+      details: page.url()
+    })
+    await saveScreenshot(page, outputDir, 'erp-sale-reconciliation-export', record)
+    caseRecord.evidence.push('销售对账导出接口真实文件流与页面导出入口校验')
+    return { token, api }
+  }
+
   if (caseId === 'ERP-SALE-RECON-002') {
     const token = await login(page)
     const api = createApiClient({ token, record })

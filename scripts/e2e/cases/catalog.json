@@ -8847,6 +8847,40 @@
           "reverse": [
             "使用独立测试对账单与幂等键，不修改正式对账、开票与核销状态"
           ]
+        },
+        {
+          "id": "CP-164-168-002",
+          "title": "PB-164/PB-168 签收凭证上传与发票接收状态回执",
+          "status": "READY",
+          "preconditions": [
+            "客户门户登录态可用",
+            "存在映射到当前客户的销售出库单与销售发票"
+          ],
+          "routes": [
+            "/customer/deliveries",
+            "/customer/invoices"
+          ],
+          "assertions": [
+            "签收凭证/异常证据经 /customer/file/upload 上传，场景为 RECEIPT，仅接受图片与 PDF",
+            "签收确认与异常反馈落 attachmentName/attachmentUrl 到 customer_portal_delivery_receipt",
+            "发票接收状态反馈写入 customer_portal_invoice_receipt，不修改销售发票财务字段",
+            "接收状态只允许 RECEIVED/DISPUTED，重复 idempotencyKey 不新增第二条回执",
+            "页面回读 /customer/invoice/receipt/list 展示已反馈状态"
+          ],
+          "api": [
+            "/customer-api/customer/file/upload",
+            "/customer-api/customer/delivery/receipt",
+            "/customer-api/customer/invoice/receipt",
+            "/customer-api/customer/invoice/receipt/list"
+          ],
+          "database": [
+            "customer_portal_delivery_receipt",
+            "customer_portal_invoice_receipt",
+            "sale_invoice"
+          ],
+          "reverse": [
+            "使用独立测试出库单与发票与幂等键，不修改正式发票与签收状态"
+          ]
         }
       ]
     },
@@ -9328,6 +9362,77 @@
       ]
     },
     {
+      "id": "crm-contract-service-period",
+      "title": "PB-238 CRM 合同结果分流（售后资产服务期承接）",
+      "status": "PARTIAL",
+      "dependsOn": [
+        "smoke",
+        "init",
+        "crm"
+      ],
+      "cases": [
+        {
+          "id": "CRM-CONTRACT-SERVICE-PERIOD-001",
+          "title": "合同结果分流预览与合同台账入口只读校验",
+          "status": "PARTIAL",
+          "preconditions": [
+            "已登录管理端并具备 crm:contract-service-period:query 权限",
+            "存在一条已签署、未作废的真实 CRM 合同（无合同时案例退化为契约校验）"
+          ],
+          "routes": [
+            "/crm/jixu/contract"
+          ],
+          "assertions": [
+            "/crm/contract/page 返回 signStatus，只有 SIGNED(30) 合同才允许结果分流",
+            "/crm/contract-service-period/preview 返回 recommendedAction 与建议服务期起止",
+            "客户已有售后资产时建议 SERVICE_PERIOD_EXTEND，无资产时建议 PROJECT_HANDOVER",
+            "合同台账页面渲染服务期承接入口所在工作台"
+          ],
+          "api": [
+            "/crm/contract/page",
+            "/crm/contract-service-period/preview"
+          ],
+          "database": [
+            "crm_contract",
+            "after_sales_asset_service_period"
+          ],
+          "reverse": [
+            "只读校验，不创建服务期与售后资产"
+          ]
+        },
+        {
+          "id": "CRM-CONTRACT-SERVICE-PERIOD-002",
+          "title": "售后资产服务期追加、归属校验与幂等",
+          "status": "DESIGNED",
+          "preconditions": [
+            "存在一条已签署的续费/运维服务合同",
+            "该合同客户已存在售后资产",
+            "具备 crm:contract-service-period:create 权限"
+          ],
+          "routes": [
+            "/crm/jixu/contract"
+          ],
+          "assertions": [
+            "未签署或已作废合同不能追加服务期",
+            "资产必须归属该合同客户，越权资产返回业务拒绝",
+            "服务期结束日期不得早于开始日期",
+            "CRM 只通过 AfterSalesInboundApi 写入，事实源仍是 after_sales_asset_service_period，不新建 CRM 平行表",
+            "CRM_CONTRACT_SERVICE:{contractId}:{assetId} 幂等键重复请求只返回已有服务期"
+          ],
+          "api": [
+            "/crm/contract-service-period/append"
+          ],
+          "database": [
+            "crm_contract",
+            "after_sales_asset_service_period"
+          ],
+          "reverse": [
+            "测试结束只清理本次追加的服务期记录，不物理删除既有资产"
+          ]
+        }
+      ]
+    },
+    {
       "id": "erp-receivable-receipt-writeoff",
       "title": "PB-276～282 应收、收款到账确认与核销撤销冲销",
       "status": "PARTIAL",
@@ -9500,6 +9605,35 @@
           "reverse": [
             "只读校验，不触发开票或关闭动作"
           ]
+        },
+        {
+          "id": "ERP-SALE-RECON-003",
+          "title": "PB-271 销售对账导出文件与导出权限",
+          "status": "READY",
+          "preconditions": [
+            "已登录管理端并具备 erp:sale-reconciliation:export 权限",
+            "存在可导出的销售对账数据（允许为空，也必须返回合法 Excel）"
+          ],
+          "routes": [
+            "/erp/sale/reconciliation"
+          ],
+          "assertions": [
+            "/erp/sale-reconciliation/export-excel 返回真实 Excel 文件流而不是 404/501 兜底",
+            "导出响应带下载文件名（content-disposition）",
+            "对账页面提供导出入口，导出动作走独立权限键 erp:sale-reconciliation:export 并留痕",
+            "导出不做数据写入，只反映当前筛选条件下的对账单"
+          ],
+          "api": [
+            "/erp/sale-reconciliation/export-excel"
+          ],
+          "database": [
+            "erp_sale_reconciliation",
+            "system_menu",
+            "system_role_menu"
+          ],
+          "reverse": [
+            "只读导出，不创建或修改对账单"
+          ]
         }
       ]
     },
@@ -9647,6 +9781,53 @@
           ],
           "reverse": [
             "只读校验，不创建或修改菜单与业务单据"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "purchase-wms-source",
+      "title": "PB-283 采购发票与应付取数统一到 WMS 采购入库",
+      "status": "PARTIAL",
+      "dependsOn": [
+        "smoke",
+        "procurement",
+        "wms-operation"
+      ],
+      "cases": [
+        {
+          "id": "PUR-WMS-001",
+          "title": "采购发票「关联采购入库」与应付取数统一到 mes_stk_io 采购入库",
+          "status": "PARTIAL",
+          "preconditions": [
+            "已登录管理端并具备 erp:purchase-invoice:query、erp:purchase-in:query 权限",
+            "存在一条已生效的 stock_io_type=101 采购入库单（mes_stk_io）",
+            "已执行 V202610162010 与 V202610161035 迁移"
+          ],
+          "routes": [
+            "/erp/purchase/invoice",
+            "/wireSideWarehouse/in/inPurchase"
+          ],
+          "assertions": [
+            "采购入库事实源为 mes_stk_io（101），单据头返回 settleAmt/settledAmt/invoicedAmt",
+            "mes_stk_io_entry 返回 invoicedQty/invoicedAmt/settleAmt/price/taxRate，供开票与付款取数",
+            "采购发票分页返回 srcBillType/srcBillId，来源类型收敛在 ERP_PURCHASE_ORDER/WMS_PURCHASE_IN/MesOutsourcePayable/OPENING_PURCHASE_IN",
+            "采购入库只保留「仓库 › 入库管理 › 采购入库」一个在用入口，供应链旧入口不再可见",
+            "采购发票页面与采购入库页面在真实浏览器中可打开并渲染"
+          ],
+          "api": [
+            "/mes/stkIo/list",
+            "/erp/purchase-invoice/page",
+            "/system/auth/get-permission-info"
+          ],
+          "database": [
+            "mes_stk_io",
+            "mes_stk_io_entry",
+            "erp_purchase_invoice",
+            "erp_purchase_in"
+          ],
+          "reverse": [
+            "只读验证，不创建或修改单据；erp_purchase_in 只断言停止写入与历史只读"
           ]
         }
       ]

@@ -19,6 +19,8 @@ const context = await browser.newContext({
   viewport: { width: 1440, height: 960 },
   locale: 'zh-CN'
 })
+// 共享 runner 已支持 CFOR_E2E_BROWSER_TIMEOUT_MS，这里保持一致，避免高负载下误判。
+context.setDefaultTimeout(Number(process.env.CFOR_E2E_BROWSER_TIMEOUT_MS || 30000))
 const page = await context.newPage()
 const requests = []
 let twoFactorEnabled = false
@@ -100,6 +102,29 @@ const customerReconciliations = [
     ]
   }
 ]
+
+const customerInvoices = [
+  {
+    id: 'invoice-1',
+    billNo: 'FP-PORTAL-001',
+    billDate: '2026-09-30T12:00:00',
+    billStage: 'CONFIRMED',
+    isEffective: 1,
+    invoiceType: 1,
+    invoiceMoney: '1000.00',
+    isRubric: 0,
+    companyName: '测试客户',
+    fileUrl: 'https://files.cfor.local/invoice-1.pdf'
+  }
+]
+
+const invoiceReceipts = []
+
+/** 1x1 PNG，用于触发 PB-164 签收凭证上传。 */
+const voucherPng = Buffer.from(
+  '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000002000154a24f5d0000000049454e44ae426082',
+  'hex'
+)
 
 try {
   await page.route('**/customer/config.json', async (route) => {
@@ -300,7 +325,39 @@ try {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ code: 0, data: { list: [], total: 0 } })
+      body: JSON.stringify({ code: 0, data: { list: customerInvoices, total: customerInvoices.length } })
+    })
+  })
+  // PB-164 签收凭证/异常证据上传：客户门户独立文件通道，先校验门户会话再落文件资产
+  await page.route('**/customer-api/customer/file/upload', async (route) => {
+    const request = route.request()
+    requests.push({
+      url: request.url(),
+      headers: request.headers(),
+      body: request.postData() || ''
+    })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ code: 0, data: 'https://files.cfor.local/voucher.png' })
+    })
+  })
+  // PB-168 发票接收状态回执：只记录门户回执，不回写发票财务字段
+  await page.route('**/customer-api/customer/invoice/receipt/list**', async (route) => {
+    requests.push({ url: route.request().url(), headers: route.request().headers() })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ code: 0, data: invoiceReceipts })
+    })
+  })
+  await page.route('**/customer-api/customer/invoice/receipt', async (route) => {
+    const request = route.request()
+    requests.push({ url: request.url(), headers: request.headers(), body: request.postDataJSON() })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ code: 0, data: 7 })
     })
   })
   await page.route('**/customer-api/customer/invoice/request', async (route) => {
@@ -467,11 +524,25 @@ try {
   await page.waitForURL('**/customer/deliveries')
   await page.getByText('CK2609300001', { exact: true }).waitFor({ state: 'visible' })
   await page.getByRole('button', { name: '签收' }).first().click()
+  // PB-164：签收凭证先走门户独立文件通道，再随签收确认一起落库
+  await page
+    .locator('.el-dialog input[type="file"]')
+    .first()
+    .setInputFiles({ name: 'voucher.png', mimeType: 'image/png', buffer: voucherPng })
+  await page.getByText('凭证上传成功', { exact: false }).first().waitFor({ state: 'visible' })
+  const uploadRequest = requests.find((request) => request.url.endsWith('/customer/file/upload'))
+  assert.ok(uploadRequest, 'PB-164 签收凭证必须通过 /customer/file/upload 上传')
+  assert.ok(
+    String(uploadRequest?.body || '').includes('RECEIPT'),
+    'PB-164 上传场景必须声明 RECEIPT'
+  )
   await page.locator('.el-dialog').getByRole('button', { name: '确认签收' }).click()
   await page.getByText('签收已提交').first().waitFor({ state: 'visible' })
   const receiptRequest = requests.find((request) => request.url.endsWith('/customer/delivery/receipt'))
   assert.equal(receiptRequest?.body?.receiptType, 'RECEIVED')
   assert.ok(receiptRequest?.body?.idempotencyKey)
+  assert.equal(receiptRequest?.body?.attachmentUrl, 'https://files.cfor.local/voucher.png')
+  assert.equal(receiptRequest?.body?.attachmentName, 'voucher.png')
 
   await page.getByRole('link', { name: '销售对账' }).click()
   await page.waitForURL('**/customer/reconciliations')
@@ -496,6 +567,27 @@ try {
   // 校验失败不会自动关闭弹窗，先收起再切页，避免遮罩拦截后续点击
   await page.locator('.el-dialog').getByRole('button', { name: '取消' }).click()
   await page.locator('.el-overlay').first().waitFor({ state: 'hidden' })
+
+  // PB-168：发票接收状态回执只记录客户反馈，不改动发票本身
+  await page.getByText('FP-PORTAL-001', { exact: true }).waitFor({ state: 'visible' })
+  await page.getByRole('button', { name: '反馈接收' }).first().click()
+  await page.getByText('反馈发票接收状态', { exact: true }).waitFor({ state: 'visible' })
+  // 原生 radio 被样式层覆盖，点击可见的 el-radio 标签
+  await page.locator('.el-dialog .el-radio', { hasText: '有异议' }).click()
+  await page.getByRole('textbox', { name: '反馈说明' }).fill('发票金额与对账单不一致')
+  await page.locator('.el-dialog').getByRole('button', { name: '提交反馈' }).click()
+  await page.getByText('接收状态已反馈', { exact: false }).first().waitFor({ state: 'visible' })
+  const invoiceReceiptRequest = requests.find((request) =>
+    request.url.endsWith('/customer/invoice/receipt')
+  )
+  assert.equal(invoiceReceiptRequest?.body?.invoiceId, 'invoice-1')
+  assert.equal(invoiceReceiptRequest?.body?.receiveStatus, 'DISPUTED')
+  assert.equal(invoiceReceiptRequest?.body?.receiveNote, '发票金额与对账单不一致')
+  assert.ok(invoiceReceiptRequest?.body?.idempotencyKey)
+  assert.ok(
+    requests.some((request) => request.url.endsWith('/customer/invoice/receipt/list')),
+    'PB-168 页面必须回读接收状态列表'
+  )
 
   await page.getByRole('link', { name: '结算与收款' }).click()
   await page.waitForURL('**/customer/receivables')
@@ -550,7 +642,9 @@ try {
   const logoutRequest = requests.find((request) => request.url.endsWith('/customer/auth/logout'))
   assert.equal(logoutRequest?.headers.authorization, 'Bearer customer-access-token')
 
-  console.log('PASS customer portal isolated login, storage, order, delivery, reconciliation and feedback')
+  console.log(
+    'PASS customer portal isolated login, storage, order, delivery receipt voucher, reconciliation, invoice receipt and feedback'
+  )
 } finally {
   await context.close()
   await browser.close()
