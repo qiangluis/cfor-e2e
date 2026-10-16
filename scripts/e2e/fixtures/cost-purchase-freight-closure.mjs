@@ -7,6 +7,7 @@ import { verifyPurchaseFreightPage } from './cost-purchase-freight-page.mjs'
 export const COST_PURCHASE_FREIGHT_CHECKS = Object.freeze({
   wmsSource: 'COST-011 专属应付 freight 复用已审核采购入库对应唯一WMS来源',
   expense: 'COST-011 已生效应付 freight 精确映射PURCHASE_FREIGHT并写入expenseAmount',
+  payableScope: 'COST-011 到岸费用来源按应付主键解析出真实应付结算状态',
   shared: 'COST-011 采购费用与采购入库共用PURCHASE来源快照且刷新保持DRAFT',
   zero: 'COST-011 未生效或零值应付不进入确认采购费用来源'
 })
@@ -452,10 +453,20 @@ export const assertPurchaseFreightSnapshot = ({
     Number(row.expenseAmount || 0) <= 0)) {
     throw new Error('COST-011零值或非正费用进入了确认采购费用来源')
   }
+  // 到岸费用的上游是应付明细，追溯键只能是 fin_payable 主键；按 WMS 入库主键反查必然落空。
+  if (line.payableKeyScope !== 'FREIGHT_PAYABLE' ||
+      String(line.payableSourceBillId) !== String(wmsSource.wms.id) ||
+      String(line.payableNo) !== positive.billNo ||
+      !['UNPAID', 'PARTIAL', 'PAID'].includes(line.payableSettlementStatus) ||
+      Number(line.payableAmount) <= 0) {
+    throw new Error('COST-011 到岸费用来源未按应付主键解析出应付结算状态')
+  }
+  // 采购入库来源已切到 WMS 采购入库事实源（`24d78b2ab`）：成本来源主从 ID 是 mes_stk_io 的主从 ID，
+  // ERP 采购入库单只作为上游单据，不能再当作来源身份比对。
   const receipt = snapshot.lines.filter((row) =>
     row?.sourceType === 'PURCHASE_RECEIPT' &&
-    String(row.sourceId) === String(wmsSource.purchaseIn.id) &&
-    String(row.sourceLineId) === String(wmsSource.purchaseItemId))
+    String(row.sourceId) === String(wmsSource.wms.id) &&
+    String(row.sourceLineId) === String(wmsSource.entry.id))
   if (receipt.length !== 1) {
     throw new Error('COST-011专属采购入库与freight未共用同一PURCHASE快照')
   }
@@ -564,7 +575,7 @@ export async function runCostPurchaseFreightClosure ({
     })
     if (page || dependencies.verifyBrowser) {
       closure.browser = await (dependencies.verifyBrowser || verifyPurchaseFreightPage)({
-        page, outputDir, record, fixture, snapshot, positive, zero
+        page, outputDir, record, fixture, snapshot, positive, zero, wmsSource
       })
       caseRecord.checks.push({
         name: 'COST-011真实采购页面调用正式刷新并显示同期间入库及12.34费用，无共享草稿写入',
@@ -588,8 +599,17 @@ export async function runCostPurchaseFreightClosure ({
       name: COST_PURCHASE_FREIGHT_CHECKS.shared,
       passed: true,
       details: `snapshotKey=PURCHASE; status=${snapshot.status}; ` +
-        `receiptSource=${wmsSource.purchaseIn.id}:${wmsSource.purchaseItemId}; ` +
+        `receiptSource=${wmsSource.wms.id}:${wmsSource.entry.id}; ` +
+        `erpPurchaseIn=${wmsSource.purchaseIn.id}:${wmsSource.purchaseItemId}; ` +
         `freightSource=${positive.id}:${positive.entryId}`
+    })
+    caseRecord.checks.push({
+      name: COST_PURCHASE_FREIGHT_CHECKS.payableScope,
+      passed: true,
+      details: `payableId=${proof.freightLine.payableSourceBillId}; ` +
+        `payableNo=${proof.freightLine.payableNo}; ` +
+        `settlement=${proof.freightLine.payableSettlementStatus}; ` +
+        `payableAmount=${proof.freightLine.payableAmount}`
     })
     caseRecord.checks.push({
       name: COST_PURCHASE_FREIGHT_CHECKS.zero,
@@ -632,8 +652,8 @@ export async function runCostPurchaseFreightClosure ({
       )
       if (!afterCleanup.lines.some((row) =>
         row.sourceType === 'PURCHASE_RECEIPT' &&
-        String(row.sourceId) === String(wmsSource.purchaseIn.id) &&
-        String(row.sourceLineId) === String(wmsSource.purchaseItemId))) {
+        String(row.sourceId) === String(wmsSource.wms.id) &&
+        String(row.sourceLineId) === String(wmsSource.entry.id))) {
         throw new Error('COST-011清理后专属采购入库明细来源丢失')
       }
       caseRecord.checks.push({

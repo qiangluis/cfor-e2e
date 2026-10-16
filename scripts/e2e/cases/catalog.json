@@ -5376,6 +5376,7 @@
           "assertions": [
             "采购到岸费用复用fin_payable_entry.freight，不新增平行费用事实表",
             "费用来源映射为PURCHASE_FREIGHT并写入expenseAmount",
+            "到岸费用按fin_payable主键解析应付结算状态，返回payableNo与UNPAID/PARTIAL/PAID状态",
             "采购费用与采购入库/退回共用PURCHASE来源快照且自动刷新保持DRAFT",
             "没有已生效采购费用时不把零值冒充已确认费用"
           ],
@@ -5654,6 +5655,9 @@
           ],
           "assertions": [
             "采购/委外来源刷新返回应付金额、已核销金额、未核销金额和UNPAID/PARTIAL/PAID/NOT_AVAILABLE状态",
+            "已生效采购发票应付优先、未开票回退采购订单主键：命中发票口径时payableKeyScope为PURCHASE_INVOICE且payableSourceBillType为PurInvoice",
+            "到岸费用来源本身就是应付明细，按fin_payable主键解析payableKeyScope=FREIGHT_PAYABLE",
+            "同一来源多口径共存时只采用最高优先级口径，其余口径只在payableCoexistedScopes登记，金额不合并",
             "应付结算状态只冻结在来源payload快照中，不改变采购入库、采购退回或委外成本金额",
             "付款和核销不重复进入经营费用，也不替代成本确认金额",
             "来源刷新仍返回DRAFT，人工确认后才可进入正式成本发布"
@@ -5686,6 +5690,7 @@
             "采购/委外来源刷新返回payableTraceStatus，取值为AVAILABLE或NOT_AVAILABLE",
             "存在轨迹时payableSettlementTraces逐行给出PAYMENT/WRITE_OFF类型、单号、金额和CONFIRMED/VOIDED状态",
             "付款与核销轨迹只冻结在来源payload快照中，不改变采购入库、采购退回或委外成本金额，也不与应付结算金额重复相加",
+            "真实付款单解析为CONFIRMED且单号金额一致的PAYMENT轨迹，自动核销单解析为CONFIRMED的WRITE_OFF轨迹，并据此推进已核销金额与结算状态",
             "来源刷新仍返回DRAFT，人工确认后才可进入正式成本发布"
           ],
           "api": [

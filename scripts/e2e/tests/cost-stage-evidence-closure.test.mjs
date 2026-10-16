@@ -48,14 +48,19 @@ const evidence = ({
   const receipt = { id: '301', orderId: '302', status: 20, businessType: 'NORMAL',
     no: `IN-${suffix}`, inTime: '2200-01-06T10:00:00',
     items: [{ id: '304', productId: '303', count: 2, totalPrice: 123.45 }] }
+  // 采购来源主从 ID 是 WMS 采购入库（mes_stk_io）主从 ID。
+  const wms = { wmsId: '305', entryId: '306' }
   const collectSource = { id: '106', periodId: '101', snapshotKey: 'PURCHASE',
     versionNo: fixture.versionNo, snapshotHash: 'c'.repeat(64), status: 'CONFIRMED',
-    lines: [{ sourceModule: 'ERP', sourceType: 'PURCHASE_RECEIPT', sourceId: receipt.id,
-      sourceLineId: '304', sourceNo: receipt.no, sourceVersion: 'receipt-v1',
+    lines: [{ sourceModule: 'ERP', sourceType: 'PURCHASE_RECEIPT', sourceId: wms.wmsId,
+      sourceLineId: wms.entryId, sourceNo: receipt.no, sourceVersion: 'receipt-v1',
       productCode: '303', quantity: 2, materialAmount: 123.45, sourceStatus: 'CONFIRMED' }] }
   const collectDraft = { ...clone(collectSource), status: 'DRAFT',
     lines: collectSource.lines.map((row) => ({ ...row, sourceStatus: 'DRAFT' })) }
-  if (formalCollect) Object.assign(fixture, { materialId: '303', purchaseInId: '301', purchaseOrderId: '302' })
+  if (formalCollect) Object.assign(fixture, {
+    materialId: '303', purchaseInId: '301', purchaseOrderId: '302',
+    wmsReceiptId: wms.wmsId, wmsReceiptEntryId: wms.entryId
+  })
   const resultHash = 'b'.repeat(64)
   const sourceSnapshotHash = createHash('sha256')
     .update(`${source.snapshotHash}|${formalCollect ? `${collectSource.snapshotHash}|` : ''}`).digest('hex')
@@ -130,7 +135,8 @@ const evidence = ({
         ...(formalCollect ? [['hash', collectSource.snapshotHash]] : [])] : []),
       ['blocking', '0'],
       ...(formalCollect && phase > 0 ? [['collect-line', '106', 'ERP', 'PURCHASE_RECEIPT',
-        '301', '304', 'receipt-v1', '303', '2.000000', '123.450000', index < 3 ? 'DRAFT' : 'CONFIRMED']] : [])
+        wms.wmsId, wms.entryId, 'receipt-v1', '303', '2.000000', '123.450000',
+        index < 3 ? 'DRAFT' : 'CONFIRMED']] : [])
     ]
     return { period, hits, database }
   })
@@ -142,7 +148,7 @@ const evidence = ({
     fixture, observations, runId,
     closure: { caseId: 'COST-034', runId, tenantId: '1', periodId: '101',
       trialId: '104', publicationId: '105', batchNo: trace.batchNo, cleanupComplete: true,
-      collectPreparation: formalCollect ? { available: true, receipt } : {
+      collectPreparation: formalCollect ? { available: true, receipt, wms } : {
         available: false, code: 'COLLECT_PURCHASE_PREREQUISITES_MISSING', details: { publishedQualityPlan: false }
       },
       ...(formalCollect ? { collectSource } : {}),

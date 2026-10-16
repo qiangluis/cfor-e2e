@@ -186,6 +186,59 @@ test('portal announcement polling does not block case reuse', async () => {
   await observer.flushResponses({ timeoutMs: 20, quietMs: 0 })
 })
 
+test('portal home workspace prefetch burst does not block case reuse', async () => {
+  const page = new EventEmitter()
+  page.url = () => 'http://127.0.0.1:9151/index'
+  const observer = observePage(page, { failedApiResponses: [] })
+  // 登录后门户首页会并发预取这批聚合小部件；用例随即整页跳转时它们会被浏览器取消，
+  // Playwright 不会补发 requestfinished/requestfailed，必须不阻塞上下文复用。
+  const prefetch = [
+    'workbench/todo/page?category=all&pageNo=1&pageSize=8',
+    'bpm/task/done-page?pageNo=1&pageSize=8',
+    'bpm/process-instance/my-page?pageNo=1&pageSize=8',
+    'bpm/process-instance/copy/page?pageNo=1&pageSize=8',
+    'system/notify-message/my-page?pageNo=1&pageSize=8',
+    'system/notice/page?pageNo=1&pageSize=6',
+    'hrm/survey/my-pending',
+    'oa/schedule/my-page?pageNo=1&pageSize=100',
+    'oa/schedule/received-page?pageNo=1&pageSize=100',
+    'oa/meeting-booking/my-range?rangeStart=2026-10-01&rangeEnd=2026-10-31',
+    'oa/task/received-page?pageNo=1&pageSize=5',
+    'oa/plan/page?pageNo=1&pageSize=5',
+    'oa/contact/my-page?pageNo=1&pageSize=6',
+    'erp/sale-order/page?pageNo=1&pageSize=5&tracked=true',
+    'pms/pm/project/page?pageNo=1&pageSize=5',
+    'pms/kb/favorite/page?pageNo=1&pageSize=6',
+    'pm/daily-report/page?pageNo=1&pageSize=100&reportType=DAILY&reporterId=1',
+    'crm/work-report/page?pageNo=1&pageSize=100&reportType=WEEKLY&ownerUserId=1',
+    'system/user-favorite/page?pageNo=1&pageSize=5'
+  ]
+  for (const path of prefetch) {
+    page.emit('request', {
+      url: () => `http://127.0.0.1:9151/admin-api/${path}`,
+      method: () => 'GET',
+      resourceType: () => 'xhr',
+      failure: () => null
+    })
+  }
+  await observer.flushResponses({ timeoutMs: 50, quietMs: 0 })
+})
+
+test('the same list endpoints still block when a business page issues them', async () => {
+  const page = new EventEmitter()
+  page.url = () => 'http://127.0.0.1:9151/pms/pm/project'
+  const observer = observePage(page, { failedApiResponses: [] })
+  // 首页聚合预取的放行条件是「路径命中且发起时就在门户首页文档」。
+  page.emit('request', {
+    url: () => 'http://127.0.0.1:9151/admin-api/pms/pm/project/page?pageNo=1&pageSize=20',
+    method: () => 'GET',
+    resourceType: () => 'xhr',
+    failure: () => null
+  })
+  await assert.rejects(observer.flushResponses({ timeoutMs: 50, quietMs: 0 }),
+    /禁止复用当前上下文.*project\/page/)
+})
+
 test('a drain timeout rejects navigation reuse and reports the pending request', async () => {
   const page = new EventEmitter()
   const observer = observePage(page, { failedApiResponses: [] })

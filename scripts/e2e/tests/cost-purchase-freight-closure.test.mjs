@@ -41,7 +41,7 @@ function makeApi ({
   leaveEntries = false,
   failSubmitSuffix,
   afterDelete = ok(null),
-  receiptLineAfterCleanup = '9202'
+  receiptLineAfterCleanup = '9602'
 } = {}) {
   const calls = []
   const payables = new Map()
@@ -106,14 +106,20 @@ function makeApi ({
               componentCode: 'PURCHASE_FREIGHT',
               quantity: 0,
               materialAmount: 0,
-              expenseAmount: entry.freight
+              expenseAmount: entry.freight,
+              // 到岸费用追溯键是 fin_payable 主键，回读口径按应付的上游 src_bill_id 冻结。
+              payableKeyScope: 'FREIGHT_PAYABLE',
+              payableSourceBillId: wmsSource.wms.id,
+              payableNo: payable.billNo,
+              payableSettlementStatus: 'UNPAID',
+              payableAmount: entry.freight
             })
           }
         }
         lines.push({
           sourceType: 'PURCHASE_RECEIPT',
-          sourceId: fixture.purchaseInId,
-          sourceLineId: payables.size ? '9202' : receiptLineAfterCleanup,
+          sourceId: wmsSource.wms.id,
+          sourceLineId: payables.size ? wmsSource.entry.id : receiptLineAfterCleanup,
           quantity: 2,
           materialAmount: 123.45
         })
@@ -228,6 +234,16 @@ test('COST-011 payable payload keeps exact WMS source IDs and positive freight',
 test('COST-011 snapshot assertion rejects empty or unowned freight lines', () => {
   const positive = { id: '9700', entryId: '97001', billNo: 'PAYABLE-9700', amount: '12.34' }
   const zero = { id: '9701' }
+  const freightLine = (overrides = {}) => ({
+    sourceType: 'PURCHASE_FREIGHT', sourceId: positive.id,
+    sourceLineId: positive.entryId, sourceNo: positive.billNo,
+    sourceVersion: 'MesStkIoDTO:101', componentCode: 'PURCHASE_FREIGHT',
+    quantity: 0, materialAmount: 0, expenseAmount: positive.amount,
+    payableKeyScope: 'FREIGHT_PAYABLE', payableSourceBillId: wmsSource.wms.id,
+    payableNo: positive.billNo, payableSettlementStatus: 'UNPAID',
+    payableAmount: positive.amount,
+    ...overrides
+  })
   assert.throws(
     () => assertPurchaseFreightSnapshot({
       snapshot: { snapshotKey: 'PURCHASE', status: 'DRAFT', lines: [] },
@@ -240,17 +256,13 @@ test('COST-011 snapshot assertion rejects empty or unowned freight lines', () =>
       snapshot: {
         snapshotKey: 'PURCHASE',
         status: 'DRAFT',
-        lines: [{
-          sourceType: 'PURCHASE_FREIGHT', sourceId: positive.id,
-          sourceLineId: positive.entryId, sourceNo: positive.billNo,
-          sourceVersion: 'MesStkIoDTO:101', componentCode: 'PURCHASE_FREIGHT',
-          quantity: 0, materialAmount: 0, expenseAmount: '0.00'
-        }]
+        lines: [freightLine({ expenseAmount: '0.00' })]
       },
       positive, zero, wmsSource
     }),
     /来源字段或金额不精确/
   )
+  // 到岸费用的应付追溯键必须是应付主键口径，缺少冻结字段时不能放过。
   assert.throws(
     () => assertPurchaseFreightSnapshot({
       snapshot: {
@@ -262,6 +274,17 @@ test('COST-011 snapshot assertion rejects empty or unowned freight lines', () =>
           sourceVersion: 'MesStkIoDTO:101', componentCode: 'PURCHASE_FREIGHT',
           quantity: 0, materialAmount: 0, expenseAmount: positive.amount
         }]
+      },
+      positive, zero, wmsSource
+    }),
+    /到岸费用来源未按应付主键解析出应付结算状态/
+  )
+  assert.throws(
+    () => assertPurchaseFreightSnapshot({
+      snapshot: {
+        snapshotKey: 'PURCHASE',
+        status: 'DRAFT',
+        lines: [freightLine()]
       },
       positive, zero, wmsSource
     }),

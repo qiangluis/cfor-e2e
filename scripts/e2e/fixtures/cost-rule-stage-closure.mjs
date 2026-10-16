@@ -8,7 +8,13 @@ import { isBusinessSuccess } from '../lib/assertions.mjs'
 import { assertLocalDatabase, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 import { openRoute, saveScreenshot } from '../lib/browser.mjs'
 import { costModelPayload } from './cost-model.mjs'
-import { cleanupCostScenarioReviewer, createAuditedPurchaseReceipt, createReviewer, loginAs } from './cost-scenario.mjs'
+import {
+  cleanupCostScenarioReviewer,
+  createAuditedPurchaseReceipt,
+  createReviewer,
+  loginAs,
+  resolveWmsPurchaseReceipt
+} from './cost-scenario.mjs'
 import { assertPurchaseReceipt, assertPurchaseConfirmed, costSourceDecimal } from './cost-purchase-source-closure.mjs'
 
 export const COST_RULE_STAGE_CHECKS = Object.freeze({
@@ -241,7 +247,11 @@ export async function prepareCostRuleStagePurchase (context, fixture, dependenci
   requireFact(id(detail.id) === fixture.purchaseInId && Number(detail.status) === 20 &&
     id(detail.orderId) === fixture.purchaseOrderId && detail.businessType === 'NORMAL' &&
     detail.inTime?.slice(0, 7) === fixture.month, '采购来源未在本专属期间正式审核')
-  return { available: true, receipt: detail }
+  // 成本来源主从 ID 取 WMS 采购入库（mes_stk_io）主从 ID，ERP 采购入库是上游单据。
+  const wms = await (dependencies.resolveWmsPurchaseReceipt || resolveWmsPurchaseReceipt)({
+    api, fixture
+  })
+  return { available: true, receipt: detail, wms }
 }
 
 export function assertCostStageCollectDatabase (state, source) {
@@ -430,7 +440,8 @@ export async function runCostRuleStageClosure (context, dependencies = {}) {
     if (purchase.available) {
       collectSource = data(await api.postBusiness(`${root}/source-snapshot/purchase/refresh`))
       closure.collectDraft = collectSource
-      assertPurchaseReceipt(collectSource, fixture, purchase.receipt)
+      assertPurchaseReceipt(collectSource, fixture, purchase.receipt,
+        purchase.wms || { wmsId: fixture.wmsReceiptId, entryId: fixture.wmsReceiptEntryId })
       requireFact(collectSource.lines.length === 1 && collectSource.lines[0].sourceVersion,
         '采购取数必须只有本轮真实来源且保留来源版本')
     }

@@ -57,6 +57,17 @@ const purchaseDouble = ({
       if (endpoint === '/erp/purchase-order/get?id=204') return ok(order)
       if (endpoint === '/mes/wms/arrival-notice/get?id=205') return ok(notice)
       if (endpoint === '/erp/purchase-in/get?id=206') return ok(receipt)
+      // 成本来源主从 ID 取 WMS 采购入库（mes_stk_io）主从 ID。
+      if (endpoint.startsWith('/mes/stkIo/list?')) return ok({
+        records: [{
+          id: '207', srcBillType: 'ErpPurchaseIn', srcBillId: '206',
+          stockIoType: '101', isEffective: 1, isVoided: 0
+        }],
+        total: 1
+      })
+      if (endpoint === '/mes/stkIo/queryEntryByMainId?id=207') return ok([
+        { id: '2071', srcEntryId: '2061', materialId: '201', qty: 2 }
+      ])
       assert.fail(`unexpected GET ${endpoint}`)
     },
     async postBusiness (endpoint, body) {
@@ -106,6 +117,9 @@ test('collect preparation accepts MES Result 200/true and CommonResult 0 in the 
   assert.equal(result.receipt.status, 20)
   assert.equal(run.fixture.purchaseOrderId, '204')
   assert.equal(run.fixture.purchaseInId, '206')
+  assert.equal(run.fixture.wmsReceiptId, '207')
+  assert.equal(run.fixture.wmsReceiptEntryId, '2071')
+  assert.equal(result.wms.wmsId, '207')
   assert.equal(run.fixture.materialId, '201')
   assert.equal(run.fixture.warehouseId, '202')
   assert.equal(run.calls.filter((row) => row.endpoint === '/mes/wmsWareHouse/add').length, 1)

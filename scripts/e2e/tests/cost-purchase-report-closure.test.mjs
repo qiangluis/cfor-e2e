@@ -11,6 +11,8 @@ const ownedFixture = () => ({
   suffix: 'UNIT', month: '2212-01', modelId: '2002', periodId: '2003',
   versionNo: 'E2E-C12-UNIT', materialId: '2110561246932443138',
   purchaseInId: '2110561246932443139', purchaseOrderId: '2110561246932443140',
+  // 采购来源主从 ID 已切到 WMS 采购入库（mes_stk_io）主从 ID。
+  wmsReceiptId: '2110561246932443148', wmsReceiptEntryId: '2110561246932443149',
   receiptNo: 'CGRK-C12-UNIT', period: { enterpriseType: 'MANUFACTURING' }
 })
 const ownedPeriod = (fixture) => ({
@@ -30,8 +32,8 @@ const draftFor = (fixture) => ({
   id: '910', periodId: fixture.periodId, snapshotKey: 'PURCHASE',
   versionNo: fixture.versionNo, snapshotHash: 'a'.repeat(64), status: 'DRAFT',
   lines: [{
-    sourceModule: 'ERP', sourceType: 'PURCHASE_RECEIPT', sourceId: fixture.purchaseInId,
-    sourceLineId: receiptFor(fixture).items[0].id, sourceNo: fixture.receiptNo,
+    sourceModule: 'ERP', sourceType: 'PURCHASE_RECEIPT', sourceId: fixture.wmsReceiptId,
+    sourceLineId: fixture.wmsReceiptEntryId, sourceNo: fixture.receiptNo,
     sourceStatus: 'DRAFT', productCode: fixture.materialId,
     mappingStatus: 'MAPPED', quantity: 2, materialAmount: '123.45',
     invoicePriceStatus: 'PARTIAL_INVOICE', invoicePriceScope: 'PURCHASE_ORDER',
@@ -70,11 +72,12 @@ test('COST-012 names four distinct evidence checks', () => {
 })
 
 test('COST-012 order-level invoice fallback keeps row-level unit price absent', () => {
-  const fixture = { purchaseInId: '1001' }
+  const fixture = { wmsReceiptId: '1001', wmsReceiptEntryId: '1002' }
   const line = helpers.sourceLine({
     lines: [{
       sourceType: 'PURCHASE_RECEIPT',
       sourceId: '1001',
+      sourceLineId: '1002',
       invoicePriceScope: 'PURCHASE_ORDER'
     }]
   }, fixture)
@@ -114,7 +117,7 @@ test('COST-012 trial uses the owned period without changing its enterprise track
 
 test('COST-012 rejects an empty purchase source snapshot', () => {
   assert.throws(
-    () => helpers.sourceLine({ lines: [] }, { purchaseInId: '1001' }),
+    () => helpers.sourceLine({ lines: [] }, { wmsReceiptId: '1001', wmsReceiptEntryId: '1002' }),
     /采购来源快照为空/
   )
 })
@@ -131,7 +134,7 @@ test('COST-012 money comparisons do not round away missing values or sub-cent di
 test('COST-012 rejects duplicate owned purchase receipt sources', () => {
   const fixture = ownedFixture()
   const draft = draftFor(fixture)
-  draft.lines.push({ ...draft.lines[0], sourceLineId: '2110561246932443142' })
+  draft.lines.push(structuredClone(draft.lines[0]))
   assert.throws(() => helpers.sourceLine(draft, fixture), /缺少或重复/)
 })
 

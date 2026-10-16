@@ -34,12 +34,14 @@ const returned = {
   isEffective: 1, isVoided: 0, billStage: '34', billNo: 'CGTH-OWNED',
   items: [{ id: '2110561246932443145', productId: fixture.materialId, count: 1, totalPrice: '61.725' }]
 }
+// 采购入库来源已切到 WMS 事实源：来源主从 ID 是 mes_stk_io 的主从 ID。
+const wms = { wmsId: '2110561246932443146', entryId: '2110561246932443147' }
 const snapshot = () => ({
   id: '910', periodId: fixture.periodId, snapshotKey: 'PURCHASE',
   versionNo: fixture.versionNo, status: 'DRAFT', snapshotHash: 'a'.repeat(64),
   lines: [{
-    sourceModule: 'ERP', sourceType: 'PURCHASE_RECEIPT', sourceId: receipt.id,
-    sourceLineId: receipt.items[0].id, productCode: fixture.materialId,
+    sourceModule: 'ERP', sourceType: 'PURCHASE_RECEIPT', sourceId: wms.wmsId,
+    sourceLineId: wms.entryId, productCode: fixture.materialId,
     sourceStatus: 'DRAFT', sourceNo: receipt.no, quantity: 2, materialAmount: '123.45'
   }, {
     sourceModule: 'ERP', sourceType: 'PURCHASE_RETURN', sourceId: returned.id,
@@ -83,7 +85,7 @@ test('exact decimal comparison preserves cents and Snowflake identities', () => 
 })
 
 test('nonempty draft proves separately audited source and unconfirmed cost boundaries', () => {
-  assertPurchaseReceipt(snapshot(), fixture, receipt)
+  assertPurchaseReceipt(snapshot(), fixture, receipt, wms)
   assertPurchaseReturn(snapshot(), fixture, returned)
   for (const change of [
     { lines: [] }, { periodId: '999' }, { status: 'CONFIRMED' },

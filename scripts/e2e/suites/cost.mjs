@@ -12,9 +12,12 @@ import {
 import {
   COST_SCENARIO_BY_CASE,
   cleanupCostScenarioReviewer,
+  createAuditedPurchaseInvoice,
   loadCostScenario,
   loginAs,
-  prepareCostScenario
+  prepareCostScenario,
+  readPurchaseInvoicePayable,
+  runPurchasePayablePayment
 } from '../fixtures/cost-scenario.mjs'
 import { assertLocalDatabase, assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 import {
@@ -154,8 +157,9 @@ export const costCatalogBindings = Object.freeze({
   'COST-011': Object.freeze({
     0: [COST_PURCHASE_FREIGHT_CHECKS.wmsSource],
     1: [COST_PURCHASE_FREIGHT_CHECKS.expense],
-    2: [COST_PURCHASE_FREIGHT_CHECKS.shared],
-    3: [COST_PURCHASE_FREIGHT_CHECKS.zero]
+    2: [COST_PURCHASE_FREIGHT_CHECKS.payableScope],
+    3: [COST_PURCHASE_FREIGHT_CHECKS.shared],
+    4: [COST_PURCHASE_FREIGHT_CHECKS.zero]
   }),
   'COST-012': Object.freeze({
     0: [COST_PURCHASE_REPORT_CHECKS.fields],
@@ -248,8 +252,8 @@ export const costCatalogGapContexts = Object.freeze({
   'COST-017': '收入草稿为空，未验证 ERP API 边界、来源单号、退货红字和不落正式快照',
   'COST-018': '支出草稿为空，未验证 ERP 报销 API 边界、来源单号、采购应付排除和不落正式快照',
   'COST-019': '其他应付草稿为空，未验证过滤规则、分摊基数正数门禁及发布阻断',
-  'COST-020': '当前采购样本未覆盖委外和四种应付状态，且没有人工确认后的正式发布边界回读',
-  'COST-021': '当前没有 AVAILABLE 付款核销轨迹，未验证逐行金额/状态及不重复相加',
+  'COST-020': '已覆盖已生效采购发票优先与未开票回退采购订单两种应付口径；委外收货应付与发票/订单应付共存场景仍缺成本期间样本，PARTIAL 状态也未构造',
+  'COST-021': '已覆盖真实付款单+自动核销单的模拟轨迹、逐行金额与结算状态推进；部分核销（PARTIAL）轨迹仍未构造',
   'COST-022': '缺少反月结审批执行、历史状态回读和重新试算发布的完整证据',
   'COST-023': '已补专属试算、独立复核、发布批次和回退/反月结审批 API/数据库证据；模型维护人独立拒绝、发布人申请回退/反月结与经营域双人断言缺少现有权限下的独立业务主体或可写事实，保留 GAP；审批拒绝不替代申请拒绝',
   'COST-024': '当前只验证部分 CARRYOVER 读取，未覆盖确认锁定、缺上期门禁、对象汇总、料工费拆分和完整页面交互',
@@ -1788,13 +1792,33 @@ const runCostCase = async ({
   }
 
   if (caseId === 'COST-020') {
-    // PB-420/421：采购/委外应付结算状态只作为来源追溯快照，不改变成本金额。
-    const period = loadCostScenario(caseRecord)?.period
-    if (period?.id) {
-      const refreshed = await api.request(
-        'POST',
-        `/cost/periods/${period.id}/source-snapshot/purchase/refresh`
-      )
+    // PB-420/421：采购入库成本来源与应付不是同一键口径，必须按“已生效采购发票优先、未开票回退采购订单”
+    // 只读解析真实应付；应付结算状态只作追溯快照，不改变成本金额。
+    const fixture = loadCostScenario(caseRecord)
+    const period = fixture?.period
+    const refreshPurchase = async () =>
+      await api.request('POST', `/cost/periods/${period.id}/source-snapshot/purchase/refresh`)
+    const receiptRowOf = (payload) =>
+      (payload?.data?.lines || []).find((row) => row.sourceType === 'PURCHASE_RECEIPT')
+    if (period?.id && fixture?.suffix) {
+      const unbilled = await refreshPurchase()
+      const unbilledRow = unbilled?.code === 0 ? receiptRowOf(unbilled) : null
+      caseRecord.checks.push({
+        name: '未开票采购入库按采购订单口径登记且不虚构应付',
+        passed: Boolean(unbilledRow) &&
+          unbilledRow.payableKeyScope === 'PURCHASE_ORDER' &&
+          unbilledRow.payableSettlementStatus === 'NOT_AVAILABLE' &&
+          unbilledRow.payableTraceStatus === 'NOT_AVAILABLE' &&
+          !nonEmpty(unbilledRow.payableNo),
+        details: unbilledRow
+          ? `scope=${unbilledRow.payableKeyScope}; settlement=${unbilledRow.payableSettlementStatus}; payableNo=${unbilledRow.payableNo || ''}`
+          : String(unbilled?.msg || unbilled?.message || '采购来源刷新无响应')
+      })
+      const invoice = await createAuditedPurchaseInvoice({
+        api: rawApi, suffix: `${fixture.suffix}I`, month: fixture.month, fixture
+      })
+      const refreshed = await refreshPurchase()
+      const billedRow = refreshed?.code === 0 ? receiptRowOf(refreshed) : null
       caseRecord.checks.push({
         name: '采购成本来源刷新返回应付结算追溯字段',
         passed: refreshed?.code === 0 && refreshed?.data?.status === 'DRAFT',
@@ -1802,19 +1826,31 @@ const runCostCase = async ({
           ? `rows=${refreshed.data?.lines?.length || 0}`
           : String(refreshed?.msg || refreshed?.message || '采购来源刷新无响应')
       })
-      if (refreshed?.code === 0) {
-        const rows = refreshed.data?.lines || []
-        const tracked = rows.filter((row) => row.sourceType === 'PURCHASE_RECEIPT' || row.sourceType === 'PURCHASE_RETURN')
-        caseRecord.checks.push({
-          name: '应付状态仅作为快照且不替代采购成本金额',
-          passed: tracked.every(
-            (row) => ['UNPAID', 'PARTIAL', 'PAID', 'NOT_AVAILABLE'].includes(row.payableSettlementStatus) &&
-              row.materialAmount !== undefined &&
-              row.payableAmount !== undefined
-          ),
-          details: `trackedRows=${tracked.length}`
-        })
-      }
+      caseRecord.checks.push({
+        name: '已生效采购发票优先命中应付并携带真实单号金额',
+        passed: Boolean(billedRow) &&
+          billedRow.payableKeyScope === 'PURCHASE_INVOICE' &&
+          billedRow.payableSettlementStatus === 'UNPAID' &&
+          billedRow.payableSourceBillType === 'PurInvoice' &&
+          String(billedRow.payableSourceBillId) === String(invoice.id) &&
+          nonEmpty(billedRow.payableNo) &&
+          Number(billedRow.payableAmount) > 0,
+        details: billedRow
+          ? `scope=${billedRow.payableKeyScope}; status=${billedRow.payableSettlementStatus}; ` +
+            `payableNo=${billedRow.payableNo}; payableAmount=${billedRow.payableAmount}; invoice=${invoice.id}`
+          : String(refreshed?.msg || refreshed?.message || '开票后采购来源刷新无响应')
+      })
+      caseRecord.checks.push({
+        name: '应付追溯不改变采购成本金额且不合并共存口径',
+        passed: Boolean(billedRow) && Boolean(unbilledRow) &&
+          Number(billedRow.materialAmount) === Number(unbilledRow.materialAmount) &&
+          Array.isArray(billedRow.payableCoexistedScopes) &&
+          billedRow.payableCoexistedScopes.length === 0,
+        details: billedRow && unbilledRow
+          ? `materialAmount=${unbilledRow.materialAmount}->${billedRow.materialAmount}; ` +
+            `coexisted=${JSON.stringify(billedRow.payableCoexistedScopes)}`
+          : '缺少开票前后快照行'
+      })
     } else {
       caseRecord.checks.push({
         name: '存在成本期间用于采购应付结算快照校验',
@@ -1829,13 +1865,29 @@ const runCostCase = async ({
       details: '真实 Chrome 成本工作台采购来源入口'
     })
     await saveScreenshot(page, outputDir, 'cost-purchase-payable-settlement-snapshot', record)
-    caseRecord.evidence.push('采购来源刷新接口、应付结算状态快照与成本金额分离校验、成本工作台截图')
+    caseRecord.evidence.push('采购来源刷新接口、发票优先/未开票回退应付键解析、应付结算状态快照与成本金额分离校验、成本工作台截图')
   }
 
   if (caseId === 'COST-021') {
-    // PB-420/421：付款与核销冲销轨迹仅作为来源追溯快照，成本确认金额保持不变。
-    const period = loadCostScenario(caseRecord)?.period
-    if (period?.id) {
+    // PB-420/421：采购入库对应的真实付款与核销轨迹必须能被只读解析出来，且不改变成本确认金额。
+    const fixture = loadCostScenario(caseRecord)
+    const period = fixture?.period
+    if (period?.id && fixture?.suffix) {
+      const invoice = await createAuditedPurchaseInvoice({
+        api: rawApi, suffix: `${fixture.suffix}p`, month: fixture.month, fixture
+      })
+      const payable = await readPurchaseInvoicePayable({ api: rawApi, fixture, invoiceId: invoice.id })
+      const amount = Number(payable.entry.amt)
+      const beforePayment = await api.request(
+        'POST',
+        `/cost/periods/${period.id}/source-snapshot/purchase/refresh`
+      )
+      const beforePaymentRow = (beforePayment?.data?.lines || [])
+        .find((row) => row.sourceType === 'PURCHASE_RECEIPT')
+      const payment = await runPurchasePayablePayment({
+        api: rawApi, fixture, payableEntryId: fixture.payableEntryId, amount,
+        billDate: `${fixture.month}-08`
+      })
       const refreshed = await api.request(
         'POST',
         `/cost/periods/${period.id}/source-snapshot/purchase/refresh`
@@ -1850,23 +1902,40 @@ const runCostCase = async ({
       if (refreshed?.code === 0) {
         const rows = refreshed.data?.lines || []
         const traced = rows.filter((row) => row.sourceType === 'PURCHASE_RECEIPT' || row.sourceType === 'PURCHASE_RETURN')
+        const tracedRow = traced.find((row) => row.payableKeyScope === 'PURCHASE_INVOICE')
+        const traces = Array.isArray(tracedRow?.payableSettlementTraces)
+          ? tracedRow.payableSettlementTraces
+          : []
+        const payments = traces.filter((trace) => trace.traceType === 'PAYMENT')
+        const writeOffs = traces.filter((trace) => trace.traceType === 'WRITE_OFF')
         caseRecord.checks.push({
           name: '付款核销轨迹仅作快照且成本金额不变',
-          passed: trackedTraceShape(traced),
-          details: `tracedRows=${traced.length}`
+          passed: trackedTraceShape(traced) && Boolean(tracedRow) &&
+            tracedRow.payableTraceStatus === 'AVAILABLE',
+          details: `tracedRows=${traced.length}; availableRows=${traced.filter((row) => row.payableTraceStatus === 'AVAILABLE').length}`
         })
         caseRecord.checks.push({
-          name: '存在付款核销轨迹时携带可追溯单号与状态',
-          passed: traced.every((row) => {
-            if (row.payableTraceStatus !== 'AVAILABLE') return true
-            const traces = Array.isArray(row.payableSettlementTraces) ? row.payableSettlementTraces : []
-            return traces.length > 0 && traces.every((trace) =>
-              ['PAYMENT', 'WRITE_OFF'].includes(trace.traceType) &&
-              ['CONFIRMED', 'VOIDED'].includes(trace.traceStatus) &&
-              nonEmpty(trace.traceNo) &&
-              nonEmpty(trace.payableNo))
-          }),
-          details: `availableRows=${traced.filter((row) => row.payableTraceStatus === 'AVAILABLE').length}`
+          name: '真实付款单与自动核销单进入可追溯轨迹',
+          passed: payments.length === 1 && payments.every((trace) =>
+            String(trace.traceId) === String(payment.id) &&
+            trace.traceStatus === 'CONFIRMED' &&
+            nonEmpty(trace.traceNo) &&
+            Number(trace.amount) === amount) &&
+            writeOffs.every((trace) =>
+              trace.traceStatus === 'CONFIRMED' &&
+              nonEmpty(trace.traceNo) && nonEmpty(trace.payableNo)) &&
+            nonEmpty(tracedRow?.payableNo) &&
+            ['PARTIAL', 'PAID'].includes(tracedRow?.payableSettlementStatus) &&
+            Number(tracedRow?.payableCheckedAmount) > 0,
+          details: `payments=${payments.length}; writeOffs=${writeOffs.length}; ` +
+            `settlement=${tracedRow?.payableSettlementStatus}; checked=${tracedRow?.payableCheckedAmount}`
+        })
+        caseRecord.checks.push({
+          name: '付款核销轨迹不影响采购成本金额',
+          passed: Boolean(tracedRow) && Boolean(beforePaymentRow) &&
+            Number(tracedRow.materialAmount) === Number(beforePaymentRow.materialAmount),
+          details: `materialAmount=${beforePaymentRow?.materialAmount}->${tracedRow?.materialAmount}; ` +
+            `checked=${tracedRow?.payableCheckedAmount}`
         })
       }
     } else {

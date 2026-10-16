@@ -12,7 +12,9 @@ const amount = (value) => {
   return Number(value)
 }
 
-export function assertPurchaseFreightPage ({ observation, fixture, snapshot, positive, zero }) {
+export function assertPurchaseFreightPage ({
+  observation, fixture, snapshot, positive, zero, wmsSource
+}) {
   requireFact(observation?.loaded === 'true' && observation.error === '', '正式页面未成功读取来源')
   requireFact(observation.periodId === fixture.periodId && observation.month === fixture.month &&
     observation.modelId === fixture.modelId && observation.versionNo === fixture.versionNo,
@@ -43,8 +45,10 @@ export function assertPurchaseFreightPage ({ observation, fixture, snapshot, pos
     row.sourceId === positive.id && row.sourceLineId === positive.entryId)
   requireFact(freight.length === 1 && freight[0].expenseText === positive.amount &&
     freight[0].materialText === '0.00', '页面没有唯一显示专属采购费用')
+  // 采购入库来源已切到 WMS 采购入库事实源，页面来源主键是 mes_stk_io 主从 ID。
   requireFact(observation.rows.some((row) => row.sourceType === 'PURCHASE_RECEIPT' &&
-    row.sourceId === fixture.purchaseInId), '页面缺少同期间采购入库')
+    row.sourceId === String(wmsSource.wms.id) &&
+    row.sourceLineId === String(wmsSource.entry.id)), '页面缺少同期间采购入库')
   requireFact(!observation.rows.some((row) => row.sourceType === 'PURCHASE_FREIGHT' &&
     row.sourceId === zero.id), '页面将零费用应付冒充来源')
   requireFact(amount(observation.expenseTotal) ===
@@ -56,7 +60,7 @@ export function assertPurchaseFreightPage ({ observation, fixture, snapshot, pos
 }
 
 export async function verifyPurchaseFreightPage ({
-  page, outputDir, record, fixture, snapshot, positive, zero
+  page, outputDir, record, fixture, snapshot, positive, zero, wmsSource
 }) {
   const workspaceWrites = []
   const onRequest = (request) => {
@@ -109,7 +113,7 @@ export async function verifyPurchaseFreightPage ({
       }
     })
     observation.workspaceWrites = workspaceWrites
-    assertPurchaseFreightPage({ observation, fixture, snapshot: refreshed, positive, zero })
+    assertPurchaseFreightPage({ observation, fixture, snapshot: refreshed, positive, zero, wmsSource })
     await saveScreenshot(page, outputDir, 'cost-011-formal-purchase-freight', record)
     return observation
   } finally {

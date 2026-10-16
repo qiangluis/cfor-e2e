@@ -69,14 +69,65 @@ const pageObservers = new WeakMap()
 
 // Layout and form-prefetch requests are shared background work. They may outlive
 // a business case, but HTTP and business failures must still be recorded.
-const isBackgroundLifecycleRequest = (url) =>
+//
+// 门户首页（/index）登录后会并发预取一批聚合小部件数据。用例随后用整页跳转打开业务
+// 路由时，浏览器会取消这些还没返回的 XHR，而 Playwright 对这类被跨文档导航销毁的请求
+// 既不发 requestfinished 也不发 requestfailed，收尾 flush 会被永久阻塞。
+// 放行条件同时要求「发起请求时的页面文档就是门户首页」，因此同一路径被业务页面正常
+// 调用时仍然按业务请求阻塞收尾；失败也依旧通过 requestfailed 与响应体检查记录。
+const HOME_WORKSPACE_PREFETCH_PATHS = new Set([
+  '/workbench/todo/page',
+  '/bpm/task/done-page',
+  '/bpm/process-instance/my-page',
+  '/bpm/process-instance/copy/page',
+  '/system/notify-message/my-page',
+  '/system/notice/page',
+  '/hrm/survey/my-pending',
+  '/oa/schedule/my-page',
+  '/oa/schedule/received-page',
+  '/oa/meeting-booking/my-range',
+  '/oa/task/received-page',
+  '/oa/plan/page',
+  '/oa/contact/my-page',
+  '/erp/sale-order/page',
+  '/pms/pm/project/page',
+  '/pms/kb/favorite/page',
+  '/pm/daily-report/page',
+  '/crm/work-report/page',
+  '/system/user-favorite/page'
+])
+
+const PORTAL_HOME_PATHS = new Set(['/', '/index'])
+
+const isPortalHomeDocument = (url) => {
+  try {
+    return PORTAL_HOME_PATHS.has(new URL(String(url || '')).pathname)
+  } catch {
+    return false
+  }
+}
+
+const isHomeWorkspacePrefetch = (url, documentUrl) => {
+  if (!isPortalHomeDocument(documentUrl)) return false
+  const pathname = String(url || '').split(/[?#]/)[0]
+  const marker = '/admin-api'
+  const index = pathname.lastIndexOf(marker)
+  if (index < 0) return false
+  return HOME_WORKSPACE_PREFETCH_PATHS.has(pathname.slice(index + marker.length))
+}
+
+const isBackgroundLifecycleRequest = (url, documentUrl) =>
   /\/system\/system-init\/(?:state|readiness)(?:[/?]|$)/.test(url || '') ||
   /\/base\/material-grade\/simple-list(?:[/?]|$)/.test(url || '') ||
   /\/system\/notify-message\/get-unread-list(?:[/?]|$)/.test(url || '') ||
+  // 个人工作台首页会预取用户偏好（列宽/视图等），可能在用例导航或收尾时仍在
+  // 传输中。它同样保持失败可观测，但不阻塞健康的浏览器上下文被下一个用例复用。
+  /\/system\/user-preference\/get(?:[/?]|$)/.test(url || '') ||
   // The portal notification panel keeps this request alive while a case
   // navigates through business pages. It remains observable for failures,
   // but must not block reuse of an otherwise healthy browser session.
-  /\/oa\/announcement\/received-page(?:[/?]|$)/.test(url || '')
+  /\/oa\/announcement\/received-page(?:[/?]|$)/.test(url || '') ||
+  isHomeWorkspacePrefetch(url, documentUrl)
 
 export const isExpectedRequestFailure = ({ resourceType, error, url } = {}) =>
   error === 'net::ERR_ABORTED' &&
@@ -226,6 +277,13 @@ export function observePage (page, record) {
   const responseTasks = new Map()
   const pendingRequests = new Map()
   const consoleTasks = new Set()
+  const currentDocumentUrl = () => {
+    try {
+      return typeof page.url === 'function' ? page.url() : ''
+    } catch {
+      return ''
+    }
+  }
   const trackRequest = (request) => {
     if (!/\/(?:admin|app)-api\//.test(request.url())) return
     if (!pendingRequests.has(request)) {
@@ -234,7 +292,8 @@ export function observePage (page, record) {
       pendingRequests.set(request, {
         finished, resolve, startedAt: Date.now(),
         method: request.method(), url: resourceUrl(request.url()),
-        background: isBackgroundLifecycleRequest(request.url())
+        // 门户首页的聚合预取只在「发起时仍停留在首页文档」才被放行。
+        background: isBackgroundLifecycleRequest(request.url(), currentDocumentUrl())
       })
     }
     return pendingRequests.get(request)

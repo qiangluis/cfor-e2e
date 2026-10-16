@@ -8,7 +8,8 @@ import {
   createReviewer,
   loginAs,
   prepareCostScenario,
-  resetCostScenarioCache
+  resetCostScenarioCache,
+  resolveWmsPurchaseReceipt
 } from './cost-scenario.mjs'
 import {
   assertPurchaseConfirmed,
@@ -176,9 +177,12 @@ const createAndAuditInvoice = async ({ api, record, caseRecord, fixture }) => {
 const sourceLine = (snapshot, fixture) => {
   const lines = snapshot?.lines
   requireFact(Array.isArray(lines) && lines.length > 0, 'COST-012采购来源快照为空')
+  // 采购来源已切到 WMS 采购入库事实源，来源主从 ID 取 mes_stk_io 主从 ID。
+  const wmsId = exactId(fixture.wmsReceiptId, 'COST-012 WMS采购入库')
   const matches = lines.filter((row) =>
     row.sourceType === 'PURCHASE_RECEIPT' &&
-    String(row.sourceId) === String(fixture.purchaseInId))
+    String(row.sourceId) === wmsId &&
+    String(row.sourceLineId) === exactId(fixture.wmsReceiptEntryId, 'COST-012 WMS采购入库明细'))
   requireFact(matches.length === 1, 'COST-012正式采购来源缺少或重复本轮入库行')
   return matches[0]
 }
@@ -193,7 +197,9 @@ const prepareInvoiceSnapshot = async ({
     'COST-012采购来源刷新'
   )
   closure.snapshot = snapshot
-  assertPurchaseReceipt(snapshot, fixture, receipt)
+  // WMS 来源主从 ID 与夹具登记的是同一对值；优先用封闭步骤解析出的证据。
+  assertPurchaseReceipt(snapshot, fixture, receipt,
+    closure.wmsSource || { wmsId: fixture.wmsReceiptId, entryId: fixture.wmsReceiptEntryId })
   requireFact(snapshot.lines.length === 1, 'COST-012专属期间必须只有本轮采购来源')
   const line = sourceLine(snapshot, fixture)
   requireFact(snapshot.snapshotKey === 'PURCHASE' &&
@@ -355,7 +361,7 @@ const readPublishedReport = async (api, fixture) => {
 
 const readPublicationFormula = async ({ fixture, caseRecord, readSql = runReadOnlySql }) => {
   const result = await readSql(`
-    SELECT source_id, source_line_id, formula_json
+    SELECT source_id, source_business_line_id, formula_json
     FROM cost_publication_source_fact
     WHERE tenant_id=1 AND deleted=0 AND publication_id=${exactId(fixture.publicationId, 'COST-012发布批次')}
       AND source_type='PURCHASE_RECEIPT'
@@ -364,7 +370,8 @@ const readPublicationFormula = async ({ fixture, caseRecord, readSql = runReadOn
   requireFact(result.available && result.rows.length > 0,
     'COST-012正式发布来源事实缺少采购行')
   const owned = result.rows.filter((row) =>
-    String(row[0]) === String(fixture.purchaseInId))
+    String(row[0]) === exactId(fixture.wmsReceiptId, 'COST-012 WMS采购入库') &&
+    String(row[1]) === exactId(fixture.wmsReceiptEntryId, 'COST-012 WMS采购入库明细'))
   requireFact(owned.length === 1 &&
     String(owned[0][2]).includes('"invoicePriceStatus"') &&
     String(owned[0][2]).includes('"invoicePriceScope"') &&
@@ -429,6 +436,7 @@ export async function runCostPurchaseReportClosure (context, dependencies = {}) 
   requireFact(typeof receipt.no === 'string' && receipt.no.trim() !== '',
     'COST-012采购入库缺少正式单号')
   fixture.receiptNo = receipt.no
+  closure.wmsSource = await resolveWmsPurchaseReceipt({ api, fixture })
   const source = await prepareInvoiceSnapshot({
     api, fixture, invoice, receipt, closure, caseRecord, readSql: dependencies.readSql
   })

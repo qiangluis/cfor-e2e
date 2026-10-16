@@ -9,9 +9,14 @@ function example () {
   }
   const positive = { id: '9223372036854775002', entryId: '9223372036854775003', amount: '12.34' }
   const zero = { id: '9223372036854775004' }
+  // 采购入库来源已切到 WMS 事实源：页面来源主从 ID 是 mes_stk_io 的主从 ID。
+  const wmsSource = {
+    wms: { id: '9223372036854775006' },
+    entry: { id: '9223372036854775007' }
+  }
   const lines = [{
-    sourceType: 'PURCHASE_RECEIPT', sourceId: fixture.purchaseInId,
-    sourceLineId: '9223372036854775005', sourceNo: 'OWNED-RECEIPT',
+    sourceType: 'PURCHASE_RECEIPT', sourceId: wmsSource.wms.id,
+    sourceLineId: wmsSource.entry.id, sourceNo: 'OWNED-RECEIPT',
     productCode: 'OWNED-P01', quantity: 2, materialAmount: 100, expenseAmount: 0
   }, {
     sourceType: 'PURCHASE_FREIGHT', sourceId: positive.id, sourceLineId: positive.entryId,
@@ -33,7 +38,7 @@ function example () {
       materialText: line.materialAmount.toFixed(2), expenseText: line.expenseAmount.toFixed(2)
     }))
   }
-  return { fixture, positive, zero, snapshot, observation }
+  return { fixture, positive, zero, snapshot, observation, wmsSource }
 }
 
 test('COST-011 page requires exact Snowflake IDs and visible real fee/receipt cells', () => {

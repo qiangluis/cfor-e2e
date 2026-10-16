@@ -709,6 +709,240 @@ export const createAuditedPurchaseReceipt = async ({
   return { orderId, noticeId, purchaseInId, supplierId }
 }
 
+/**
+ * 创建并审核一张真实采购发票：发票审核后会生成 PurInvoice 采购应付，
+ * 该应付是采购入库成本来源的应付键（PB-420/421 应付结算/付款核销追溯）。
+ */
+export const createAuditedPurchaseInvoice = async ({
+  api, suffix, month, fixture, amount = 123.45, day = '07'
+}) => {
+  if (!fixture.supplierId || !fixture.purchaseOrderId) {
+    throw new Error('成本场景采购发票缺少供应商或采购订单归属')
+  }
+  const invoiceId = preciseId(
+    responseData(
+      await api.postBusiness('/erp/purchase-invoice/create', {
+        supplierId: fixture.supplierId,
+        invoiceType: 1,
+        taxRate: 0,
+        isRubric: 0,
+        invoiceNo: `AUTOTEST-COST-INV-${suffix}`,
+        invoiceMoney: amount,
+        invoicePrice: amount,
+        billDate: `${month}-${day}`,
+        srcBillType: 'ERP_PURCHASE_ORDER',
+        taxNo: '',
+        remark: `CFOR-E2E cost scenario invoice ${suffix}`,
+        items: [{
+          purchaseOrderId: String(fixture.purchaseOrderId),
+          srcBillType: 'ERP_PURCHASE_ORDER',
+          invoiceMoneyItem: amount
+        }]
+      }),
+      '成本场景采购发票'
+    ),
+    '成本场景采购发票'
+  )
+  responseData(
+    await api.putBusiness(`/erp/purchase-invoice/update-status?id=${encodeURIComponent(invoiceId)}`),
+    '成本场景采购发票审核'
+  )
+  const invoice = responseData(
+    await api.getBusiness(`/erp/purchase-invoice/get?id=${encodeURIComponent(invoiceId)}`),
+    '成本场景采购发票回读'
+  )
+  if (String(invoice?.isEffective) !== '1') {
+    throw new Error(`成本场景采购发票审核后未生效：${JSON.stringify(invoice)}`)
+  }
+  fixture.purchaseInvoiceId = invoiceId
+  return { id: invoiceId, invoice }
+}
+
+/**
+ * 解析采购入库成本来源在 WMS 侧的主从 ID。
+ *
+ * 采购来源已切到 WMS 采购入库事实源（`24d78b2ab`）：`cost_source_snapshot_line.source_id/source_line_id`
+ * 是 `mes_stk_io` 主从 ID，ERP 采购入库单只是上游单据，不能再当作来源身份比对。
+ */
+export const resolveWmsPurchaseReceipt = async ({ api, fixture }) => {
+  if (!fixture?.purchaseInId || !fixture?.materialId) {
+    throw new Error('采购入库 WMS 来源缺少采购入库单或物料归属')
+  }
+  const page = responseData(
+    await api.getBusiness(
+      `/mes/stkIo/list?pageNo=1&pageSize=100&srcBillType=ErpPurchaseIn&` +
+      `srcBillId=${encodeURIComponent(fixture.purchaseInId)}`
+    ),
+    'WMS采购入库分页'
+  )
+  const rows = Array.isArray(page) ? page : page?.records || page?.list || []
+  const matches = rows.filter((row) =>
+    String(row?.srcBillType) === 'ErpPurchaseIn' &&
+    String(row?.srcBillId) === String(fixture.purchaseInId) &&
+    String(row?.stockIoType ?? '') === '101' &&
+    Number(row?.isEffective) === 1 &&
+    Number(row?.isVoided ?? 0) === 0)
+  if (matches.length !== 1) {
+    throw new Error(`采购入库未唯一命中已生效WMS来源：matches=${matches.length}`)
+  }
+  const wmsId = preciseId(matches[0].id, 'WMS采购入库')
+  const entryPayload = responseData(
+    await api.getBusiness(`/mes/stkIo/queryEntryByMainId?id=${encodeURIComponent(wmsId)}`),
+    'WMS采购入库明细'
+  )
+  const entries = Array.isArray(entryPayload) ? entryPayload : entryPayload?.records || entryPayload?.list || []
+  const owned = entries.filter((row) => String(row?.materialId) === String(fixture.materialId))
+  if (owned.length !== 1) {
+    throw new Error(`WMS采购入库明细未唯一归属本轮物料：matches=${owned.length}`)
+  }
+  fixture.wmsReceiptId = wmsId
+  fixture.wmsReceiptEntryId = preciseId(owned[0].id, 'WMS采购入库明细')
+  return { wmsId, entryId: fixture.wmsReceiptEntryId, wms: matches[0], entry: owned[0] }
+}
+
+/** 读取采购发票生成的应付主单与唯一明细，用于构造真实付款申请。 */
+export const readPurchaseInvoicePayable = async ({ api, fixture, invoiceId }) => {
+  const page = responseData(
+    await api.getBusiness(
+      `/finance/finPayable/list?pageNo=1&pageSize=100&srcBillType=PurInvoice&srcBillId=${encodeURIComponent(invoiceId)}`
+    ),
+    '采购应付列表'
+  )
+  // /finance/finPayable/list 返回 records 分页体，兼容 list 命名，避免把真实应付读成空。
+  const rows = Array.isArray(page) ? page : (page?.list || page?.records || [])
+  const row = rows.find((item) => item?.id && String(item.isVoided ?? 0) !== '1')
+  if (!row) throw new Error(`采购发票 ${invoiceId} 未生成应付单`)
+  const payableId = preciseId(row.id, '采购应付')
+  const detail = responseData(
+    await api.getBusiness(`/finance/finPayable/queryById?id=${encodeURIComponent(payableId)}`),
+    '采购应付主单'
+  )
+  if (String(detail?.isEffective) !== '1' || !String(detail?.billNo || '')) {
+    throw new Error(`采购应付未生效或缺少单号：${JSON.stringify(detail)}`)
+  }
+  const entries = Array.isArray(detail.finPayableEntryList) && detail.finPayableEntryList.length
+    ? detail.finPayableEntryList
+    : responseData(
+      await api.getBusiness(
+        `/finance/finPayable/queryFinPayableSubByMainId?id=${encodeURIComponent(payableId)}`
+      ),
+      '采购应付明细'
+    )
+  const matched = (Array.isArray(entries) ? entries : entries?.list || [])
+    .filter((entry) => entry?.id && String(entry.mid) === payableId)
+  if (matched.length !== 1) {
+    throw new Error(`采购应付明细未精确归属：${JSON.stringify(entries)}`)
+  }
+  fixture.payableId = payableId
+  fixture.payableEntryId = preciseId(matched[0].id, '采购应付明细')
+  fixture.payableNo = detail.billNo
+  return { payable: detail, entry: matched[0], amount: Number(matched[0].amt) }
+}
+
+/**
+ * 真实采购付款并自动核销：为采购应付补一条可追溯的付款/核销轨迹。
+ * 审批路径由租户单据选项决定：免审时提交即生效，手工核批时依次走申请审核、正式审核与执行。
+ */
+export const runPurchasePayablePayment = async ({
+  api, fixture, payableEntryId, amount, billDate
+}) => {
+  const bankAccountId = fixture.accountId
+  if (!bankAccountId) throw new Error('采购付款缺少结算账户')
+  const page = responseData(
+    await api.getBusiness('/erp/account/page?pageNo=1&pageSize=100'),
+    '结算账户分页'
+  )
+  const accountId = String(fixture.accountId)
+  const account = (page?.list || []).find((row) => String(row.id) === accountId)
+  if (!account) throw new Error(`结算账户 ${accountId} 不存在，无法确认收款方开户行`)
+  const paymentType = '2021'
+  const collectionItem = '1'
+  const settleMethod = '1'
+  const line = {
+    entryNo: 1,
+    srcBillType: 'FinPayable:201',
+    srcBillId: String(fixture.payableId),
+    srcEntryId: String(payableEntryId),
+    amt: Number(amount),
+    discountAmt: 0,
+    checkedAmt: 0,
+    bankAccountId,
+    settleMethod,
+    collectionItem
+  }
+  const paymentId = preciseId(
+    responseData(
+      await api.postBusiness('/finance/finPayment/add/submit', {
+        billNo: `E2E-${fixture.suffix}-PAY`,
+        billDate,
+        isAuto: 0,
+        isRubric: 0,
+        isRequest: 1,
+        paymentType,
+        supplierId: fixture.supplierId,
+        bankAccountId,
+        collectionItem,
+        settleMethod,
+        discountAmt: 0,
+        checkedAmt: 0,
+        amt: Number(amount),
+        srcBillType: 'FinPayable:201',
+        srcBillId: String(fixture.payableId),
+        finPaymentEntryList: [line]
+      }),
+      '成本场景采购付款申请'
+    ),
+    '成本场景采购付款申请'
+  )
+  fixture.paymentId = paymentId
+  const readPayment = async () =>
+    responseData(
+      await api.getBusiness(`/finance/finPayment/queryById?id=${encodeURIComponent(paymentId)}`),
+      '成本场景采购付款回读'
+    )
+  let payment = await readPayment()
+  if (String(payment?.isEffective) === '1') {
+    if (String(payment.billStage) === '24') {
+      responseData(
+        await api.putBusiness('/finance/finPayment/execute', { id: paymentId }),
+        '成本场景采购付款执行'
+      )
+      payment = await readPayment()
+    }
+  } else {
+    if (String(payment?.billStage) === '12') {
+      responseData(
+        await api.putBusiness('/finance/finPayment/checkFinPayableRequest', {
+          id: paymentId, approvalResultType: '1', approvalRemark: `CFOR-E2E cost ${fixture.suffix}`.slice(0, 32)
+        }),
+        '成本场景采购付款申请审核'
+      )
+      payment = await readPayment()
+    }
+    if (String(payment?.billStage) !== '14' || String(payment?.isEffective) !== '0') {
+      throw new Error(`采购付款申请审核后未转换为正式待审核付款：${JSON.stringify(payment)}`)
+    }
+    responseData(
+      await api.putBusiness('/finance/finPayment/checkFinPayable', {
+        id: paymentId, approvalResultType: '1', approvalRemark: `CFOR-E2E cost ${fixture.suffix}`.slice(0, 32)
+      }),
+      '成本场景采购付款审核'
+    )
+    payment = await readPayment()
+    if (String(payment?.billStage) === '24') {
+      responseData(
+        await api.putBusiness('/finance/finPayment/execute', { id: paymentId }),
+        '成本场景采购付款执行'
+      )
+      payment = await readPayment()
+    }
+  }
+  if (String(payment?.isEffective) !== '1') {
+    throw new Error(`采购付款未生效：${JSON.stringify(payment)}`)
+  }
+  return { id: paymentId, payment }
+}
+
 const buildManufacturingModel = async ({ api, suffix, month, remark, versionNo, sourceType, itemName }) => {
   const modelId = await createModel({
     api, suffix, month, remark, versionNo,

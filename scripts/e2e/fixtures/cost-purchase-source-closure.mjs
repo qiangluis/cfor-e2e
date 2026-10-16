@@ -4,7 +4,11 @@ import { assertBusinessSuccess } from '../lib/assertions.mjs'
 import { matchesExpectedBusinessRejection } from '../lib/api.mjs'
 import { assertLocalWriteSafety, runReadOnlySql } from '../lib/db.mjs'
 import { openRoute, saveScreenshot } from '../lib/browser.mjs'
-import { prepareCostScenario, resetCostScenarioCache } from './cost-scenario.mjs'
+import {
+  prepareCostScenario,
+  resetCostScenarioCache,
+  resolveWmsPurchaseReceipt
+} from './cost-scenario.mjs'
 import { approveWmsProcess } from '../lib/wms-approval.mjs'
 import { checkInspection } from './mes-quality-write.mjs'
 
@@ -103,22 +107,24 @@ export function assertPurchaseDraft (snapshot, fixture) {
   return snapshot
 }
 
-export function assertPurchaseReceipt (snapshot, fixture, receipt) {
+export function assertPurchaseReceipt (snapshot, fixture, receipt, wms) {
   assertPurchaseDraft(snapshot, fixture)
   requireFact(receipt?.id === fixture.purchaseInId && Number(receipt.status) === 20 &&
     receipt.businessType === 'NORMAL' && String(receipt.orderId) === fixture.purchaseOrderId &&
     Array.isArray(receipt.items) && receipt.items.length === 1,
   '正式采购入库未按本轮订单审核生效')
+  // 成本来源已切到 WMS 采购入库事实源：来源主从 ID 是 mes_stk_io 的主从 ID，ERP 采购入库是上游单据。
+  requireFact(wms?.wmsId && wms?.entryId, '采购入库缺少WMS来源主从ID')
   const item = receipt.items[0]
   const matches = snapshot.lines.filter((line) => line.sourceType === 'PURCHASE_RECEIPT' &&
-    line.sourceId === fixture.purchaseInId && line.sourceLineId === id(item.id))
+    line.sourceId === id(wms.wmsId) && line.sourceLineId === id(wms.entryId))
   requireFact(matches.length === 1 && matches[0].sourceNo === receipt.no &&
     String(item.productId) === fixture.materialId &&
     costSourceDecimal(matches[0].quantity) > 0n &&
     costSourceDecimal(matches[0].materialAmount) > 0n &&
     same(matches[0].quantity, item.count) &&
     costSourceDecimal(matches[0].materialAmount) === amountOfPurchaseItem(item),
-  '正式采购入库与PURCHASE_RECEIPT未精确对应')
+  '正式采购入库与PURCHASE_RECEIPT未按WMS主从ID精确对应')
   return matches[0]
 }
 
@@ -368,9 +374,11 @@ export async function runCostPurchaseReceiptClosure (context, dependencies = {})
   const closure = { complete: false }
   caseRecord.fixtures.costPurchaseReceipt = closure
   const receipt = data(await api.getBusiness(`/erp/purchase-in/get?id=${fixture.purchaseInId}`), '采购入库')
+  const wms = await resolveWmsPurchaseReceipt({ api, fixture })
   const snapshot = data(await api.postBusiness(
     `/cost/periods/${fixture.periodId}/source-snapshot/purchase/refresh`), '采购来源刷新')
-  assertPurchaseReceipt(snapshot, fixture, receipt)
+  assertPurchaseReceipt(snapshot, fixture, receipt, wms)
+  closure.wmsSource = wms
   requireFact(snapshot.lines.length === 1, '专属期间应仅有一条本轮入库来源')
   const reread = data(await api.getBusiness(snapshotPath(fixture)), '采购来源回读')
   requireFact(JSON.stringify(reread) === JSON.stringify(snapshot), '采购草稿写后回读不一致')
@@ -522,7 +530,8 @@ export async function runCostPurchaseReturnClosure (context, dependencies = {}) 
     })
     const snapshot = data(await api.postBusiness(
       `/cost/periods/${fixture.periodId}/source-snapshot/purchase/refresh`), '入库退回刷新')
-    const receiptLine = assertPurchaseReceipt(snapshot, fixture, receipt)
+    const receiptLine = assertPurchaseReceipt(snapshot, fixture, receipt,
+      { wmsId: id(source.wmsId), entryId: id(source.entry.id) })
     const returnLine = assertPurchaseReturn(snapshot, fixture, closure.returned)
     requireFact(snapshot.lines.length === 2, '采购净额夹具必须同时具有真实入库和退回两行')
     requireFact(costSourceDecimal(receiptLine.quantity) + costSourceDecimal(returnLine.quantity) === 100000000n &&

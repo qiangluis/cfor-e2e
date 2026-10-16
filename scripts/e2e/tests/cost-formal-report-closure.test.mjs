@@ -538,7 +538,8 @@ test('036 manufacturing negative is exact and missing TRADE positive remains GAP
   assert.equal(verified(h, 'page'), true)
   assert.equal(result.acceptanceComplete, false)
   assert.match(messages(result), /no existing legal TRADE PUBLISHED nonempty positive/)
-  assert.match(messages(result), /original empty-month ownership/)
+  // 远期空月的“原始空月归属”不再靠月份本身推断，必须由运行期在分配前普查并登记归属证据。
+  assert.match(messages(result), /no run-owned far-future allocation provenance/)
   assert.equal(h.world.calls.filter((call) => typeof call === 'object').length, 1)
 })
 

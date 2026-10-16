@@ -188,7 +188,8 @@ export function assessCostStageEvidence ({ fixture, closure, observations, runId
     const draft = observations.find((row) => row.stage === '取数' && row.method === 'POST' &&
       row.endpoint === `/cost/periods/${fixture.periodId}/source-snapshot/purchase/refresh`)?.response?.data
     requireFact(closure.collectPreparation?.available === true, '缺少正式采购取数前置')
-    assertPurchaseReceipt(draft, fixture, closure.collectPreparation.receipt)
+    assertPurchaseReceipt(draft, fixture, closure.collectPreparation.receipt,
+      closure.collectPreparation.wms || { wmsId: fixture.wmsReceiptId, entryId: fixture.wmsReceiptEntryId })
     assertPurchaseConfirmed(collectSource, fixture, draft)
     requireFact(collectSource.id !== source.id && collectSource.lines.length === 1 &&
       typeof collectSource.lines[0].sourceVersion === 'string' && collectSource.lines[0].sourceVersion.length > 0,
@@ -312,7 +313,8 @@ export function assessCostStageEvidence ({ fixture, closure, observations, runId
         assert.equal(original.response.data[field], collectSource[field])
       }
       if (closure.collectSource) {
-        assertPurchaseReceipt(original.response.data, fixture, closure.collectPreparation.receipt)
+        assertPurchaseReceipt(original.response.data, fixture, closure.collectPreparation.receipt,
+          closure.collectPreparation.wms || { wmsId: fixture.wmsReceiptId, entryId: fixture.wmsReceiptEntryId })
         assertPurchaseConfirmed(collectSource, fixture, original.response.data)
       }
     }
