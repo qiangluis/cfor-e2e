@@ -167,3 +167,51 @@ test('PB-271 销售对账导出独立成权限键并带页面入口与案例', (
   assert.match(page, /exportReconciliation/)
   assert.ok(casesOf('erp-sale-reconciliation').includes('ERP-SALE-RECON-003'))
 })
+
+test('PB-166 对账差异处理生成修订版本并重新发送客户确认', () => {
+  const controller = read(
+    backend,
+    'cfor-module-erp/cfor-module-erp-biz/src/main/java/tech/cfor17/module/erp/controller/admin/sale/ErpSaleReconciliationController.java'
+  )
+  assert.match(controller, /@PutMapping\("\/process-difference"\)/)
+  assert.match(controller, /erp:sale-reconciliation:process-difference/)
+
+  const service = read(
+    backend,
+    'cfor-module-erp/cfor-module-erp-biz/src/main/java/tech/cfor17/module/erp/service/sale/reconciliation/ErpSaleReconciliationServiceImpl.java'
+  )
+  // 只允许客户驳回的单据进入差异处理，并复用门户待确认通知重新发送。
+  assert.match(service, /CUSTOMER_REJECTED\.getCode\(\)\.equals\(main\.getStatus\(\)\)/)
+  assert.match(service, /ErpSaleReconciliationStatusEnum\.DIFFERENCE_PROCESSING/)
+  assert.match(service, /notifyCustomerReconciliationPending\(main\)/)
+
+  const revisionMigration = migration('V202610181000__add_sale_reconciliation_revision.sql')
+  assert.match(revisionMigration, /ADD COLUMN `revision_no`/)
+  assert.match(revisionMigration, /ADD COLUMN `revision_note`/)
+  assert.match(revisionMigration, /erp:sale-reconciliation:process-difference/)
+  // 修订版本必须落在既有对账单主表，不允许另建平行表。
+  assert.doesNotMatch(revisionMigration, /CREATE TABLE/i)
+
+  const portalVO = read(
+    backend,
+    'cfor-module-erp/cfor-module-erp-biz/src/main/java/tech/cfor17/module/erp/controller/customer/sale/vo/CustomerPortalReconciliationRespVO.java'
+  )
+  assert.match(portalVO, /private Integer revisionNo;/)
+  assert.match(portalVO, /private String revisionNote;/)
+
+  const page = read(web, 'src/views/erp/sale/reconciliation/index.vue')
+  assert.match(page, /processDifferenceDetail/)
+  assert.match(page, /erp:sale-reconciliation:process-difference/)
+  const portalPage = read(web, 'src/customer/views/CustomerReconciliations.vue')
+  assert.match(portalPage, /DIFFERENCE_PROCESSING/)
+  assert.match(portalPage, /revisionNo/)
+
+  const serviceTest = read(
+    backend,
+    'cfor-module-erp/cfor-module-erp-biz/src/test/java/tech/cfor17/module/erp/service/sale/reconciliation/ErpSaleReconciliationServiceImplTest.java'
+  )
+  assert.match(serviceTest, /processDifferenceShouldRejectStatusOtherThanCustomerRejected/)
+  assert.match(serviceTest, /processDifferenceShouldBumpRevisionAndResendCustomerConfirm/)
+
+  assert.ok(casesOf('erp-sale-reconciliation').includes('ERP-SALE-RECON-004'))
+})

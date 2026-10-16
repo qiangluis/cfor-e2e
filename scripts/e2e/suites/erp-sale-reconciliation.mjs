@@ -1,12 +1,95 @@
 import { createApiClient } from '../lib/api.mjs'
 import { login, openRoute, saveScreenshot } from '../lib/browser.mjs'
 
-// PB-268～PB-271 销售对账中心自动化案例索引。
-export const cases = ['ERP-SALE-RECON-001', 'ERP-SALE-RECON-002', 'ERP-SALE-RECON-003']
+// PB-268～PB-271 销售对账中心自动化案例索引，含 PB-166 差异处理与修订版本。
+export const cases = [
+  'ERP-SALE-RECON-001',
+  'ERP-SALE-RECON-002',
+  'ERP-SALE-RECON-003',
+  'ERP-SALE-RECON-004'
+]
 
 const unwrap = (response) => response?.data
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
+  if (caseId === 'ERP-SALE-RECON-004') {
+    const token = await login(page)
+    const api = createApiClient({ token, record })
+    // PB-166：客户驳回后企业侧要把单据推进到差异处理中、生成修订版本并重新发送确认。
+    const pageResult = unwrap(await api.get('/erp/sale-reconciliation/page?pageNo=1&pageSize=100'))
+    const rows = Array.isArray(pageResult?.list) ? pageResult.list : []
+    const sample = rows[0]
+    caseRecord.checks.push({
+      name: 'PB-166 对账单分页契约暴露修订版本字段',
+      passed:
+        rows.length > 0 &&
+        rows.every((row) => Object.prototype.hasOwnProperty.call(row, 'revisionNo')),
+      details: JSON.stringify({ total: pageResult?.total, sampleRevisionNo: sample?.revisionNo })
+    })
+    const detail = sample?.id
+      ? unwrap(await api.get(`/erp/sale-reconciliation/get?id=${sample.id}`))
+      : null
+    caseRecord.checks.push({
+      name: 'PB-166 对账单详情返回修订版本与修订说明',
+      passed:
+        Boolean(detail) &&
+        Object.prototype.hasOwnProperty.call(detail, 'revisionNo') &&
+        Object.prototype.hasOwnProperty.call(detail, 'revisionNote'),
+      details: JSON.stringify({
+        billNo: detail?.billNo,
+        revisionNo: detail?.revisionNo,
+        revisionNote: detail?.revisionNote
+      })
+    })
+
+    // 只读探针：不存在的对账单必须被业务拒绝（证明路由已部署且通过权限校验），
+    // 而不是落到 DefaultController 的 404/501 兜底或权限不足提示。
+    const probe = await api.put('/erp/sale-reconciliation/process-difference', {
+      id: 'e2e-pb166-missing-reconciliation',
+      version: 0,
+      revisionNote: 'E2E 路由与权限探针'
+    })
+    const probeMessage = String(probe?.msg ?? probe?.message ?? '')
+    caseRecord.checks.push({
+      name: 'PB-166 差异处理接口已部署且受权限保护',
+      passed: /销售对账单不存在|仅客户驳回|对账单状态已改变|对账单已被其他用户操作/.test(probeMessage),
+      details: `code=${probe?.code} msg=${probeMessage}`
+    })
+
+    // 详情弹窗固定展示修订版本；有客户驳回样本时再校验差异处理按钮。
+    const rejected = rows.find((row) => row?.status === 'CUSTOMER_REJECTED')
+    const target = rejected || sample
+    if (target?.id) {
+      await openRoute(page, '/erp/sale/reconciliation', { readyText: '销售对账' })
+      const row = page.locator('.el-table__row', { hasText: target.billNo }).first()
+      await row.waitFor({ state: 'visible', timeout: 15000 })
+      await row.getByRole('button', { name: '详情' }).click()
+      await page.getByText('修订版本').first().waitFor({ state: 'visible', timeout: 15000 })
+      caseRecord.checks.push({
+        name: 'PB-166 对账详情弹窗展示修订版本',
+        passed: true,
+        details: `${target.billNo} revisionNo=${target.revisionNo}`
+      })
+      if (rejected) {
+        const action = page.getByRole('button', { name: '差异处理并重新发送' })
+        caseRecord.checks.push({
+          name: 'PB-166 客户驳回的对账单提供差异处理并重新发送入口',
+          passed: (await action.count()) > 0,
+          details: rejected.billNo
+        })
+      } else {
+        caseRecord.evidence.push(
+          '当前租户无 CUSTOMER_REJECTED 对账单，差异处理按钮的界面校验待有样本时执行（接口与权限已在探针中校验）'
+        )
+      }
+      await saveScreenshot(page, outputDir, 'erp-sale-reconciliation-revision', record)
+    }
+    caseRecord.evidence.push(
+      'PB-166 修订版本字段、差异处理路由与权限、详情弹窗修订版本展示校验'
+    )
+    return { token, api }
+  }
+
   if (caseId === 'ERP-SALE-RECON-003') {
     const token = await login(page)
     const api = createApiClient({ token, record })

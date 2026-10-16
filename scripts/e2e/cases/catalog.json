@@ -9634,6 +9634,39 @@
           "reverse": [
             "只读导出，不创建或修改对账单"
           ]
+        },
+        {
+          "id": "ERP-SALE-RECON-004",
+          "title": "PB-166 对账差异处理与修订版本重新发送",
+          "status": "READY",
+          "preconditions": [
+            "已登录管理端并具备 erp:sale-reconciliation:query 权限",
+            "存在历史销售对账单（存在 CUSTOMER_REJECTED 单据时额外校验差异处理入口）"
+          ],
+          "routes": [
+            "/erp/sale/reconciliation"
+          ],
+          "assertions": [
+            "对账单分页与详情返回 revisionNo/revisionNote 修订版本字段",
+            "PUT /erp/sale-reconciliation/process-difference 已部署且受 erp:sale-reconciliation:process-difference 权限保护，不存在的单据返回业务拒绝而不是兜底路由",
+            "对账详情弹窗展示修订版本，客户驳回报表在弹窗内提供「差异处理并重新发送」入口",
+            "差异处理只把 CUSTOMER_REJECTED 推进到 DIFFERENCE_PROCESSING，明细回到待客户确认并重新发送门户确认通知"
+          ],
+          "api": [
+            "/erp/sale-reconciliation/page",
+            "/erp/sale-reconciliation/get",
+            "/erp/sale-reconciliation/process-difference"
+          ],
+          "database": [
+            "erp_sale_reconciliation",
+            "erp_sale_reconciliation_entry",
+            "system_menu",
+            "system_role_menu"
+          ],
+          "reverse": [
+            "探针使用不存在的对账单编号，只读不写入",
+            "差异处理的真实写链路需在有 CUSTOMER_REJECTED 样本的租户上人工执行，并在客户门户重新确认后回滚为正式对账状态"
+          ]
         }
       ]
     },
