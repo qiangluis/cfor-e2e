@@ -1,7 +1,8 @@
 # CFOR E2E
 
 独立自动化仓库，使用 `playwright-core` 和本机真实 Chrome。案例来源为
-`scripts/e2e/cases/catalog.json`，当前有 47 个套件、310 个案例。
+`scripts/e2e/cases/catalog.json`，当前有 50 个套件、316 个案例（2026-10-16 复核）。
+本仓库是唯一案例事实源，`cfor-admin-vue3/scripts/e2e` 历史副本已删除（提交 `be7cc0b5c`）。
 `READY/PARTIAL/DESIGNED/BLOCKED` 是实现状态，不是验收结果。
 
 ## 本地执行
@@ -168,7 +169,7 @@ node scripts/e2e/coverage-report.mjs --out /tmp/cfor-e2e/coverage-latest
 
 覆盖报告同时输出 `.json` 和 `.md`，`--out` 是文件前缀。按案例选择最新非 SKIPPED
 结果，保留来源与证据路径；DESIGNED/BLOCKED 的跳过记录不算已执行。可用 `--root`
-限定证据目录、`--since` 限定观察时间。268 个自动化案例不等于 PB-001 至 PB-443
+限定证据目录、`--since` 限定观察时间。316 个自动化案例不等于 PB-001 至 PB-443
 的每一条需求均已验收；PARTIAL、未执行、前置不足和范围外项必须分别报告。
 
 Vite 专项需要前端依赖已安装；使用隔离缓存与自动清理的测试文件，不启动额外端口。
