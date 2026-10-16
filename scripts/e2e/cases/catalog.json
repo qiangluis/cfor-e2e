@@ -9862,6 +9862,41 @@
           "reverse": [
             "只读验证，不创建或修改单据；erp_purchase_in 只断言停止写入与历史只读"
           ]
+        },
+        {
+          "id": "PUR-WMS-002",
+          "title": "采购退货来源切换到 WMS 采购入库单（mes_stk_io 101）",
+          "status": "PARTIAL",
+          "preconditions": [
+            "已登录管理端并具备 erp:purchase-return:query、erp:purchase-return:create 权限",
+            "存在一条已生效、未作废的 stock_io_type=101 采购入库单（mes_stk_io），且明细可退货数量大于 0",
+            "已执行 V202610162010 与 V202610162600 迁移"
+          ],
+          "routes": [
+            "/erp/purchase/return"
+          ],
+          "assertions": [
+            "采购退货「选单」入口只列出 WMS 101 采购入库单，明细返回 returnedCount/canReturnCount，可退货数量为 0 的行不可选",
+            "退货单头落库 srcBillType=WMS_PURCHASE_IN、srcBillId=mes_stk_io.id、srcNo=采购入库单号",
+            "退货明细落库 srcEntryId=mes_stk_io_entry.id，超可退数量、明细不属于该入库单、供应商不一致均被后端拒绝",
+            "同一采购入库单只允许存在一个未审核退货单",
+            "历史来源为采购订单（PurOrder）的退货单仍可打开查看，不再作为新建退货的选单来源"
+          ],
+          "api": [
+            "/mes/stkIo/list",
+            "/erp/purchase-return/wms-purchase-in/returnable",
+            "/erp/purchase-return/create"
+          ],
+          "database": [
+            "mes_stk_io",
+            "mes_stk_io_entry",
+            "erp_purchase_return",
+            "erp_purchase_return_item"
+          ],
+          "reverse": [
+            "可退货视图与选单列表为只读查询；真实退货写链路需在测试租户上建单后按 BPM 流程作废清理",
+            "历史 erp_purchase_in 来源的退货单只做只读兼容验证，不修改其来源字段"
+          ]
         }
       ]
     }
