@@ -9613,6 +9613,43 @@
           ]
         }
       ]
+    },
+    {
+      "id": "crm-sales-alignment",
+      "title": "销售协同 PB-158~PB-282 菜单-页面-权限对齐回归",
+      "status": "READY",
+      "dependsOn": [
+        "smoke"
+      ],
+      "cases": [
+        {
+          "id": "CRM-ALIGN-001",
+          "title": "销售协同菜单无死链、无重复入口、权限键无缺失",
+          "status": "READY",
+          "preconditions": [
+            "SMOKE-001 PASS",
+            "本地库已执行到 V202610162530（会议纪要权限键）",
+            "前端源码位于 CFOR_WEB_ROOT 或相邻 cfor/cfor-admin-vue3"
+          ],
+          "routes": [
+            "/crm/menu/work-goals/sales-plan",
+            "/erp/sale/reconciliation"
+          ],
+          "assertions": [
+            "可见销售协同菜单全部指向存在的前端页面，无 crm/jixu/modeling 死链",
+            "同一组件在可见菜单中不重复出现",
+            "销售对账/销售计划/合同交接/会议纪要/客户门户/经营报表权限键全部注册",
+            "会议纪要菜单挂在漏斗管理并指向 funnel 页 minutes 页签",
+            "报价页使用真实文件上传并回写 attachmentUrl，无写死金额与文件大小"
+          ],
+          "api": [
+            "/system/menu/list"
+          ],
+          "reverse": [
+            "只读校验，不创建或修改菜单与业务单据"
+          ]
+        }
+      ]
     }
   ]
 }

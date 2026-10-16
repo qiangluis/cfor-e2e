@@ -88,7 +88,8 @@ const suiteFiles = {
   'crm-sales-task': 'crm-sales-task.mjs',
   'crm-work-report': 'crm-work-report.mjs',
   'crm-business-report': 'crm-business-report.mjs',
-  'crm-sales-plan': 'crm-sales-plan.mjs'
+  'crm-sales-plan': 'crm-sales-plan.mjs',
+  'crm-sales-alignment': 'crm-sales-alignment.mjs'
 }
 
 const definitions = new Map(
