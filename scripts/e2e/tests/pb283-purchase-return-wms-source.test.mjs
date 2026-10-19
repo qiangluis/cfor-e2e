@@ -8,8 +8,14 @@ import { fileURLToPath } from 'node:url'
 // （mes_stk_io，stock_io_type=101）。退货单头 srcBillType=WMS_PURCHASE_IN、srcBillId=mes_stk_io.id、
 // 退货明细 srcEntryId=mes_stk_io_entry.id；历史 PurOrder 来源保留只读兼容，不再作为新建退货的入口。
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../')
-const backend = path.join(workspace, 'cfor/cfor-admin')
-const web = path.join(workspace, 'cfor/cfor-admin-vue3')
+const backend = process.env.CFOR_E2E_BACKEND_ROOT ||
+  (fs.existsSync(path.join(workspace, 'cfor/cfor-admin'))
+    ? path.join(workspace, 'cfor/cfor-admin')
+    : path.join(workspace, 'backend'))
+const web = process.env.CFOR_E2E_WEB_ROOT ||
+  (fs.existsSync(path.join(workspace, 'cfor/cfor-admin-vue3'))
+    ? path.join(workspace, 'cfor/cfor-admin-vue3')
+    : path.join(workspace, 'web'))
 const testsDir = path.dirname(fileURLToPath(import.meta.url))
 
 const read = (base, relative) => fs.readFileSync(path.join(base, relative), 'utf8')

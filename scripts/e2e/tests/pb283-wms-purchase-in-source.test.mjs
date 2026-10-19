@@ -11,8 +11,14 @@ const workspace = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../../../'
 )
-const backend = path.join(workspace, 'cfor/cfor-admin')
-const web = path.join(workspace, 'cfor/cfor-admin-vue3')
+const backend = process.env.CFOR_E2E_BACKEND_ROOT ||
+  (fs.existsSync(path.join(workspace, 'cfor/cfor-admin'))
+    ? path.join(workspace, 'cfor/cfor-admin')
+    : path.join(workspace, 'backend'))
+const web = process.env.CFOR_E2E_WEB_ROOT ||
+  (fs.existsSync(path.join(workspace, 'cfor/cfor-admin-vue3'))
+    ? path.join(workspace, 'cfor/cfor-admin-vue3')
+    : path.join(workspace, 'web'))
 const testsDir = path.dirname(fileURLToPath(import.meta.url))
 
 const read = (base, relative) => fs.readFileSync(path.join(base, relative), 'utf8')

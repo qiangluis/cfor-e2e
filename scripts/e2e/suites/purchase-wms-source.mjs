@@ -57,12 +57,66 @@ export const visibleComponentRoutes = (menus) => {
 }
 
 export const runCase = async ({ caseId, page, record, caseRecord, outputDir }) => {
-  if (caseId !== 'PUR-WMS-001') return { designed: true }
-
   const token = await loginWithCredentials(page)
   const api = createApiClient({ token, record })
   const check = (name, passed, details) => caseRecord.checks.push({ name, passed: passed === true, details })
   const missing = []
+
+  if (caseId === 'PUR-WMS-002') {
+    const stockRows = rowsOf(
+      await api.getBusiness(
+        '/mes/stkIo/list?pageNo=1&pageSize=100&stockIoType=101&isEffective=1&isVoided=0'
+      ),
+      '可退货采购入库分页'
+    )
+    const candidate = stockRows.find((row) =>
+      Array.isArray(row.stkIoEntryList) && row.stkIoEntryList.length > 0
+    )
+    check(
+      'PB-283 采购退货选单只读取已生效、未作废的 WMS 101 采购入库',
+      stockRows.every((row) => String(row.stockIoType) === '101' &&
+        Number(row.isEffective) === 1 && Number(row.isVoided) === 0),
+      `采购入库样本=${stockRows.length}`
+    )
+    if (!candidate) {
+      missing.push('没有可供退货核验的 WMS 101 入库样本')
+      check(
+        'PB-283 可退货明细返回 returnedCount/canReturnCount',
+        false,
+        '缺少可退货采购入库样本，未执行明细查询'
+      )
+    } else {
+      const detail = dataOf(
+        await api.getBusiness(
+          `/erp/purchase-return/wms-purchase-in/returnable?billId=${encodeURIComponent(candidate.id)}`
+        ),
+        '采购退货可退明细'
+      )
+      const lines = Array.isArray(detail?.lines) ? detail.lines : []
+      const missingFields = lines.flatMap((line) =>
+        ['entryId', 'returnedCount', 'canReturnCount'].filter((field) => !Object.hasOwn(line, field))
+      )
+      check(
+        'PB-283 可退货明细返回 returnedCount/canReturnCount，已退完明细不可再选',
+        lines.length > 0 && missingFields.length === 0 &&
+          lines.every((line) => Number(line.canReturnCount) >= 0),
+        `入库单=${candidate.billNo || candidate.id}; 明细=${lines.length}; 缺失字段=${[...new Set(missingFields)].join('|') || '无'}`
+      )
+    }
+    await openRoute(page, '/erp/purchase/return', { readyText: '采购退货' })
+    check(
+      'PB-283 采购退货页面可打开并提供“选择采购入库单”入口',
+      await page.getByText('采购退货').first().isVisible() &&
+        await page.getByRole('button', { name: /新增/ }).first().isVisible(),
+      page.url()
+    )
+    caseRecord.evidence.push(
+      '采购退货只读核验：选单来源为 mes_stk_io（stock_io_type=101），可退数量由 WMS 入库明细计算'
+    )
+    caseRecord.notes.push(`采购入库样本=${stockRows.length}；缺失前置=${missing.join('；') || '无'}`)
+    return { token, api, missing }
+  }
+  if (caseId !== 'PUR-WMS-001') return { designed: true }
 
   // 1) 采购入库事实源：mes_stk_io（101）+ mes_stk_io_entry 必须承载结算与开票进度。
   const stockRows = rowsOf(
