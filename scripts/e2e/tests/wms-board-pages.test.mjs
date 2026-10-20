@@ -1,13 +1,22 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 
-const backendRoot = new URL('../../../../backend/', import.meta.url)
-const webRoot = new URL('../../../../web/', import.meta.url)
+const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../')
+const backendRoot = process.env.CFOR_E2E_BACKEND_ROOT ||
+  (fs.existsSync(path.join(workspace, 'cfor/cfor-admin'))
+    ? path.join(workspace, 'cfor/cfor-admin')
+    : path.join(workspace, 'backend'))
+const webRoot = process.env.CFOR_E2E_WEB_ROOT ||
+  (fs.existsSync(path.join(workspace, 'cfor/cfor-admin-vue3'))
+    ? path.join(workspace, 'cfor/cfor-admin-vue3')
+    : path.join(workspace, 'web'))
 
 const readBackend = (file) =>
-  fs.readFileSync(new URL(`cfor-server/src/main/resources/db/migration/${file}`, backendRoot), 'utf8')
-const readWeb = (file) => fs.readFileSync(new URL(`src/${file}`, webRoot), 'utf8')
+  fs.readFileSync(path.join(backendRoot, 'cfor-server/src/main/resources/db/migration', file), 'utf8')
+const readWeb = (file) => fs.readFileSync(path.join(webRoot, 'src', file), 'utf8')
 
 test('WMS 现场菜单迁移使用自动主键并挂到既有仓库入口', () => {
   const migration = readBackend('V202610201230__add_wms_board_and_operation_menus.sql')
