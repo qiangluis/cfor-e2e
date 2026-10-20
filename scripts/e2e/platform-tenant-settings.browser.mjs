@@ -36,12 +36,49 @@ const find = (name) => {
   assert.ok(found, `Missing menu ${name}`)
   return found
 }
-assert.equal(String(menus.find((menu) => String(menu.id) === '102').parentId), '29412506')
+assert.ok(find('SettingsPlatformManagement'))
+assert.equal(String(menus.find((menu) => String(menu.id) === '102').parentId), '58801647')
 assert.equal(String(menus.find((menu) => String(menu.id) === '100').parentId), '29412502')
 const backup = find('SettingsDataBackup')
 assert.equal(backup.sort, 80)
-assert.equal(backup.visible, false)
-const report = { menuOwnership: true, backupIndependentAndHidden: true }
+assert.equal(backup.visible, true)
+assert.equal(backup.path, '/settings/data-backup')
+const globalTenantTags = await success('GET', '/system/config/get-tags?category=global', undefined, admin)
+const globalPlatformTags = await success(
+  'GET', '/system/config/platform/get-tags?category=global', undefined, admin)
+assert.deepEqual(globalTenantTags.map((tag) => tag.value),
+  ['common', 'approval', 'portal', 'mobile_home', 'fields'])
+assert.deepEqual(globalPlatformTags.map((tag) => tag.value),
+  ['auth', 'sms', 'tenant_lifecycle', 'desktop_release'])
+assert.equal((await api('GET', '/system/config/get?category=global&tag=auth',
+  undefined, admin)).code, 403)
+assert.equal((await api('GET', '/system/config/get-from-cache?category=global&tag=sms',
+  undefined, admin)).code, 403)
+const platformAuth = await success(
+  'GET', '/system/config/platform/get?category=global&tag=auth', undefined, admin)
+assert.match(platformAuth.configData, /"loginMaxFailCount"/)
+assert.equal((await api('GET',
+  '/system/config/platform/get?category=purchase&tag=reconciliationSla',
+  undefined, admin)).code, 400)
+await success('POST', '/system/config/save?category=global&tag=auth',
+  { configData: platformAuth.configData }, admin)
+const savedPlatformAuth = await success(
+  'GET', '/system/config/platform/get?category=global&tag=auth', undefined, admin)
+assert.equal(savedPlatformAuth.configData, platformAuth.configData)
+const reconciliationSla = await success(
+  'GET', '/system/config/get?category=purchase&tag=reconciliationSla', undefined, admin)
+assert.ok(reconciliationSla?.configData)
+await success('POST', '/system/config/save?category=purchase&tag=reconciliationSla',
+  { configData: reconciliationSla.configData }, admin)
+const savedReconciliationSla = await success(
+  'GET', '/system/config/get?category=purchase&tag=reconciliationSla', undefined, admin)
+assert.equal(savedReconciliationSla.configData, reconciliationSla.configData)
+const report = {
+  menuOwnership: true,
+  backupIndependentAndTenantVisible: true,
+  platformTenantConfigSplit: true,
+  platformTenantConfigPersistence: true
+}
 
 if (process.argv.includes('--allow-local-fixtures')) {
   let roleId
@@ -54,7 +91,8 @@ if (process.argv.includes('--allow-local-fixtures')) {
     const neededPermissions = new Set(['system:dict:query', 'system:dict:update',
       'base:order-type:update'])
     const menuIds = menus.filter((menu) => neededPermissions.has(menu.permission)).map((menu) => menu.id)
-    menuIds.push(find('SettingsSpec_dictionary').id, find('SettingsSpec_document_types').id, 102)
+    menuIds.push(find('SettingsSpec_dictionary').id, find('SettingsSpec_document_types').id,
+      find('busConfig').id)
     await success('POST', '/system/permission/assign-role-menu', { roleId, menuIds }, admin)
     userId = await success('POST', '/system/user/create', {
       username, password, nickname: '设置范围临时验证', roleIds: [roleId], postIds: []
@@ -65,11 +103,38 @@ if (process.argv.includes('--allow-local-fixtures')) {
     const flatten = (nodes) => nodes.flatMap((node) => [node, ...flatten(node.children || [])])
     const routes = flatten(tenant.menus)
     assert.ok(routes.some((menu) => menu.path === '/settings/spec/dictionaries'))
-    assert.ok(!routes.some((menu) => menu.path === '/settings/system-settings' || menu.path === '/system/menu'))
+    assert.ok(!routes.some((menu) => [
+      '/settings/system-settings',
+      '/settings/platform-management',
+      '/system/config/platform',
+      '/system/menu'
+    ].includes(menu.path)))
     for (const path of ['/system/menu/list', '/infra/config/page?pageNo=1&pageSize=1',
       '/system/tenant/page?pageNo=1&pageSize=1', '/system/ai-runtime/admin/options']) {
       assert.equal((await api('GET', path, undefined, tenantToken)).code, 403, path)
     }
+    for (const path of [
+      '/system/config/platform/get-tags?category=global',
+      '/system/config/platform/get?category=global&tag=auth',
+      '/system/config/platform/get-fields?category=global&tag=auth',
+      '/system/config/get?category=global&tag=auth',
+      '/system/config/get-from-cache?category=global&tag=auth',
+      '/system/config/get-fields?category=global&tag=auth'
+    ]) {
+      assert.equal((await api('GET', path, undefined, tenantToken)).code, 403, path)
+    }
+    assert.equal((await api('POST', '/system/config/save?category=global&tag=auth',
+      { configData: platformAuth.configData }, tenantToken)).code, 403)
+    const tenantConfigList = await success('GET', '/system/config/getConfigList',
+      undefined, tenantToken)
+    const tenantConfigKeys = tenantConfigList.map((config) => `${config.category}:${config.tag}`)
+    for (const key of ['global:auth', 'global:sms', 'global:tenant_lifecycle',
+      'global:desktop_release']) {
+      assert.ok(!tenantConfigKeys.includes(key), key)
+    }
+    const tenantCommon = await success(
+      'GET', '/system/config/get?category=global&tag=common', undefined, tenantToken)
+    assert.ok(tenantCommon?.configData)
     const dictionaries = await success('GET',
       '/system/dict-type/page?pageNo=1&pageSize=100&scope=business', undefined, tenantToken)
     assert.ok(dictionaries.total > 0)
@@ -93,6 +158,7 @@ const browser = await chromium.launch({ channel: 'chrome', headless: true })
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
   await loginWithCredentials(page, {
+    tenantName: config.tenantName,
     username: process.env.CFOR_USERNAME || 'admin',
     password: process.env.CFOR_PASSWORD || 'admin123'
   })
@@ -107,8 +173,22 @@ try {
     await page.getByText(text, { exact: true }).first().waitFor({ timeout: 60000 })
     assert.equal(new URL(page.url()).pathname, route)
   }
+  await page.goto(`${config.webBase}/system/bus-config`, { waitUntil: 'domcontentloaded' })
+  await page.getByRole('tab', { name: '旧版扩展字段', exact: true }).waitFor({ timeout: 60000 })
+  const businessTabs = (await page.getByRole('tab').allTextContents()).map((text) => text.trim())
+  assert.deepEqual(businessTabs,
+    ['通用配置', '审批流', '门户品牌', '小程序首页', '旧版扩展字段'])
+  await page.getByRole('tab', { name: '旧版扩展字段', exact: true }).click()
+  await page.getByText('新增字段请到「设置 / 业务基础 / 自定义项中心」创建', { exact: false })
+    .waitFor()
+  await page.goto(`${config.webBase}/system/config/platform`, { waitUntil: 'domcontentloaded' })
+  await page.getByRole('tab', { name: '登录与注册', exact: true }).waitFor({ timeout: 60000 })
+  const platformTabs = (await page.getByRole('tab').allTextContents()).map((text) => text.trim())
+  assert.deepEqual(platformTabs,
+    ['登录与注册', '短信保护', '租户生命周期', '客户端发布'])
   await page.screenshot({ path: '/tmp/cfor-platform-tenant-settings.png', fullPage: true })
   report.browserRoutes = pages.map(([route]) => route)
+  report.businessOptionAndPlatformTabs = true
 } finally {
   await browser.close()
 }

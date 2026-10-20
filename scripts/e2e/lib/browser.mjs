@@ -49,6 +49,8 @@ const SELECTORS = {
   accountTab: 'button:has-text("账密登录")',
   tenant: [
     'input[placeholder="请输入租户名称"]',
+    'input[placeholder*="注册编码"]',
+    'input[placeholder*="统一社会信用代码"]',
     'input[placeholder*="租户"]',
     'input[name="tenantName"]'
   ],
@@ -146,12 +148,17 @@ export const isReleasedResponseBodyError = (error) => {
 }
 
 async function firstVisible (page, selectors, timeout = 30000) {
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first()
-    try {
-      await locator.waitFor({ state: 'visible', timeout })
-      return locator
-    } catch {}
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      const matches = page.locator(selector)
+      const count = await matches.count().catch(() => 0)
+      for (let i = 0; i < count; i++) {
+        const locator = matches.nth(i)
+        if (await locator.isVisible().catch(() => false)) return locator
+      }
+    }
+    await page.waitForTimeout(200)
   }
   throw new Error(`找不到可见元素：${selectors.join(' / ')}`)
 }
